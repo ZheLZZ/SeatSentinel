@@ -8,7 +8,7 @@
 ![License](https://img.shields.io/badge/license-MIT-green)
 
 SeatSentinel 是一款面向 Windows 11 的本地离席自动锁屏工具。它通过摄像头和
-OpenVINO 人脸检测判断电脑前是否有人，再结合 Windows 最近键盘、鼠标活动
+OpenVINO 调用NPU进行人脸检测判断电脑前是否有人，再结合 Windows 最近键盘、鼠标活动
 时间，在满足全部安全条件时调用系统锁屏。
 
 摄像头画面和模型推理全部在本机完成。SeatSentinel 不上传、不拍照、不录像，
