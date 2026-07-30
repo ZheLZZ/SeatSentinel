@@ -17,6 +17,13 @@ OpenVINO 人脸检测判断电脑前是否有人，再结合 Windows 最近键�
 > 当前版本为 `v0.1.1-beta`。请先在可控环境中测试摄像头和锁屏参数，不要在
 > 尚未验证的工作场景中长时间无人值守运行。
 
+## 界面预览
+
+![SeatSentinel 视觉控制台](docs/seatsentinel-vision-console.png)
+
+> 为保护隐私，截图已遮挡真人面部。图中 30 秒为用户自定义参数，项目默认的
+> 无人脸及键鼠空闲锁屏时间均为 60 秒。
+
 ## 功能亮点
 
 - 使用 `face-detection-retail-0004` 检测人脸，不进行身份识别；
@@ -226,6 +233,8 @@ python app.py --self-test
 ├─ config.py
 ├─ settings.example.json
 ├─ tests/
+├─ docs/
+│  └─ seatsentinel-vision-console.png
 ├─ models/
 │  └─ .gitkeep
 ├─ PRIVACY.md
