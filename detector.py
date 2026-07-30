@@ -13,7 +13,7 @@ import cv2
 import numpy as np
 from numpy.typing import NDArray
 
-# AwayLock never initializes OpenVINO conversion-tool telemetry. These
+# SeatSentinel never initializes OpenVINO conversion-tool telemetry. These
 # process-local flags also disable common optional dependency analytics.
 os.environ.setdefault("DO_NOT_TRACK", "1")
 os.environ.setdefault("SCARF_NO_ANALYTICS", "1")

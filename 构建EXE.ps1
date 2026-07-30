@@ -1,4 +1,4 @@
-﻿[CmdletBinding()]
+[CmdletBinding()]
 param(
     [switch]$NoPause
 )
@@ -14,7 +14,7 @@ function Wait-OnError {
 }
 
 try {
-    $Host.UI.RawUI.WindowTitle = "构建 AwayLock EXE"
+    $Host.UI.RawUI.WindowTitle = "构建 SeatSentinel EXE"
     Set-Location -LiteralPath $PSScriptRoot
 
     $virtualPython = Join-Path `
@@ -50,7 +50,7 @@ try {
         --clean `
         --onedir `
         --windowed `
-        --name "AwayLock" `
+        --name "SeatSentinel" `
         --collect-all "openvino" `
         --collect-all "pystray" `
         --collect-all "cv2_enumerate_cameras" `
@@ -62,10 +62,10 @@ try {
 
     $outputDirectory = Join-Path `
         $PSScriptRoot `
-        "dist\AwayLock"
-    $outputExe = Join-Path $outputDirectory "AwayLock.exe"
+        "dist\SeatSentinel"
+    $outputExe = Join-Path $outputDirectory "SeatSentinel.exe"
     if (-not (Test-Path -LiteralPath $outputExe)) {
-        throw "构建完成但未找到 AwayLock.exe"
+        throw "构建完成但未找到 SeatSentinel.exe"
     }
 
     $distributionDocuments = @(
@@ -105,13 +105,13 @@ try {
     if ($selfTest.ExitCode -ne 0) {
         $logPath = Join-Path `
             $env:LOCALAPPDATA `
-            "AwayLock\logs\away-lock.log"
+            "SeatSentinel\logs\seat-sentinel.log"
         throw "打包自检失败，请查看日志：$logPath"
     }
 
     $archivePath = Join-Path `
         $PSScriptRoot `
-        "dist\AwayLock-Windows-x64.zip"
+        "dist\SeatSentinel-Windows-x64.zip"
     if (Test-Path -LiteralPath $archivePath) {
         Remove-Item -LiteralPath $archivePath -Force
     }

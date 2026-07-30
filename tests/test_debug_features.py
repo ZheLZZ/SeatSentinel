@@ -15,14 +15,18 @@ import config
 from app import TrayApplication
 from debug_frame import DebugFrameBuffer
 from detector import DetectorInferenceError, FaceDetection, FaceDetector
+from single_instance import DEBUG_WINDOW_EVENT_NAME, MUTEX_NAME
 from user_settings import AppSettings, SettingsStore
 
 
 class ApplicationDefaultsTests(unittest.TestCase):
     def test_title_and_lock_timeouts(self) -> None:
         settings = AppSettings.defaults()
-        self.assertEqual(config.APPLICATION_TITLE, "AwayLock")
-        self.assertEqual(config.APPLICATION_VERSION, "0.1.0-beta")
+        self.assertEqual(config.APPLICATION_TITLE, "SeatSentinel")
+        self.assertEqual(config.APPLICATION_VERSION, "0.1.1-beta")
+        self.assertEqual(config.USER_DATA_DIRECTORY.name, "SeatSentinel")
+        self.assertIn("SeatSentinel", MUTEX_NAME)
+        self.assertIn("SeatSentinel", DEBUG_WINDOW_EVENT_NAME)
         self.assertEqual(settings.inference_device, "NPU")
         self.assertEqual(settings.face_absence_timeout_seconds, 60)
         self.assertEqual(settings.input_idle_timeout_seconds, 60)
@@ -36,30 +40,41 @@ class ApplicationDefaultsTests(unittest.TestCase):
         self.assertEqual(settings.inference_device, "CPU")
 
     def test_legacy_settings_are_migrated(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary_directory:
-            root = Path(temporary_directory)
-            new_path = root / "AwayLock" / "settings.json"
-            legacy_path = root / "PresenceLock" / "settings.json"
-            legacy_path.parent.mkdir(parents=True)
-            legacy_path.write_text(
-                json.dumps(
-                    {
-                        "camera_name": "FHD Camera",
-                        "inference_device": "CPU",
-                        "face_absence_timeout_seconds": 75,
-                    }
-                ),
-                encoding="utf-8",
-            )
+        for legacy_name in ("AwayLock", "PresenceLock"):
+            with self.subTest(legacy_name=legacy_name):
+                with tempfile.TemporaryDirectory() as temporary_directory:
+                    root = Path(temporary_directory)
+                    new_path = root / "SeatSentinel" / "settings.json"
+                    legacy_paths = (
+                        root / "AwayLock" / "settings.json",
+                        root / "PresenceLock" / "settings.json",
+                    )
+                    legacy_path = (
+                        root / legacy_name / "settings.json"
+                    )
+                    legacy_path.parent.mkdir(parents=True)
+                    legacy_path.write_text(
+                        json.dumps(
+                            {
+                                "camera_name": "FHD Camera",
+                                "inference_device": "CPU",
+                                "face_absence_timeout_seconds": 75,
+                            }
+                        ),
+                        encoding="utf-8",
+                    )
 
-            settings = SettingsStore(
-                path=new_path,
-                legacy_path=legacy_path,
-            ).load()
+                    settings = SettingsStore(
+                        path=new_path,
+                        legacy_paths=legacy_paths,
+                    ).load()
 
-            self.assertEqual(settings.inference_device, "CPU")
-            self.assertEqual(settings.face_absence_timeout_seconds, 75)
-            self.assertTrue(new_path.is_file())
+                    self.assertEqual(settings.inference_device, "CPU")
+                    self.assertEqual(
+                        settings.face_absence_timeout_seconds,
+                        75,
+                    )
+                    self.assertTrue(new_path.is_file())
 
 
 class DebugCameraSelectorTests(unittest.TestCase):

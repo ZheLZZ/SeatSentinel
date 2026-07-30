@@ -1,6 +1,6 @@
-# AwayLock Roadmap
+# SeatSentinel Roadmap
 
-以下事项不属于 `v0.1.0-beta` 本轮发布范围，但应在后续版本继续处理。
+以下事项不属于 `v0.1.1-beta` 本轮发布范围，但应在后续版本继续处理。
 
 ## 优先事项
 

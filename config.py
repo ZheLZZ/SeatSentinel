@@ -1,4 +1,4 @@
-"""Application configuration for AwayLock."""
+"""Application configuration for SeatSentinel."""
 
 from __future__ import annotations
 
@@ -7,8 +7,8 @@ import sys
 from pathlib import Path
 
 
-APPLICATION_TITLE = "AwayLock"
-APPLICATION_VERSION = "0.1.0-beta"
+APPLICATION_TITLE = "SeatSentinel"
+APPLICATION_VERSION = "0.1.1-beta"
 CAMERA_INDEX = 0
 # Windows 当前内置摄像头的设备名称。非空时按名称选择，不再盲用编号 0。
 PREFERRED_CAMERA_NAME = "FHD Camera"
@@ -51,18 +51,24 @@ USER_DATA_DIRECTORY = (
             str(APPLICATION_DIRECTORY),
         )
     )
-    / "AwayLock"
+    / "SeatSentinel"
 )
-LEGACY_USER_DATA_DIRECTORY = USER_DATA_DIRECTORY.parent / "PresenceLock"
+LEGACY_USER_DATA_DIRECTORIES = (
+    USER_DATA_DIRECTORY.parent / "AwayLock",
+    USER_DATA_DIRECTORY.parent / "PresenceLock",
+)
 USER_SETTINGS_PATH = (
     USER_DATA_DIRECTORY / "settings.json"
     if getattr(sys, "frozen", False)
     else APPLICATION_DIRECTORY / "settings.json"
 )
-LEGACY_USER_SETTINGS_PATH = (
-    LEGACY_USER_DATA_DIRECTORY / "settings.json"
+LEGACY_USER_SETTINGS_PATHS = (
+    tuple(
+        directory / "settings.json"
+        for directory in LEGACY_USER_DATA_DIRECTORIES
+    )
     if getattr(sys, "frozen", False)
-    else None
+    else ()
 )
 MODEL_XML_PATH = (
     BUNDLE_RESOURCE_DIRECTORY

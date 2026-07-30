@@ -136,15 +136,24 @@ class SettingsStore:
         self,
         path: Path | None = None,
         legacy_path: Path | None = None,
+        legacy_paths: tuple[Path, ...] | None = None,
     ) -> None:
+        if legacy_path is not None and legacy_paths is not None:
+            raise SettingsError(
+                "legacy_path 和 legacy_paths 不能同时使用"
+            )
         self.path = path or config.USER_SETTINGS_PATH
-        self.legacy_path = (
-            legacy_path
-            if legacy_path is not None
+        self.legacy_paths = (
+            legacy_paths
+            if legacy_paths is not None
             else (
-                config.LEGACY_USER_SETTINGS_PATH
-                if path is None
-                else None
+                (legacy_path,)
+                if legacy_path is not None
+                else (
+                    config.LEGACY_USER_SETTINGS_PATHS
+                    if path is None
+                    else ()
+                )
             )
         )
 
@@ -171,20 +180,22 @@ class SettingsStore:
         return AppSettings.from_mapping(values)
 
     def _load_legacy_settings(self) -> AppSettings | None:
-        """Read the previous PresenceLock settings when upgrading."""
-        if self.legacy_path is None or not self.legacy_path.is_file():
-            return None
-        try:
-            values = json.loads(
-                self.legacy_path.read_text(encoding="utf-8")
-            )
-        except (OSError, json.JSONDecodeError) as exc:
-            raise SettingsError(
-                f"无法迁移旧版设置文件 {self.legacy_path}：{exc}"
-            ) from exc
-        if not isinstance(values, dict):
-            raise SettingsError("旧版设置文件的顶层内容必须是对象")
-        return AppSettings.from_mapping(values)
+        """Read settings saved under a previous application name."""
+        for legacy_path in self.legacy_paths:
+            if not legacy_path.is_file():
+                continue
+            try:
+                values = json.loads(
+                    legacy_path.read_text(encoding="utf-8")
+                )
+            except (OSError, json.JSONDecodeError) as exc:
+                raise SettingsError(
+                    f"无法迁移旧版设置文件 {legacy_path}：{exc}"
+                ) from exc
+            if not isinstance(values, dict):
+                raise SettingsError("旧版设置文件的顶层内容必须是对象")
+            return AppSettings.from_mapping(values)
+        return None
 
     def save(self, settings: AppSettings) -> None:
         settings.validate()
