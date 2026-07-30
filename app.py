@@ -1,4 +1,4 @@
-"""System-tray application for AwayLock."""
+"""System-tray application for SeatSentinel."""
 
 from __future__ import annotations
 
@@ -33,7 +33,7 @@ from single_instance import (
 from user_settings import AppSettings, SettingsError, SettingsStore
 
 
-LOGGER = logging.getLogger("away_lock.tray")
+LOGGER = logging.getLogger("seat_sentinel.tray")
 
 
 class MonitoringService:
@@ -78,7 +78,7 @@ class MonitoringService:
         threading.Thread(
             target=self._transition,
             args=(True, False),
-            name="away-lock-start",
+            name="seat-sentinel-start",
             daemon=True,
         ).start()
 
@@ -90,7 +90,7 @@ class MonitoringService:
         threading.Thread(
             target=self._transition,
             args=(False, False),
-            name="away-lock-pause",
+            name="seat-sentinel-pause",
             daemon=True,
         ).start()
 
@@ -102,7 +102,7 @@ class MonitoringService:
         threading.Thread(
             target=self._transition,
             args=(True, True),
-            name="away-lock-restart",
+            name="seat-sentinel-restart",
             daemon=True,
         ).start()
 
@@ -147,7 +147,7 @@ class MonitoringService:
             worker = threading.Thread(
                 target=self._worker,
                 args=(stop_event,),
-                name="away-lock-monitor",
+                name="seat-sentinel-monitor",
                 daemon=True,
             )
             with self._state_lock:
@@ -224,7 +224,7 @@ class TrayApplication:
         self._tray_unlocked_image = self._create_icon_image(locked=False)
         self._tray_visual_state: Optional[bool] = None
         self._tray_icon = pystray.Icon(
-            "away_lock",
+            "seat_sentinel",
             self._tray_unlocked_image,
             config.APPLICATION_TITLE,
             menu=pystray.Menu(
@@ -644,7 +644,7 @@ class TrayApplication:
         )
         debug_style = ttk.Style(window)
         debug_style.configure(
-            "AwayLock.TCombobox",
+            "SeatSentinel.TCombobox",
             fieldbackground="#102337",
             background="#102337",
             foreground="#e8f6ff",
@@ -655,7 +655,7 @@ class TrayApplication:
             padding=5,
         )
         debug_style.map(
-            "AwayLock.TCombobox",
+            "SeatSentinel.TCombobox",
             fieldbackground=[("readonly", "#102337")],
             foreground=[("readonly", "#e8f6ff")],
         )
@@ -665,7 +665,7 @@ class TrayApplication:
             values=camera_names,
             state="readonly",
             width=23,
-            style="AwayLock.TCombobox",
+            style="SeatSentinel.TCombobox",
             postcommand=self._refresh_debug_camera_choices,
         )
         self._debug_camera_combobox.pack(side="left")
@@ -1798,7 +1798,7 @@ class TrayApplication:
     ) -> None:
         threading.Thread(
             target=self._shutdown,
-            name="away-lock-exit",
+            name="seat-sentinel-exit",
             daemon=True,
         ).start()
 

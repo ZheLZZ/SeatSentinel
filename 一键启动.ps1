@@ -1,4 +1,4 @@
-﻿[CmdletBinding()]
+[CmdletBinding()]
 param(
     [switch]$VerifyModelsOnly
 )
@@ -102,10 +102,10 @@ function Download-ModelFile {
 }
 
 try {
-    $Host.UI.RawUI.WindowTitle = "AwayLock"
+    $Host.UI.RawUI.WindowTitle = "SeatSentinel"
     Set-Location -LiteralPath $PSScriptRoot
 
-    Write-Host "AwayLock - 一键启动" -ForegroundColor Green
+    Write-Host "SeatSentinel - 一键启动" -ForegroundColor Green
     Write-Host "首次运行会安装本地依赖并下载人脸检测模型。"
 
     $preferredPython = Join-Path `
@@ -149,7 +149,7 @@ try {
     $requirementsFile = Join-Path $PSScriptRoot "requirements.txt"
     $dependencyMarker = Join-Path `
         $virtualEnvironment `
-        ".away-lock-requirements.sha256"
+        ".seat-sentinel-requirements.sha256"
     $requirementsHash = (
         Get-FileHash -LiteralPath $requirementsFile -Algorithm SHA256
     ).Hash
@@ -244,11 +244,11 @@ try {
     Write-Host "模型 SHA-256 校验通过。"
 
     if ($VerifyModelsOnly) {
-        Write-Host "模型完整性检查完成，未启动 AwayLock。"
+        Write-Host "模型完整性检查完成，未启动 SeatSentinel。"
         exit 0
     }
 
-    Write-Step "启动 AwayLock"
+    Write-Step "启动 SeatSentinel"
     Write-Host "程序运行期间按 Ctrl+C 可以安全退出。"
     Write-Host ""
 

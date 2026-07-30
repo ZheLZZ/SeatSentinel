@@ -1,28 +1,21 @@
-# AwayLock
+# SeatSentinel
 
-![Version](https://img.shields.io/badge/version-v0.1.0--beta-f0a020)
+![Version](https://img.shields.io/badge/version-v0.1.1--beta-f0a020)
 ![Platform](https://img.shields.io/badge/platform-Windows%2011-0078D4)
 ![Python](https://img.shields.io/badge/Python-3.13-3776AB)
 ![OpenVINO](https://img.shields.io/badge/OpenVINO-NPU%20%7C%20CPU-00C7B7)
 ![Privacy](https://img.shields.io/badge/camera-local%20memory%20only-24C88B)
 ![License](https://img.shields.io/badge/license-MIT-green)
 
-AwayLock 是一款面向 Windows 11 的本地离席自动锁屏工具。它通过摄像头和
+SeatSentinel 是一款面向 Windows 11 的本地离席自动锁屏工具。它通过摄像头和
 OpenVINO 人脸检测判断电脑前是否有人，再结合 Windows 最近键盘、鼠标活动
 时间，在满足全部安全条件时调用系统锁屏。
 
-摄像头画面和模型推理全部在本机完成。AwayLock 不上传、不拍照、不录像，
+摄像头画面和模型推理全部在本机完成。SeatSentinel 不上传、不拍照、不录像，
 画面仅短暂保存在内存中。完整说明见 [PRIVACY.md](PRIVACY.md)。
 
-> 当前版本为 `v0.1.0-beta`。请先在可控环境中测试摄像头和锁屏参数，不要在
+> 当前版本为 `v0.1.1-beta`。请先在可控环境中测试摄像头和锁屏参数，不要在
 > 尚未验证的工作场景中长时间无人值守运行。
-
-## 界面预览
-
-![AwayLock 视觉控制台](docs/awaylock-vision-console.png)
-
-> 为保护隐私，截图已遮挡真人面部。图中 30 秒为用户自定义参数，项目默认的
-> 无人脸及键鼠空闲锁屏时间均为 60 秒。
 
 ## 功能亮点
 
@@ -41,7 +34,7 @@ OpenVINO 人脸检测判断电脑前是否有人，再结合 Windows 最近键�
 
 ## 锁屏逻辑
 
-AwayLock 只有在以下条件全部成立时才会锁屏：
+SeatSentinel 只有在以下条件全部成立时才会锁屏：
 
 ```text
 摄像头正常
@@ -71,7 +64,7 @@ AND 当前尚未执行锁屏
 3. 安装依赖；
 4. 从 Intel Open Model Zoo 下载缺少的人脸检测模型；
 5. 校验两个模型文件的 SHA-256；
-6. 启动 AwayLock。
+6. 启动 SeatSentinel。
 
 也可以手动安装：
 
@@ -88,7 +81,7 @@ python app.py
 python main.py
 ```
 
-首次启动若默认摄像头不可用，AwayLock 会保持安全状态并禁止锁屏。请打开
+首次启动若默认摄像头不可用，SeatSentinel 会保持安全状态并禁止锁屏。请打开
 调试控制台，在底部 `CAMERA //` 下拉框中选择本机摄像头；无需修改源码。
 更完整的首次启动摄像头选择向导已列入 [ROADMAP.md](ROADMAP.md)。
 
@@ -136,7 +129,7 @@ BIN 必须来自同一模型版本及同一精度目录。
 - 手动选择 CPU：直接使用 CPU，不再尝试 NPU。
 
 调试控制台底部提供“切换至 CPU / 尝试切换至 NPU”按钮，也可以在“参数设置”
-中选择推理设备。切换时 AwayLock 会安全释放摄像头和模型，然后自动恢复监控。
+中选择推理设备。切换时 SeatSentinel 会安全释放摄像头和模型，然后自动恢复监控。
 
 ## 调试控制台
 
@@ -150,7 +143,7 @@ BIN 必须来自同一模型版本及同一精度目录。
 - 无人持续时间、键鼠空闲时间和宽限期；
 - 当前锁屏条件与摄像头状态。
 
-底部 `CAMERA //` 下拉框会枚举当前可用摄像头。选择新设备后，AwayLock 会
+底部 `CAMERA //` 下拉框会枚举当前可用摄像头。选择新设备后，SeatSentinel 会
 保存设置、清空调试帧、安全释放原摄像头并自动恢复监控。
 
 OpenCV 的 BGR 画面在显示前转换为 RGB，并按原始比例缩放。Tkinter 主线程
@@ -176,8 +169,8 @@ OpenCV 的 BGR 画面在显示前转换为 RGB，并按原始比例缩放。Tkin
 `settings.example.json`。打包版数据保存在：
 
 ```text
-%LOCALAPPDATA%\AwayLock\settings.json
-%LOCALAPPDATA%\AwayLock\logs\away-lock.log
+%LOCALAPPDATA%\SeatSentinel\settings.json
+%LOCALAPPDATA%\SeatSentinel\logs\seat-sentinel.log
 ```
 
 ## 隐私边界
@@ -188,7 +181,7 @@ OpenCV 的 BGR 画面在显示前转换为 RGB，并按原始比例缩放。Tkin
 - 不在日志中记录摄像头画面；
 - 锁屏、暂停、摄像头释放和程序退出时立即清空最新帧；
 - 摄像头或推理状态不可靠时采用“禁止锁屏”的安全策略；
-- AwayLock 不初始化 OpenVINO 转换工具的可选遥测，并在导入 OpenVINO 前
+- SeatSentinel 不初始化 OpenVINO 转换工具的可选遥测，并在导入 OpenVINO 前
   设置进程级 `DO_NOT_TRACK=1` 与 `SCARF_NO_ANALYTICS=1`。
 
 正常监控代码没有联网功能。只有 `一键启动.ps1` 在安装依赖和下载模型时访问
@@ -233,8 +226,6 @@ python app.py --self-test
 ├─ config.py
 ├─ settings.example.json
 ├─ tests/
-├─ docs/
-│  └─ awaylock-vision-console.png
 ├─ models/
 │  └─ .gitkeep
 ├─ PRIVACY.md
@@ -255,7 +246,7 @@ python app.py --self-test
 
 ## 许可证
 
-AwayLock 采用 [MIT License](LICENSE) 开源。第三方软件和模型继续适用其各自
+SeatSentinel 采用 [MIT License](LICENSE) 开源。第三方软件和模型继续适用其各自
 许可证，详见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
 
 ## 作者

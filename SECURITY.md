@@ -4,14 +4,15 @@
 
 | Version | Supported |
 | --- | --- |
-| `0.1.0-beta` | Yes |
+| `0.1.1-beta` | Yes |
+| `0.1.0-beta` | No |
 | Earlier development snapshots | No |
 
 ## Reporting a vulnerability
 
 请优先使用 GitHub 仓库的私密漏洞报告功能：
 
-`https://github.com/ZheLZZ/away-lock/security/advisories/new`
+`https://github.com/ZheLZZ/SeatSentinel/security/advisories/new`
 
 如果仓库尚未启用私密漏洞报告，请只创建一个不包含漏洞细节的 Issue，请求
 维护者提供私密联系方式。不要在公开 Issue 中发布利用代码、摄像头画面、
@@ -28,7 +29,7 @@
 
 ## Security boundaries
 
-- AwayLock 只调用 Windows 锁屏，不实现或绕过 Windows 登录与解锁；
+- SeatSentinel 只调用 Windows 锁屏，不实现或绕过 Windows 登录与解锁；
 - 摄像头或推理状态不明确时禁止自动锁屏；
 - 模型下载使用 HTTPS，并校验固定 SHA-256；
 - 正常监控不需要管理员权限；

@@ -1,4 +1,4 @@
-"""Console entry point for AwayLock."""
+"""Console entry point for SeatSentinel."""
 
 from __future__ import annotations
 
@@ -27,7 +27,7 @@ from session_monitor import SessionMonitor, SessionMonitorError
 from windows_lock import WindowsLockError, lock_workstation
 
 
-LOGGER = logging.getLogger("away_lock")
+LOGGER = logging.getLogger("seat_sentinel")
 
 
 class MonitorOutcome(Enum):
@@ -125,7 +125,7 @@ def configure_logging() -> None:
         log_directory = config.USER_DATA_DIRECTORY / "logs"
         log_directory.mkdir(parents=True, exist_ok=True)
         file_handler = logging.handlers.RotatingFileHandler(
-            log_directory / "away-lock.log",
+            log_directory / "seat-sentinel.log",
             maxBytes=2 * 1024 * 1024,
             backupCount=3,
             encoding="utf-8",
