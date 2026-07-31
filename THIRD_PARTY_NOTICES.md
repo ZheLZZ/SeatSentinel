@@ -8,6 +8,8 @@ SeatSentinel 使用下列第三方软件或模型。本文件用于说明直接�
 | [OpenVINO](https://github.com/openvinotoolkit/openvino) | 本地模型推理及 NPU/CPU 设备支持 | Apache-2.0 |
 | [OpenVINO Telemetry](https://pypi.org/project/openvino-telemetry/) | OpenVINO 的可选工具依赖；SeatSentinel 不初始化其遥测 | Apache-2.0 |
 | [Open Model Zoo](https://github.com/openvinotoolkit/open_model_zoo) `face-detection-retail-0004` | 人脸存在检测模型 | Apache-2.0 |
+| [Open Model Zoo](https://github.com/openvinotoolkit/open_model_zoo) `landmarks-regression-retail-0009` | 本地人脸关键点定位 | Apache-2.0 |
+| [Open Model Zoo](https://github.com/openvinotoolkit/open_model_zoo) `face-reidentification-retail-0095` | 本地 256 维人脸特征提取 | Apache-2.0 |
 | [OpenCV](https://github.com/opencv/opencv) / `opencv-python` | 摄像头读取与图像处理 | Apache-2.0 |
 | [NumPy](https://github.com/numpy/numpy) | 数组与张量处理 | BSD-3-Clause 及其发行包所列的附加许可 |
 | [Pillow](https://github.com/python-pillow/Pillow) | Tkinter 调试画面和图标处理 | MIT-CMU |

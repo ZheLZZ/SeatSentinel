@@ -1,4 +1,4 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param(
     [switch]$NoPause
 )
@@ -24,17 +24,29 @@ try {
         throw "未找到项目运行环境。请先运行一键启动.ps1。"
     }
 
-    $modelXml = Join-Path `
-        $PSScriptRoot `
-        "models\face-detection-retail-0004.xml"
-    $modelBin = Join-Path `
-        $PSScriptRoot `
-        "models\face-detection-retail-0004.bin"
-    if (
-        -not (Test-Path -LiteralPath $modelXml) -or
-        -not (Test-Path -LiteralPath $modelBin)
-    ) {
-        throw "未找到人脸检测模型。请先运行一键启动.ps1。"
+    $requiredModels = @(
+        "face-detection-retail-0004",
+        "landmarks-regression-retail-0009",
+        "face-reidentification-retail-0095"
+    )
+    foreach ($modelName in $requiredModels) {
+        $modelXml = Join-Path $PSScriptRoot "models\$modelName.xml"
+        $modelBin = Join-Path $PSScriptRoot "models\$modelName.bin"
+        if (
+            -not (Test-Path -LiteralPath $modelXml) -or
+            -not (Test-Path -LiteralPath $modelBin)
+        ) {
+            throw "未找到模型 $modelName。请先运行一键启动.ps1。"
+        }
+    }
+
+    $iconPng = Join-Path $PSScriptRoot "assets\seatsentinel-icon.png"
+    $iconIco = Join-Path $PSScriptRoot "assets\seatsentinel-icon.ico"
+    if (-not (Test-Path -LiteralPath $iconPng)) {
+        throw "未找到应用图标：$iconPng"
+    }
+    if (-not (Test-Path -LiteralPath $iconIco)) {
+        throw "未找到 Windows 图标：$iconIco"
     }
 
     Write-Host "==> 检查项目依赖" -ForegroundColor Cyan
@@ -51,9 +63,11 @@ try {
         --onedir `
         --windowed `
         --name "SeatSentinel" `
+        --icon "$iconIco" `
         --collect-all "openvino" `
         --collect-all "pystray" `
         --collect-all "cv2_enumerate_cameras" `
+        --add-data "$iconPng;assets" `
         --add-data "$PSScriptRoot\models;models" `
         "app.py"
     if ($LASTEXITCODE -ne 0) {

@@ -8,16 +8,24 @@ from pathlib import Path
 
 
 APPLICATION_TITLE = "SeatSentinel"
-APPLICATION_VERSION = "0.1.1-beta"
+APPLICATION_VERSION = "0.2.2-beta"
 CAMERA_INDEX = 0
 # Windows 当前内置摄像头的设备名称。非空时按名称选择，不再盲用编号 0。
 PREFERRED_CAMERA_NAME = "FHD Camera"
 DETECTION_INTERVAL_SECONDS = 0.5
 FACE_CONFIDENCE_THRESHOLD = 0.6
 PREFERRED_INFERENCE_DEVICE = "NPU"
+PRESENCE_MODE = "ANY_FACE"
+# Open Model Zoo's face recognition demo uses a cosine-distance threshold of
+# 0.30. Similarity is 1 - distance, so the corresponding minimum is 0.70.
+FACE_MATCH_SIMILARITY_THRESHOLD = 0.70
+IDENTITY_MATCH_CONFIRMATION_FRAMES = 2
+FACE_REGISTRATION_SAMPLE_COUNT = 12
+FACE_REGISTRATION_TIMEOUT_SECONDS = 60.0
 FACE_ABSENCE_TIMEOUT_SECONDS = 60
 INPUT_IDLE_TIMEOUT_SECONDS = 60
 STARTUP_GRACE_PERIOD_SECONDS = 30
+LOCK_WARNING_SECONDS = 5.0
 FRAME_WIDTH = 640
 FRAME_HEIGHT = 360
 
@@ -80,3 +88,30 @@ MODEL_BIN_PATH = (
     / "models"
     / "face-detection-retail-0004.bin"
 )
+LANDMARKS_MODEL_XML_PATH = (
+    BUNDLE_RESOURCE_DIRECTORY
+    / "models"
+    / "landmarks-regression-retail-0009.xml"
+)
+LANDMARKS_MODEL_BIN_PATH = (
+    BUNDLE_RESOURCE_DIRECTORY
+    / "models"
+    / "landmarks-regression-retail-0009.bin"
+)
+FACE_REIDENTIFICATION_MODEL_XML_PATH = (
+    BUNDLE_RESOURCE_DIRECTORY
+    / "models"
+    / "face-reidentification-retail-0095.xml"
+)
+FACE_REIDENTIFICATION_MODEL_BIN_PATH = (
+    BUNDLE_RESOURCE_DIRECTORY
+    / "models"
+    / "face-reidentification-retail-0095.bin"
+)
+APPLICATION_ICON_PNG_PATH = (
+    BUNDLE_RESOURCE_DIRECTORY / "assets" / "seatsentinel-icon.png"
+)
+APPLICATION_ICON_ICO_PATH = (
+    BUNDLE_RESOURCE_DIRECTORY / "assets" / "seatsentinel-icon.ico"
+)
+FACE_TEMPLATE_PATH = USER_DATA_DIRECTORY / "registered-face.dat"

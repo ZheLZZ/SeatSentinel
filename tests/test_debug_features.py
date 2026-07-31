@@ -15,6 +15,13 @@ import config
 from app import TrayApplication
 from debug_frame import DebugFrameBuffer
 from detector import DetectorInferenceError, FaceDetection, FaceDetector
+from face_identity import (
+    FaceIdentityRecognizer,
+    FaceTemplate,
+    FaceTemplateError,
+    FaceTemplateStore,
+)
+from main import evaluate_lock_warning, evaluate_presence
 from single_instance import DEBUG_WINDOW_EVENT_NAME, MUTEX_NAME
 from user_settings import AppSettings, SettingsStore
 
@@ -23,13 +30,15 @@ class ApplicationDefaultsTests(unittest.TestCase):
     def test_title_and_lock_timeouts(self) -> None:
         settings = AppSettings.defaults()
         self.assertEqual(config.APPLICATION_TITLE, "SeatSentinel")
-        self.assertEqual(config.APPLICATION_VERSION, "0.1.1-beta")
+        self.assertEqual(config.APPLICATION_VERSION, "0.2.2-beta")
         self.assertEqual(config.USER_DATA_DIRECTORY.name, "SeatSentinel")
         self.assertIn("SeatSentinel", MUTEX_NAME)
         self.assertIn("SeatSentinel", DEBUG_WINDOW_EVENT_NAME)
         self.assertEqual(settings.inference_device, "NPU")
+        self.assertEqual(settings.presence_mode, "ANY_FACE")
         self.assertEqual(settings.face_absence_timeout_seconds, 60)
         self.assertEqual(settings.input_idle_timeout_seconds, 60)
+        self.assertEqual(config.LOCK_WARNING_SECONDS, 5.0)
         self.assertEqual(os.environ.get("DO_NOT_TRACK"), "1")
         self.assertEqual(os.environ.get("SCARF_NO_ANALYTICS"), "1")
 
@@ -38,6 +47,12 @@ class ApplicationDefaultsTests(unittest.TestCase):
             {"inference_device": "cpu"}
         )
         self.assertEqual(settings.inference_device, "CPU")
+
+    def test_registered_face_mode_setting_is_normalized(self) -> None:
+        settings = AppSettings.from_mapping(
+            {"presence_mode": "registered_face"}
+        )
+        self.assertEqual(settings.presence_mode, "REGISTERED_FACE")
 
     def test_legacy_settings_are_migrated(self) -> None:
         for legacy_name in ("AwayLock", "PresenceLock"):
@@ -165,6 +180,169 @@ class DetectionParsingTests(unittest.TestCase):
             )
 
 
+class LockWarningDecisionTests(unittest.TestCase):
+    def test_countdown_requires_five_continuous_seconds(self) -> None:
+        started_at, remaining, should_lock = evaluate_lock_warning(
+            True,
+            cycle_time=100.0,
+            warning_started_at=None,
+            warning_duration_seconds=5.0,
+        )
+        self.assertEqual(started_at, 100.0)
+        self.assertEqual(remaining, 5)
+        self.assertFalse(should_lock)
+
+        started_at, remaining, should_lock = evaluate_lock_warning(
+            True,
+            cycle_time=103.2,
+            warning_started_at=started_at,
+            warning_duration_seconds=5.0,
+        )
+        self.assertEqual(remaining, 2)
+        self.assertFalse(should_lock)
+
+        started_at, remaining, should_lock = evaluate_lock_warning(
+            True,
+            cycle_time=105.0,
+            warning_started_at=started_at,
+            warning_duration_seconds=5.0,
+        )
+        self.assertEqual(remaining, 0)
+        self.assertTrue(should_lock)
+
+    def test_countdown_is_cancelled_when_conditions_recover(self) -> None:
+        started_at, _, _ = evaluate_lock_warning(
+            True,
+            cycle_time=10.0,
+            warning_started_at=None,
+            warning_duration_seconds=5.0,
+        )
+        started_at, remaining, should_lock = evaluate_lock_warning(
+            False,
+            cycle_time=12.0,
+            warning_started_at=started_at,
+            warning_duration_seconds=5.0,
+        )
+        self.assertIsNone(started_at)
+        self.assertIsNone(remaining)
+        self.assertFalse(should_lock)
+
+
+class PresenceDecisionTests(unittest.TestCase):
+    def test_any_face_mode_keeps_existing_behavior(self) -> None:
+        present, streak = evaluate_presence(
+            [FaceDetection(0.9, 1, 1, 10, 10)],
+            "ANY_FACE",
+            previous_identity_match_streak=9,
+            required_identity_confirmations=2,
+        )
+        self.assertTrue(present)
+        self.assertEqual(streak, 0)
+
+    def test_registered_mode_ignores_unknown_faces(self) -> None:
+        present, streak = evaluate_presence(
+            [
+                FaceDetection(
+                    0.9,
+                    1,
+                    1,
+                    10,
+                    10,
+                    identity_similarity=0.42,
+                    is_registered_person=False,
+                )
+            ],
+            "REGISTERED_FACE",
+            previous_identity_match_streak=0,
+            required_identity_confirmations=2,
+        )
+        self.assertFalse(present)
+        self.assertEqual(streak, 0)
+
+    def test_registered_mode_requires_consecutive_matches(self) -> None:
+        detection = FaceDetection(
+            0.9,
+            1,
+            1,
+            10,
+            10,
+            identity_similarity=0.82,
+            is_registered_person=True,
+        )
+        first_present, streak = evaluate_presence(
+            [detection],
+            "REGISTERED_FACE",
+            previous_identity_match_streak=0,
+            required_identity_confirmations=2,
+        )
+        second_present, streak = evaluate_presence(
+            [detection],
+            "REGISTERED_FACE",
+            previous_identity_match_streak=streak,
+            required_identity_confirmations=2,
+        )
+        self.assertFalse(first_present)
+        self.assertTrue(second_present)
+        self.assertEqual(streak, 2)
+
+    def test_embedding_normalization_rejects_wrong_dimensions(self) -> None:
+        with self.assertRaises(FaceTemplateError):
+            FaceTemplateStore.normalize_embedding(
+                np.ones(255, dtype=np.float32)
+            )
+
+    def test_recognizer_annotates_registered_and_unknown_faces(self) -> None:
+        recognizer = FaceIdentityRecognizer.__new__(FaceIdentityRecognizer)
+        registered_embedding = np.zeros(256, dtype=np.float32)
+        registered_embedding[0] = 1.0
+        unknown_embedding = np.zeros(256, dtype=np.float32)
+        unknown_embedding[1] = 1.0
+        embeddings = iter((registered_embedding, unknown_embedding))
+        recognizer.extract_embedding = lambda frame, detection: next(
+            embeddings
+        )
+        template = FaceTemplate(
+            embedding=registered_embedding,
+            sample_count=12,
+            created_at="test",
+        )
+        detections = recognizer.recognize_faces(
+            np.zeros((20, 20, 3), dtype=np.uint8),
+            [
+                FaceDetection(0.9, 1, 1, 9, 9),
+                FaceDetection(0.9, 10, 1, 18, 9),
+            ],
+            template,
+            similarity_threshold=0.70,
+        )
+        self.assertTrue(detections[0].is_registered_person)
+        self.assertFalse(detections[1].is_registered_person)
+        self.assertAlmostEqual(detections[0].identity_similarity, 1.0)
+        self.assertAlmostEqual(detections[1].identity_similarity, 0.0)
+
+    @unittest.skipUnless(os.name == "nt", "Windows DPAPI is required")
+    def test_template_is_dpapi_protected_and_round_trips(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory) / "registered-face.dat"
+            store = FaceTemplateStore(path)
+            source = np.arange(1, 257, dtype=np.float32)
+            saved = store.save_embeddings(
+                [source + value for value in range(5)]
+            )
+            loaded = store.load()
+            self.assertEqual(saved.sample_count, 5)
+            self.assertEqual(loaded.embedding.shape, (256,))
+            self.assertAlmostEqual(
+                float(np.linalg.norm(loaded.embedding)),
+                1.0,
+                places=5,
+            )
+            self.assertNotIn(
+                b"embedding_f32_base64",
+                path.read_bytes(),
+            )
+
+
 class DebugFrameBufferTests(unittest.TestCase):
     def test_publish_snapshot_copy_and_clear(self) -> None:
         buffer = DebugFrameBuffer()
@@ -189,6 +367,7 @@ class DebugFrameBufferTests(unittest.TestCase):
         assert first.frame_bgr is not None
         self.assertTrue(np.all(first.frame_bgr == 7))
         self.assertTrue(first.face_detected)
+        self.assertTrue(first.presence_detected)
         self.assertEqual(first.detections, (detection,))
         self.assertEqual(first.face_absent_seconds, 0.0)
         self.assertEqual(first.input_idle_seconds, 2.5)

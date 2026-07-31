@@ -1,4 +1,4 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param(
     [switch]$VerifyModelsOnly
 )
@@ -106,7 +106,7 @@ try {
     Set-Location -LiteralPath $PSScriptRoot
 
     Write-Host "SeatSentinel - 一键启动" -ForegroundColor Green
-    Write-Host "首次运行会安装本地依赖并下载人脸检测模型。"
+    Write-Host "首次运行会安装本地依赖并下载本地人脸检测/识别模型。"
 
     $preferredPython = Join-Path `
         $env:LOCALAPPDATA `
@@ -201,47 +201,90 @@ try {
             -Path $modelsDirectory)
     }
 
-    $modelBaseUrl = (
+    $modelRepositoryUrl = (
         "https://storage.openvinotoolkit.org/repositories/" +
-        "open_model_zoo/2022.1/models_bin/2/" +
-        "face-detection-retail-0004/FP32"
+        "open_model_zoo/2022.1/models_bin/2"
     )
-    $modelXml = Join-Path `
-        $modelsDirectory `
-        "face-detection-retail-0004.xml"
-    $modelBin = Join-Path `
-        $modelsDirectory `
-        "face-detection-retail-0004.bin"
-    $modelXmlSha256 = (
-        "E1103759CF32B74AE3C2E84E9653DB5F" +
-        "A0D69AC246DC1E17AC3B116EFF319459"
-    )
-    $modelBinSha256 = (
-        "89349CE12DD21C5263FB302CD3FFD4B7" +
-        "3C35EA12ED98AFF863D03A2CF3A32464"
+    $modelDefinitions = @(
+        [PSCustomObject]@{
+            Name = "face-detection-retail-0004"
+            Label = "人脸检测"
+            XmlSha256 = (
+                "E1103759CF32B74AE3C2E84E9653DB5F" +
+                "A0D69AC246DC1E17AC3B116EFF319459"
+            )
+            BinSha256 = (
+                "89349CE12DD21C5263FB302CD3FFD4B7" +
+                "3C35EA12ED98AFF863D03A2CF3A32464"
+            )
+            XmlMinimumBytes = 10000
+            BinMinimumBytes = 1000000
+        },
+        [PSCustomObject]@{
+            Name = "landmarks-regression-retail-0009"
+            Label = "人脸关键点"
+            XmlSha256 = (
+                "8EDE1C8A94BFF1C0DDDA96F938CB8722" +
+                "49BD0E1E33E77315498C8A8F17470AC1"
+            )
+            BinSha256 = (
+                "71199E8D6DF4583C3BA4AD8EAB013F36" +
+                "995B9FEF2DD6D85D86C2CC2322803955"
+            )
+            XmlMinimumBytes = 50000
+            BinMinimumBytes = 700000
+        },
+        [PSCustomObject]@{
+            Name = "face-reidentification-retail-0095"
+            Label = "本人人脸特征"
+            XmlSha256 = (
+                "9148EB0E6578807B073F2A90649C7015" +
+                "66A277DF1A2086E769C2CB263CC66B86"
+            )
+            BinSha256 = (
+                "C0A0ACB57503ACB0B04A9AA3B1A6DA7" +
+                "165C799D0DC2A462AD6B081A5CD1BC908"
+            )
+            XmlMinimumBytes = 300000
+            BinMinimumBytes = 4000000
+        }
     )
 
-    $modelXmlIsValid = Test-FileSha256 `
-        -Path $modelXml `
-        -ExpectedSha256 $modelXmlSha256
-    $modelBinIsValid = Test-FileSha256 `
-        -Path $modelBin `
-        -ExpectedSha256 $modelBinSha256
-
-    if (-not $modelXmlIsValid -or -not $modelBinIsValid) {
-        Write-Step "首次下载 Intel Open Model Zoo 人脸检测模型"
-        Download-ModelFile `
-            -Url "$modelBaseUrl/face-detection-retail-0004.xml" `
-            -Destination $modelXml `
-            -MinimumBytes 10000 `
-            -ExpectedSha256 $modelXmlSha256
-        Download-ModelFile `
-            -Url "$modelBaseUrl/face-detection-retail-0004.bin" `
-            -Destination $modelBin `
-            -MinimumBytes 1000000 `
-            -ExpectedSha256 $modelBinSha256
+    foreach ($modelDefinition in $modelDefinitions) {
+        $modelName = $modelDefinition.Name
+        $modelBaseUrl = (
+            "$modelRepositoryUrl/$modelName/FP32"
+        )
+        $modelXml = Join-Path `
+            $modelsDirectory `
+            "$modelName.xml"
+        $modelBin = Join-Path `
+            $modelsDirectory `
+            "$modelName.bin"
+        if (
+            -not (Test-FileSha256 `
+                -Path $modelXml `
+                -ExpectedSha256 $modelDefinition.XmlSha256) -or
+            -not (Test-FileSha256 `
+                -Path $modelBin `
+                -ExpectedSha256 $modelDefinition.BinSha256)
+        ) {
+            Write-Step (
+                "下载 Intel Open Model Zoo $($modelDefinition.Label)模型"
+            )
+            Download-ModelFile `
+                -Url "$modelBaseUrl/$modelName.xml" `
+                -Destination $modelXml `
+                -MinimumBytes $modelDefinition.XmlMinimumBytes `
+                -ExpectedSha256 $modelDefinition.XmlSha256
+            Download-ModelFile `
+                -Url "$modelBaseUrl/$modelName.bin" `
+                -Destination $modelBin `
+                -MinimumBytes $modelDefinition.BinMinimumBytes `
+                -ExpectedSha256 $modelDefinition.BinSha256
+        }
     }
-    Write-Host "模型 SHA-256 校验通过。"
+    Write-Host "全部模型 SHA-256 校验通过。"
 
     if ($VerifyModelsOnly) {
         Write-Host "模型完整性检查完成，未启动 SeatSentinel。"
