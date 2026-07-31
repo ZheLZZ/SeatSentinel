@@ -20,6 +20,8 @@ class DebugFrameSnapshot:
     frame_bgr: Optional[NDArray[np.uint8]]
     detections: tuple[FaceDetection, ...]
     face_detected: Optional[bool]
+    presence_detected: Optional[bool]
+    presence_mode: str
     device: str
     status: str
     face_absent_seconds: Optional[float]
@@ -39,6 +41,8 @@ class DebugFrameBuffer:
         self._frame_bgr: Optional[NDArray[np.uint8]] = None
         self._detections: tuple[FaceDetection, ...] = ()
         self._face_detected: Optional[bool] = None
+        self._presence_detected: Optional[bool] = None
+        self._presence_mode = ""
         self._device = ""
         self._status = "等待监控启动"
         self._face_absent_seconds: Optional[float] = None
@@ -60,6 +64,8 @@ class DebugFrameBuffer:
         startup_elapsed_seconds: Optional[float] = None,
         should_lock: Optional[bool] = None,
         inference_ms: Optional[float] = None,
+        presence_detected: Optional[bool] = None,
+        presence_mode: str = "",
     ) -> None:
         """Copy a monitoring result into the in-memory latest-frame slot."""
         if (
@@ -76,6 +82,12 @@ class DebugFrameBuffer:
             self._frame_bgr = frame_copy
             self._detections = detection_copy
             self._face_detected = bool(detection_copy)
+            self._presence_detected = (
+                bool(detection_copy)
+                if presence_detected is None
+                else bool(presence_detected)
+            )
+            self._presence_mode = str(presence_mode)
             self._device = str(device)
             self._status = str(status)
             self._face_absent_seconds = face_absent_seconds
@@ -92,6 +104,8 @@ class DebugFrameBuffer:
             self._frame_bgr = None
             self._detections = ()
             self._face_detected = None
+            self._presence_detected = None
+            self._presence_mode = ""
             self._device = str(device)
             self._status = str(status)
             self._face_absent_seconds = None
@@ -114,6 +128,8 @@ class DebugFrameBuffer:
                 frame_bgr=frame_copy,
                 detections=self._detections,
                 face_detected=self._face_detected,
+                presence_detected=self._presence_detected,
+                presence_mode=self._presence_mode,
                 device=self._device,
                 status=self._status,
                 face_absent_seconds=self._face_absent_seconds,

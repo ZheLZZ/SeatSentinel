@@ -41,6 +41,8 @@ class FaceDetection:
     ymin: int
     xmax: int
     ymax: int
+    identity_similarity: Optional[float] = None
+    is_registered_person: Optional[bool] = None
 
 
 class FaceDetector:

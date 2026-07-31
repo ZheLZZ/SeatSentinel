@@ -1,6 +1,6 @@
 # SeatSentinel 隐私说明
 
-适用版本：`v0.1.1-beta`
+适用版本：`v0.2.2-beta`
 
 SeatSentinel 的设计目标是只在本机判断用户是否仍在电脑前，并在满足安全条件时
 调用 Windows 锁屏。SeatSentinel 不提供云端服务，也不要求用户账户。
@@ -14,14 +14,16 @@ SeatSentinel 的设计目标是只在本机判断用户是否仍在电脑前，�
 - 锁屏、暂停、摄像头释放和程序退出时立即清空最新帧；
 - 关闭调试窗口不会创建或保留历史画面。
 
-SeatSentinel 只做人脸存在检测，不进行身份识别，不建立人脸库，也不生成可用于
-识别个人身份的人脸特征模板。
+默认的“任意人脸”模式只做人脸存在检测。“仅本人”模式会对检测到的人脸进行
+关键点对齐并生成 256 维特征，用于和本机已注册模板做一对一比对。该处理全部在
+当前进程内完成，不建立多人脸库，也不向任何网络服务发送特征。
 
 ## 本地保存的数据
 
 SeatSentinel 可能在本地保存：
 
 - 用户设置：摄像头名称、推理设备、阈值、时间和分辨率；
+- 本人人脸模板：仅在用户主动注册后保存一个 256 维平均特征，不包含注册照片；
 - 运行日志：启动、停止、设备选择、故障和锁屏状态。
 
 日志不包含摄像头画面。日志可能包含摄像头设备名称、OpenVINO 设备名称和
@@ -33,7 +35,13 @@ SeatSentinel 可能在本地保存：
 ```text
 %LOCALAPPDATA%\SeatSentinel\settings.json
 %LOCALAPPDATA%\SeatSentinel\logs\seat-sentinel.log
+%LOCALAPPDATA%\SeatSentinel\registered-face.dat
 ```
+
+`registered-face.dat` 使用 Windows Data Protection API（DPAPI）按当前 Windows
+用户加密，不能作为普通图片查看。它仍属于敏感生物识别数据：能够登录同一
+Windows 用户并运行 SeatSentinel 的进程可以请求系统解密。用户可在设置中点击
+“删除本人数据”永久移除模板；删除后程序自动切回“任意人脸”模式。
 
 首次运行打包版时，如果新目录还没有设置文件，程序会只读检查旧版应用目录，
 并将找到的设置复制到 SeatSentinel 目录。旧目录及其日志不会被删除或上传。
@@ -45,7 +53,7 @@ SeatSentinel 的正常监控代码不包含上传、远程推理或网络 API �
 `一键启动.ps1` 仅在以下情况下联网：
 
 1. 从 PyPI 或配置的镜像安装 Python 依赖；
-2. 从 Intel Open Model Zoo 官方存储地址下载人脸检测模型。
+2. 从 Intel Open Model Zoo 官方存储地址下载人脸检测、关键点和特征模型。
 
 下载后的模型必须通过固定 SHA-256 校验。
 

@@ -23,6 +23,7 @@ class AppSettings:
     detection_interval_seconds: float
     face_confidence_threshold: float
     inference_device: str
+    presence_mode: str
     face_absence_timeout_seconds: float
     input_idle_timeout_seconds: float
     startup_grace_period_seconds: float
@@ -40,6 +41,7 @@ class AppSettings:
                 config.FACE_CONFIDENCE_THRESHOLD
             ),
             inference_device=config.PREFERRED_INFERENCE_DEVICE,
+            presence_mode=config.PRESENCE_MODE,
             face_absence_timeout_seconds=(
                 config.FACE_ABSENCE_TIMEOUT_SECONDS
             ),
@@ -69,6 +71,9 @@ class AppSettings:
                 inference_device=str(
                     defaults["inference_device"]
                 ).strip().upper(),
+                presence_mode=str(
+                    defaults["presence_mode"]
+                ).strip().upper(),
                 face_absence_timeout_seconds=float(
                     defaults["face_absence_timeout_seconds"]
                 ),
@@ -95,6 +100,8 @@ class AppSettings:
             raise SettingsError("人脸置信度必须在 0.1 至 1.0 之间")
         if self.inference_device not in {"NPU", "CPU"}:
             raise SettingsError("推理设备只能选择 NPU 或 CPU")
+        if self.presence_mode not in {"ANY_FACE", "REGISTERED_FACE"}:
+            raise SettingsError("在场判断只能选择任意人脸或仅本人")
         if not 3.0 <= self.face_absence_timeout_seconds <= 3600.0:
             raise SettingsError("无人超时必须在 3 至 3600 秒之间")
         if not 3.0 <= self.input_idle_timeout_seconds <= 3600.0:
@@ -116,6 +123,7 @@ class AppSettings:
             self.face_confidence_threshold
         )
         config.PREFERRED_INFERENCE_DEVICE = self.inference_device
+        config.PRESENCE_MODE = self.presence_mode
         config.FACE_ABSENCE_TIMEOUT_SECONDS = (
             self.face_absence_timeout_seconds
         )

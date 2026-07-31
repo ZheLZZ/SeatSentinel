@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import logging.handlers
+import math
 import sys
 import time
 from enum import Enum
@@ -22,6 +23,14 @@ from detector import (
     DetectorInferenceError,
     FaceDetection,
     FaceDetector,
+)
+from face_identity import (
+    FaceIdentityError,
+    FaceIdentityInferenceError,
+    FaceIdentityRecognizer,
+    FaceTemplate,
+    FaceTemplateError,
+    FaceTemplateStore,
 )
 from session_monitor import SessionMonitor, SessionMonitorError
 from windows_lock import WindowsLockError, lock_workstation
@@ -78,6 +87,8 @@ def _publish_debug_frame(
     startup_elapsed_seconds: Optional[float],
     should_lock: bool,
     inference_ms: Optional[float],
+    presence_detected: bool,
+    presence_mode: str,
 ) -> None:
     if debug_frame_buffer is None:
         return
@@ -92,6 +103,8 @@ def _publish_debug_frame(
             startup_elapsed_seconds=startup_elapsed_seconds,
             should_lock=should_lock,
             inference_ms=inference_ms,
+            presence_detected=presence_detected,
+            presence_mode=presence_mode,
         )
     except Exception:
         LOGGER.exception("Unable to publish the in-memory debug frame")
@@ -163,16 +176,81 @@ def _seconds_text(seconds: Optional[float]) -> str:
     return f"{seconds:.1f}"
 
 
+def evaluate_presence(
+    detections: list[FaceDetection],
+    presence_mode: str,
+    previous_identity_match_streak: int,
+    required_identity_confirmations: int,
+) -> tuple[bool, int]:
+    """Return current presence and the updated registered-face streak."""
+    if presence_mode == "ANY_FACE":
+        return bool(detections), 0
+    if presence_mode != "REGISTERED_FACE":
+        raise ValueError(f"Unsupported presence mode: {presence_mode}")
+    if required_identity_confirmations < 1:
+        raise ValueError("Identity confirmation count must be positive")
+    raw_identity_match = any(
+        detection.is_registered_person is True
+        for detection in detections
+    )
+    identity_match_streak = (
+        previous_identity_match_streak + 1
+        if raw_identity_match
+        else 0
+    )
+    return (
+        identity_match_streak >= required_identity_confirmations,
+        identity_match_streak,
+    )
+
+
+def evaluate_lock_warning(
+    lock_conditions_met: bool,
+    cycle_time: float,
+    warning_started_at: Optional[float],
+    warning_duration_seconds: float,
+) -> tuple[Optional[float], Optional[int], bool]:
+    """Advance a cancellable pre-lock warning countdown."""
+    if warning_duration_seconds <= 0:
+        raise ValueError("Lock warning duration must be positive")
+    if not lock_conditions_met:
+        return None, None, False
+    started_at = (
+        cycle_time
+        if warning_started_at is None
+        else warning_started_at
+    )
+    remaining_seconds = max(
+        0.0,
+        warning_duration_seconds - (cycle_time - started_at),
+    )
+    if remaining_seconds <= 0:
+        return started_at, 0, True
+    return started_at, max(1, math.ceil(remaining_seconds)), False
+
+
 def monitor_until_session_pause(
     camera: Camera,
     detector: FaceDetector,
     activity_monitor: ActivityMonitor,
     session_monitor: SessionMonitor,
+    identity_recognizer: Optional[FaceIdentityRecognizer] = None,
+    face_template: Optional[FaceTemplate] = None,
     stop_event: Optional[Event] = None,
     status_callback: Optional[StatusCallback] = None,
     debug_frame_buffer: Optional[DebugFrameBuffer] = None,
 ) -> MonitorOutcome:
     """Monitor until Windows locks or the session state becomes uncertain."""
+    registered_face_mode = config.PRESENCE_MODE == "REGISTERED_FACE"
+    if registered_face_mode and (
+        identity_recognizer is None or face_template is None
+    ):
+        raise FaceIdentityError("仅本人模式尚未完成本人人脸注册")
+    device_text = detector.device
+    if identity_recognizer is not None:
+        identity_device = identity_recognizer.device
+        if identity_device and identity_device != detector.device:
+            device_text = f"检测 {detector.device} / 识别 {identity_device}"
     monitoring_started_at = time.monotonic()
     last_seen_time = monitoring_started_at
     next_detection_at = monitoring_started_at
@@ -185,6 +263,8 @@ def monitor_until_session_pause(
     camera_was_healthy = True
     inference_was_healthy = True
     activity_was_healthy = True
+    identity_match_streak = 0
+    lock_warning_started_at: Optional[float] = None
 
     LOGGER.info(
         "Monitoring active; grace period is %.0f seconds",
@@ -193,7 +273,11 @@ def monitor_until_session_pause(
     _report_status(
         status_callback,
         "monitoring",
-        f"正在监控 · {detector.device}",
+        (
+            f"正在监控 · 仅本人 · {device_text}"
+            if registered_face_mode
+            else f"正在监控 · 任意人脸 · {device_text}"
+        ),
     )
 
     while True:
@@ -201,7 +285,7 @@ def monitor_until_session_pause(
             _clear_debug_frame(
                 debug_frame_buffer,
                 "监控已停止 · 调试画面已清空",
-                detector.device,
+                device_text,
             )
             return MonitorOutcome.STOP_REQUESTED
 
@@ -221,7 +305,7 @@ def monitor_until_session_pause(
                 _clear_debug_frame(
                     debug_frame_buffer,
                     "Windows 已锁定 · 调试画面已清空",
-                    detector.device,
+                    device_text,
                 )
                 LOGGER.info(
                     "Windows session is locked; pausing camera monitoring"
@@ -236,7 +320,7 @@ def monitor_until_session_pause(
             _clear_debug_frame(
                 debug_frame_buffer,
                 "Windows 会话状态不明 · 调试画面已清空",
-                detector.device,
+                device_text,
             )
             LOGGER.warning(
                 "Windows session state is unknown; "
@@ -252,7 +336,8 @@ def monitor_until_session_pause(
 
         camera_ok, frame = camera.read()
         inference_ok = False
-        face_detected: Optional[bool] = None
+        any_face_detected: Optional[bool] = None
+        presence_detected: Optional[bool] = None
         detections: list[FaceDetection] = []
         inference_ms: Optional[float] = None
 
@@ -260,11 +345,12 @@ def monitor_until_session_pause(
             _clear_debug_frame(
                 debug_frame_buffer,
                 "摄像头读取失败 · 调试画面已清空",
-                detector.device,
+                device_text,
             )
             # Unknown visual state is treated as presence. This starts a fresh
             # uninterrupted absence window after the camera recovers.
             last_seen_time = cycle_time
+            identity_match_streak = 0
             if (
                 cycle_time - last_camera_error_log_at
                 >= config.ERROR_LOG_INTERVAL_SECONDS
@@ -290,7 +376,7 @@ def monitor_until_session_pause(
                     _report_status(
                         status_callback,
                         "monitoring",
-                        f"摄像头已恢复 · {detector.device}",
+                        f"摄像头已恢复 · {device_text}",
                     )
                 except CameraError as exc:
                     LOGGER.warning(
@@ -309,23 +395,50 @@ def monitor_until_session_pause(
             try:
                 inference_started_at = time.perf_counter()
                 detections = detector.detect_faces(frame)
+                any_face_detected = bool(detections)
+                if registered_face_mode:
+                    assert identity_recognizer is not None
+                    assert face_template is not None
+                    detections = identity_recognizer.recognize_faces(
+                        frame,
+                        detections,
+                        face_template,
+                        config.FACE_MATCH_SIMILARITY_THRESHOLD,
+                    )
+                    presence_detected, identity_match_streak = (
+                        evaluate_presence(
+                            detections,
+                            config.PRESENCE_MODE,
+                            identity_match_streak,
+                            config.IDENTITY_MATCH_CONFIRMATION_FRAMES,
+                        )
+                    )
+                else:
+                    presence_detected, identity_match_streak = (
+                        evaluate_presence(
+                            detections,
+                            config.PRESENCE_MODE,
+                            identity_match_streak,
+                            config.IDENTITY_MATCH_CONFIRMATION_FRAMES,
+                        )
+                    )
                 inference_ms = (
                     time.perf_counter() - inference_started_at
                 ) * 1000.0
-                face_detected = bool(detections)
                 inference_ok = True
                 if not inference_was_healthy:
                     LOGGER.info("Model inference recovered")
                 inference_was_healthy = True
-            except DetectorInferenceError as exc:
+            except (DetectorInferenceError, FaceIdentityInferenceError) as exc:
                 _clear_debug_frame(
                     debug_frame_buffer,
                     "模型推理失败 · 调试画面已清空",
-                    detector.device,
+                    device_text,
                 )
                 # As with camera failure, do not count uncertain time as
                 # confirmed absence.
                 last_seen_time = cycle_time
+                identity_match_streak = 0
                 if (
                     cycle_time - last_inference_error_log_at
                     >= config.ERROR_LOG_INTERVAL_SECONDS
@@ -342,7 +455,7 @@ def monitor_until_session_pause(
                     last_inference_error_log_at = cycle_time
                 inference_was_healthy = False
 
-        if face_detected is True:
+        if presence_detected is True:
             last_seen_time = cycle_time
 
         face_absent_seconds = max(0.0, cycle_time - last_seen_time)
@@ -369,10 +482,10 @@ def monitor_until_session_pause(
             activity_was_healthy = False
 
         startup_elapsed_seconds = cycle_time - monitoring_started_at
-        should_lock = (
+        lock_conditions_met = (
             camera_ok
             and inference_ok
-            and face_detected is False
+            and presence_detected is False
             and face_absent_seconds
             >= config.FACE_ABSENCE_TIMEOUT_SECONDS
             and input_idle_seconds is not None
@@ -381,57 +494,121 @@ def monitor_until_session_pause(
             >= config.STARTUP_GRACE_PERIOD_SECONDS
             and cycle_time >= lock_retry_not_before
         )
+        previous_lock_warning_started_at = lock_warning_started_at
+        (
+            lock_warning_started_at,
+            lock_warning_seconds,
+            should_lock,
+        ) = evaluate_lock_warning(
+            lock_conditions_met,
+            cycle_time,
+            lock_warning_started_at,
+            config.LOCK_WARNING_SECONDS,
+        )
+        warning_started = (
+            previous_lock_warning_started_at is None
+            and lock_warning_started_at is not None
+        )
+        warning_cancelled = (
+            previous_lock_warning_started_at is not None
+            and lock_warning_started_at is None
+        )
+        if warning_started:
+            LOGGER.info(
+                "Lock conditions met; starting %.1f-second warning",
+                config.LOCK_WARNING_SECONDS,
+            )
+        elif warning_cancelled:
+            LOGGER.info(
+                "Presence or input resumed; lock warning cancelled"
+            )
 
         if (
             camera_ok
             and frame is not None
             and inference_ok
-            and face_detected is not None
+            and presence_detected is not None
         ):
             _publish_debug_frame(
                 debug_frame_buffer,
                 frame,
                 detections,
-                detector.device,
+                device_text,
                 (
-                    f"检测正常 · 发现 {len(detections)} 张人脸"
-                    if face_detected
-                    else "检测正常 · 未发现人脸"
+                    (
+                        f"仅本人模式 · 已确认本人 · 共 {len(detections)} 张人脸"
+                        if presence_detected
+                        else (
+                            "仅本人模式 · 正在连续确认本人"
+                            if any(
+                                detection.is_registered_person is True
+                                for detection in detections
+                            )
+                            else (
+                                f"仅本人模式 · {len(detections)} 张人脸均非本人"
+                                if detections
+                                else "仅本人模式 · 未发现人脸"
+                            )
+                        )
+                    )
+                    if registered_face_mode
+                    else (
+                        f"任意人脸模式 · 发现 {len(detections)} 张人脸"
+                        if any_face_detected
+                        else "任意人脸模式 · 未发现人脸"
+                    )
                 ),
                 face_absent_seconds,
                 input_idle_seconds,
                 startup_elapsed_seconds,
                 should_lock,
                 inference_ms,
+                presence_detected,
+                config.PRESENCE_MODE,
             )
 
         if (
             cycle_time - last_status_log_at
             >= config.STATUS_LOG_INTERVAL_SECONDS
+            or lock_warning_seconds is not None
+            or warning_cancelled
             or should_lock
         ):
             LOGGER.info(
-                "状态 | 检测到人脸=%s | 距上次人脸=%s秒 | "
+                "状态 | 在场判断=%s | 距上次确认在场=%s秒 | "
                 "距上次键鼠活动=%s秒 | 推理设备=%s | 达到锁屏条件=%s",
-                _face_status_text(face_detected),
+                _face_status_text(presence_detected),
                 _seconds_text(face_absent_seconds),
                 _seconds_text(input_idle_seconds),
-                detector.device,
+                device_text,
                 "是" if should_lock else "否",
             )
-            _report_status(
-                status_callback,
-                "monitoring",
-                "人脸=%s · 无人=%s秒 · 键鼠空闲=%s秒 · %s · "
-                "锁屏条件=%s"
-                % (
-                    _face_status_text(face_detected),
-                    _seconds_text(face_absent_seconds),
-                    _seconds_text(input_idle_seconds),
-                    detector.device,
-                    "是" if should_lock else "否",
-                ),
-            )
+            if lock_warning_seconds is not None and not should_lock:
+                _report_status(
+                    status_callback,
+                    "lock_warning",
+                    f"{lock_warning_seconds} 秒后自动锁屏",
+                )
+            elif warning_cancelled:
+                _report_status(
+                    status_callback,
+                    "monitoring",
+                    "检测到在场或键鼠操作 · 已取消锁屏",
+                )
+            else:
+                _report_status(
+                    status_callback,
+                    "monitoring",
+                    "在场=%s · 离席=%s秒 · 键鼠空闲=%s秒 · %s · "
+                    "锁屏条件=%s"
+                    % (
+                        _face_status_text(presence_detected),
+                        _seconds_text(face_absent_seconds),
+                        _seconds_text(input_idle_seconds),
+                        device_text,
+                        "是" if should_lock else "否",
+                    ),
+                )
             last_status_log_at = cycle_time
 
         if not should_lock:
@@ -448,6 +625,12 @@ def monitor_until_session_pause(
                 "Final keyboard/mouse check failed; lock cancelled: %s",
                 exc,
             )
+            lock_warning_started_at = None
+            _report_status(
+                status_callback,
+                "monitoring",
+                "无法确认键鼠状态 · 已取消锁屏",
+            )
             continue
 
         if (
@@ -457,6 +640,12 @@ def monitor_until_session_pause(
             LOGGER.info(
                 "Recent keyboard/mouse input detected during final check; "
                 "lock cancelled"
+            )
+            lock_warning_started_at = None
+            _report_status(
+                status_callback,
+                "monitoring",
+                "检测到键鼠操作 · 已取消锁屏",
             )
             continue
 
@@ -474,7 +663,7 @@ def monitor_until_session_pause(
         _clear_debug_frame(
             debug_frame_buffer,
             "正在锁定 Windows · 调试画面已清空",
-            detector.device,
+            device_text,
         )
         try:
             lock_workstation()
@@ -488,8 +677,14 @@ def monitor_until_session_pause(
         except WindowsLockError as exc:
             LOGGER.error("%s", exc)
             last_seen_time = cycle_time
+            lock_warning_started_at = None
             lock_retry_not_before = (
                 cycle_time + config.LOCK_RETRY_COOLDOWN_SECONDS
+            )
+            _report_status(
+                status_callback,
+                "monitoring",
+                "锁屏调用失败 · 将稍后重试",
             )
 
 
@@ -705,6 +900,8 @@ def run(
     """Run persistent lock, unlock, and resume cycles."""
     camera: Optional[Camera] = None
     detector: Optional[FaceDetector] = None
+    identity_recognizer: Optional[FaceIdentityRecognizer] = None
+    face_template: Optional[FaceTemplate] = None
 
     try:
         _clear_debug_frame(
@@ -724,10 +921,30 @@ def run(
             confidence_threshold=config.FACE_CONFIDENCE_THRESHOLD,
             preferred_device=config.PREFERRED_INFERENCE_DEVICE,
         )
+        if config.PRESENCE_MODE == "REGISTERED_FACE":
+            face_template = FaceTemplateStore(
+                config.FACE_TEMPLATE_PATH
+            ).load()
+            identity_recognizer = FaceIdentityRecognizer(
+                landmarks_xml_path=config.LANDMARKS_MODEL_XML_PATH,
+                landmarks_bin_path=config.LANDMARKS_MODEL_BIN_PATH,
+                reidentification_xml_path=(
+                    config.FACE_REIDENTIFICATION_MODEL_XML_PATH
+                ),
+                reidentification_bin_path=(
+                    config.FACE_REIDENTIFICATION_MODEL_BIN_PATH
+                ),
+                preferred_device=config.PREFERRED_INFERENCE_DEVICE,
+            )
+        device_text = detector.device
+        if identity_recognizer is not None:
+            device_text = (
+                f"检测 {detector.device} / 识别 {identity_recognizer.device}"
+            )
         _clear_debug_frame(
             debug_frame_buffer,
             "OpenVINO 初始化完成 · 等待摄像头",
-            detector.device,
+            device_text,
         )
 
         camera = Camera(
@@ -746,7 +963,7 @@ def run(
                 stop_event=stop_event,
                 status_callback=status_callback,
                 debug_frame_buffer=debug_frame_buffer,
-                debug_device=detector.device,
+                debug_device=device_text,
             )
             if saw_locked is None:
                 return 0
@@ -763,7 +980,7 @@ def run(
                 stop_event=stop_event,
                 status_callback=status_callback,
                 debug_frame_buffer=debug_frame_buffer,
-                debug_device=detector.device,
+                debug_device=device_text,
             )
             if camera_opened is None:
                 return 0
@@ -776,6 +993,8 @@ def run(
                     detector,
                     activity_monitor,
                     session_monitor,
+                    identity_recognizer=identity_recognizer,
+                    face_template=face_template,
                     stop_event=stop_event,
                     status_callback=status_callback,
                     debug_frame_buffer=debug_frame_buffer,
@@ -785,7 +1004,7 @@ def run(
                 _clear_debug_frame(
                     debug_frame_buffer,
                     "摄像头已释放 · 调试画面已清空",
-                    detector.device,
+                    device_text,
                 )
                 LOGGER.info("Camera released")
 
@@ -798,7 +1017,7 @@ def run(
                     stop_event=stop_event,
                     status_callback=status_callback,
                     debug_frame_buffer=debug_frame_buffer,
-                    debug_device=detector.device,
+                    debug_device=device_text,
                 )
                 if saw_locked is None:
                     return 0
@@ -815,7 +1034,7 @@ def run(
                     stop_event=stop_event,
                     status_callback=status_callback,
                     debug_frame_buffer=debug_frame_buffer,
-                    debug_device=detector.device,
+                    debug_device=device_text,
                 )
                 if saw_locked is None:
                     return 0
@@ -831,6 +1050,8 @@ def run(
     except (
         CameraError,
         DetectorError,
+        FaceIdentityError,
+        FaceTemplateError,
         ActivityMonitorError,
         SessionMonitorError,
     ) as exc:
@@ -859,6 +1080,8 @@ def run(
         )
         if detector is not None:
             detector.close()
+        if identity_recognizer is not None:
+            identity_recognizer.close()
         if stop_event is not None and stop_event.is_set():
             _report_status(
                 status_callback,

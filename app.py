@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+import ctypes
 import logging
 import os
+import queue
 import sys
 import threading
 import time
 import tkinter as tk
 from dataclasses import replace
+from ctypes import wintypes
 from tkinter import messagebox, ttk
 from typing import Callable, Optional
 
@@ -16,12 +19,23 @@ import cv2
 import numpy as np
 import pystray
 from cv2_enumerate_cameras import enumerate_cameras
-from PIL import Image, ImageDraw, ImageTk
+from PIL import Image, ImageDraw, ImageEnhance, ImageTk
 
 import main as monitoring
 import config
 from debug_frame import DebugFrameBuffer, DebugFrameSnapshot
 from detector import FaceDetection, FaceDetector
+from face_identity import (
+    FaceIdentityRecognizer,
+    FaceTemplateError,
+    FaceTemplateStore,
+)
+from face_registration import (
+    FaceRegistrationCancelled,
+    FaceRegistrationError,
+    FaceRegistrationUpdate,
+    register_face_from_camera,
+)
 from session_monitor import SessionMonitor
 from single_instance import (
     DebugWindowSignal,
@@ -34,6 +48,169 @@ from user_settings import AppSettings, SettingsError, SettingsStore
 
 
 LOGGER = logging.getLogger("seat_sentinel.tray")
+PRESENCE_MODE_LABELS = {
+    "ANY_FACE": "任意人脸",
+    "REGISTERED_FACE": "仅本人（需注册）",
+}
+PRESENCE_MODE_VALUES = {
+    label: value for value, label in PRESENCE_MODE_LABELS.items()
+}
+
+GWL_EXSTYLE = -20
+GWLP_HWNDPARENT = -8
+GA_ROOT = 2
+GW_OWNER = 4
+WS_EX_TOOLWINDOW = 0x00000080
+WS_EX_APPWINDOW = 0x00040000
+WS_EX_NOACTIVATE = 0x08000000
+SWP_NOSIZE = 0x0001
+SWP_NOMOVE = 0x0002
+SWP_NOZORDER = 0x0004
+SWP_NOACTIVATE = 0x0010
+SWP_FRAMECHANGED = 0x0020
+SWP_SHOWWINDOW = 0x0040
+HWND_TOPMOST = -1
+
+
+def _native_top_level_handle(window: tk.Misc) -> int:
+    """Return Tk's real Win32 top-level wrapper handle."""
+    window.update_idletasks()
+    user32 = ctypes.windll.user32
+    user32.GetAncestor.argtypes = [wintypes.HWND, wintypes.UINT]
+    user32.GetAncestor.restype = wintypes.HWND
+    child_handle = wintypes.HWND(window.winfo_id())
+    root_handle = user32.GetAncestor(child_handle, GA_ROOT)
+    return int(root_handle or child_handle.value or 0)
+
+
+def _get_window_long_ptr(handle: int, index: int) -> int:
+    user32 = ctypes.windll.user32
+    function = user32.GetWindowLongPtrW
+    function.argtypes = [wintypes.HWND, ctypes.c_int]
+    function.restype = ctypes.c_ssize_t
+    return int(function(wintypes.HWND(handle), index))
+
+
+def _set_window_long_ptr(handle: int, index: int, value: int) -> None:
+    user32 = ctypes.windll.user32
+    function = user32.SetWindowLongPtrW
+    function.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_ssize_t]
+    function.restype = ctypes.c_ssize_t
+    ctypes.set_last_error(0)
+    result = function(wintypes.HWND(handle), index, value)
+    error_code = ctypes.get_last_error()
+    if result == 0 and error_code != 0:
+        raise OSError(error_code, "SetWindowLongPtrW failed")
+
+
+def _configure_taskbar_window(window: tk.Misc) -> int:
+    """Make a borderless Tk top-level an unowned taskbar application."""
+    handle = _native_top_level_handle(window)
+    if not handle:
+        raise OSError("Unable to resolve the debug window handle")
+    current_style = _get_window_long_ptr(handle, GWL_EXSTYLE)
+    taskbar_style = (
+        current_style | WS_EX_APPWINDOW
+    ) & ~WS_EX_TOOLWINDOW
+    _set_window_long_ptr(handle, GWLP_HWNDPARENT, 0)
+    _set_window_long_ptr(handle, GWL_EXSTYLE, taskbar_style)
+
+    user32 = ctypes.windll.user32
+    user32.SetWindowPos.argtypes = [
+        wintypes.HWND,
+        wintypes.HWND,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        wintypes.UINT,
+    ]
+    user32.SetWindowPos.restype = wintypes.BOOL
+    flags = (
+        SWP_NOSIZE
+        | SWP_NOMOVE
+        | SWP_NOZORDER
+        | SWP_NOACTIVATE
+        | SWP_FRAMECHANGED
+    )
+    if not user32.SetWindowPos(
+        wintypes.HWND(handle),
+        wintypes.HWND(0),
+        0,
+        0,
+        0,
+        0,
+        flags,
+    ):
+        raise OSError("Unable to refresh the debug window taskbar style")
+    return handle
+
+
+def _taskbar_window_state(window: tk.Misc) -> tuple[bool, bool]:
+    """Return whether APPWINDOW is set and the native owner is absent."""
+    handle = _native_top_level_handle(window)
+    style = _get_window_long_ptr(handle, GWL_EXSTYLE)
+    user32 = ctypes.windll.user32
+    user32.GetWindow.argtypes = [wintypes.HWND, wintypes.UINT]
+    user32.GetWindow.restype = wintypes.HWND
+    owner = user32.GetWindow(wintypes.HWND(handle), GW_OWNER)
+    has_taskbar_style = bool(style & WS_EX_APPWINDOW) and not bool(
+        style & WS_EX_TOOLWINDOW
+    )
+    return has_taskbar_style, not bool(owner)
+
+
+def _configure_windows_app_identity() -> None:
+    """Give Windows a stable identity for taskbar grouping."""
+    shell32 = ctypes.windll.shell32
+    function = shell32.SetCurrentProcessExplicitAppUserModelID
+    function.argtypes = [wintypes.LPCWSTR]
+    function.restype = ctypes.c_long
+    result = int(function("ZheZZ.SeatSentinel"))
+    if result < 0:
+        raise OSError(result, "Unable to set the Windows application ID")
+
+
+def _configure_overlay_window(window: tk.Misc) -> int:
+    """Keep a notification visible without focus or a taskbar button."""
+    handle = _native_top_level_handle(window)
+    if not handle:
+        raise OSError("Unable to resolve the warning overlay handle")
+    current_style = _get_window_long_ptr(handle, GWL_EXSTYLE)
+    overlay_style = (
+        current_style | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE
+    ) & ~WS_EX_APPWINDOW
+    _set_window_long_ptr(handle, GWL_EXSTYLE, overlay_style)
+
+    user32 = ctypes.windll.user32
+    user32.SetWindowPos.argtypes = [
+        wintypes.HWND,
+        wintypes.HWND,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        wintypes.UINT,
+    ]
+    user32.SetWindowPos.restype = wintypes.BOOL
+    flags = (
+        SWP_NOSIZE
+        | SWP_NOMOVE
+        | SWP_NOACTIVATE
+        | SWP_FRAMECHANGED
+        | SWP_SHOWWINDOW
+    )
+    if not user32.SetWindowPos(
+        wintypes.HWND(handle),
+        wintypes.HWND(HWND_TOPMOST),
+        0,
+        0,
+        0,
+        0,
+        flags,
+    ):
+        raise OSError("Unable to show the lock warning without focus")
+    return handle
 
 
 class MonitoringService:
@@ -53,6 +230,10 @@ class MonitoringService:
     def status_detail(self) -> str:
         with self._state_lock:
             return self._status_detail
+
+    def status_snapshot(self) -> tuple[str, str]:
+        with self._state_lock:
+            return self._status_state, self._status_detail
 
     def is_running(self) -> bool:
         with self._state_lock:
@@ -93,6 +274,14 @@ class MonitoringService:
             name="seat-sentinel-pause",
             daemon=True,
         ).start()
+
+    def pause_blocking(self) -> None:
+        """Stop monitoring synchronously from a non-UI worker thread."""
+        self._update_status("pausing", "正在暂停并释放摄像头")
+        self._debug_frame_buffer.clear(
+            "监控正在暂停 · 调试画面已清空"
+        )
+        self._transition(False, False)
 
     def restart_async(self) -> None:
         self._update_status("starting", "正在应用设置并重启监控")
@@ -195,10 +384,28 @@ class TrayApplication:
         debug_signal: Optional[DebugWindowSignal] = None,
         show_debug_on_start: bool = False,
     ) -> None:
+        try:
+            _configure_windows_app_identity()
+        except OSError as exc:
+            LOGGER.warning("Unable to set Windows taskbar identity: %s", exc)
         self._root = tk.Tk()
         self._root.withdraw()
         self._root.protocol("WM_DELETE_WINDOW", self._root.withdraw)
         self._settings_window: Optional[tk.Toplevel] = None
+        self._registration_window: Optional[tk.Toplevel] = None
+        self._registration_cancel_event: Optional[threading.Event] = None
+        self._registration_queue: Optional[
+            queue.Queue[tuple[str, object]]
+        ] = None
+        self._registration_status_variable: Optional[tk.StringVar] = None
+        self._registration_progress: Optional[ttk.Progressbar] = None
+        self._registration_preview_label: Optional[tk.Label] = None
+        self._registration_cancel_button: Optional[ttk.Button] = None
+        self._registration_photo_image: Optional[ImageTk.PhotoImage] = None
+        self._registration_resume_after = False
+        self._lock_warning_window: Optional[tk.Toplevel] = None
+        self._lock_warning_detail_variable: Optional[tk.StringVar] = None
+        self._lock_warning_opacity = 0.0
         self._debug_window: Optional[tk.Toplevel] = None
         self._debug_status_variable: Optional[tk.StringVar] = None
         self._debug_metric_variables: dict[str, tk.StringVar] = {}
@@ -211,6 +418,7 @@ class TrayApplication:
         self._debug_camera_combobox: Optional[ttk.Combobox] = None
         self._debug_canvas: Optional[tk.Canvas] = None
         self._debug_photo_image: Optional[ImageTk.PhotoImage] = None
+        self._debug_window_icon: Optional[ImageTk.PhotoImage] = None
         self._debug_last_frame_sequence = -1
         self._debug_last_frame_time: Optional[float] = None
         self._debug_preview_fps = 0.0
@@ -219,6 +427,9 @@ class TrayApplication:
         self._debug_signal = debug_signal
         self._show_debug_on_start = show_debug_on_start
         self._settings_store = SettingsStore()
+        self._face_template_store = FaceTemplateStore(
+            config.FACE_TEMPLATE_PATH
+        )
         self._service = MonitoringService(self._settings_store)
         self._tray_locked_image = self._create_icon_image(locked=True)
         self._tray_unlocked_image = self._create_icon_image(locked=False)
@@ -255,6 +466,10 @@ class TrayApplication:
                     "设置",
                     self._show_settings_from_tray,
                 ),
+                pystray.MenuItem(
+                    "注册 / 更新本人",
+                    self._show_registration_from_tray,
+                ),
                 pystray.Menu.SEPARATOR,
                 pystray.MenuItem("退出", self._exit_from_tray),
             ),
@@ -262,6 +477,39 @@ class TrayApplication:
 
     @staticmethod
     def _create_icon_image(locked: bool = True) -> Image.Image:
+        try:
+            with Image.open(config.APPLICATION_ICON_PNG_PATH) as source:
+                image = source.convert("RGBA").resize(
+                    (64, 64),
+                    Image.Resampling.LANCZOS,
+                )
+        except (OSError, ValueError):
+            LOGGER.warning(
+                "Unable to load application icon from %s; using fallback",
+                config.APPLICATION_ICON_PNG_PATH,
+            )
+            return TrayApplication._create_fallback_icon_image(locked)
+
+        if locked:
+            return image
+
+        paused_image = ImageEnhance.Color(image).enhance(0.10)
+        paused_image = ImageEnhance.Brightness(paused_image).enhance(0.72)
+        draw = ImageDraw.Draw(paused_image)
+        draw.ellipse(
+            (44, 44, 62, 62),
+            fill=(15, 23, 42, 255),
+        )
+        draw.ellipse(
+            (47, 47, 59, 59),
+            fill=(245, 166, 35, 255),
+        )
+        return paused_image
+
+    @staticmethod
+    def _create_fallback_icon_image(
+        locked: bool = True,
+    ) -> Image.Image:
         image = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
         draw = ImageDraw.Draw(image)
         lock_color = (
@@ -314,6 +562,7 @@ class TrayApplication:
         self._tray_icon.run_detached()
         self._service.start_async()
         self._root.after(1000, self._refresh_tray_menu)
+        self._root.after(100, self._refresh_lock_warning)
         self._root.after(250, self._poll_debug_signal)
         if self._show_debug_on_start:
             self._root.after(250, self._show_debug_window)
@@ -356,6 +605,117 @@ class TrayApplication:
         )
         self._tray_visual_state = monitoring_running
 
+    def _ensure_lock_warning_window(self) -> tk.Toplevel:
+        window = self._lock_warning_window
+        if window is not None and window.winfo_exists():
+            return window
+
+        window = tk.Toplevel(self._root)
+        self._lock_warning_window = window
+        window.withdraw()
+        window.overrideredirect(True)
+        window.attributes("-topmost", True)
+        window.attributes("-alpha", 0.0)
+        window.configure(background="#0F172A")
+
+        width = 500
+        height = 122
+        x = max(16, (window.winfo_screenwidth() - width) // 2)
+        window.geometry(f"{width}x{height}+{x}+36")
+
+        card = tk.Frame(
+            window,
+            background="#0F172A",
+            highlightbackground="#1E6A78",
+            highlightthickness=1,
+            padx=22,
+            pady=16,
+        )
+        card.pack(fill="both", expand=True)
+        accent = tk.Frame(card, background="#25D4E8", width=4)
+        accent.pack(side="left", fill="y", padx=(0, 18))
+        content = tk.Frame(card, background="#0F172A")
+        content.pack(side="left", fill="both", expand=True)
+        tk.Label(
+            content,
+            text="即将自动锁屏",
+            background="#0F172A",
+            foreground="#F8FAFC",
+            font=("Microsoft YaHei UI", 15, "bold"),
+            anchor="w",
+        ).pack(fill="x")
+        self._lock_warning_detail_variable = tk.StringVar(
+            value="5 秒后自动锁屏"
+        )
+        tk.Label(
+            content,
+            textvariable=self._lock_warning_detail_variable,
+            background="#0F172A",
+            foreground="#67E8F9",
+            font=("Microsoft YaHei UI", 12, "bold"),
+            anchor="w",
+        ).pack(fill="x", pady=(3, 0))
+        tk.Label(
+            content,
+            text="移动鼠标、按下键盘或回到镜头前即可取消",
+            background="#0F172A",
+            foreground="#94A3B8",
+            font=("Microsoft YaHei UI", 9),
+            anchor="w",
+        ).pack(fill="x", pady=(4, 0))
+
+        window.update_idletasks()
+        try:
+            _configure_overlay_window(window)
+        except OSError as exc:
+            LOGGER.warning(
+                "Unable to configure non-activating lock warning: %s",
+                exc,
+            )
+        window.withdraw()
+        return window
+
+    def _refresh_lock_warning(self, schedule_next: bool = True) -> None:
+        try:
+            state, detail = self._service.status_snapshot()
+            warning_active = state == "lock_warning"
+            window = self._lock_warning_window
+            if warning_active:
+                window = self._ensure_lock_warning_window()
+                if self._lock_warning_detail_variable is not None:
+                    self._lock_warning_detail_variable.set(detail)
+                if not window.winfo_viewable():
+                    window.deiconify()
+                    try:
+                        _configure_overlay_window(window)
+                    except OSError as exc:
+                        LOGGER.warning(
+                            "Unable to show lock warning without focus: %s",
+                            exc,
+                        )
+                self._lock_warning_opacity = min(
+                    0.94,
+                    self._lock_warning_opacity + 0.16,
+                )
+            elif window is not None and window.winfo_exists():
+                self._lock_warning_opacity = max(
+                    0.0,
+                    self._lock_warning_opacity - 0.20,
+                )
+                if self._lock_warning_opacity == 0.0:
+                    window.withdraw()
+
+            if window is not None and window.winfo_exists():
+                window.attributes("-alpha", self._lock_warning_opacity)
+        except tk.TclError:
+            return
+        finally:
+            if schedule_next:
+                try:
+                    self._root.after(80, self._refresh_lock_warning)
+                except tk.TclError:
+                    pass
+
     def _poll_debug_signal(self) -> None:
         try:
             if (
@@ -390,12 +750,19 @@ class TrayApplication:
     ) -> None:
         self._root.after(0, self._show_settings)
 
+    def _show_registration_from_tray(
+        self,
+        icon: pystray.Icon,
+        item: pystray.MenuItem,
+    ) -> None:
+        self._root.after(0, self._start_face_registration)
+
     def _show_debug_window(self) -> None:
         if (
             self._debug_window is not None
             and self._debug_window.winfo_exists()
         ):
-            self._debug_window.deiconify()
+            self._show_debug_taskbar_entry(self._debug_window)
             self._debug_window.lift()
             self._debug_window.focus_force()
             return
@@ -406,6 +773,11 @@ class TrayApplication:
         window.resizable(False, False)
         window.withdraw()
         window.overrideredirect(True)
+        self._debug_window_icon = ImageTk.PhotoImage(
+            self._tray_locked_image,
+            master=window,
+        )
+        window.iconphoto(False, self._debug_window_icon)
         window.configure(background="#173248")
         window.protocol("WM_DELETE_WINDOW", self._close_debug_window)
         window.bind("<Escape>", lambda event: self._close_debug_window())
@@ -540,7 +912,7 @@ class TrayApplication:
             "VISION ENGINE",
             (
                 ("人脸数量", "face_count"),
-                ("最高置信度", "confidence"),
+                ("检测 / 本人", "confidence"),
                 ("推理耗时", "inference"),
                 ("预览刷新率", "preview_fps"),
             ),
@@ -549,7 +921,7 @@ class TrayApplication:
             telemetry,
             "LOCK DECISION",
             (
-                ("无人持续", "face_absent"),
+                ("离席持续", "face_absent"),
                 ("键鼠空闲", "input_idle"),
                 ("宽限期", "startup_grace"),
                 ("锁屏条件", "lock_condition"),
@@ -603,7 +975,7 @@ class TrayApplication:
             status_panel,
             text=(
                 f"AUTHOR // ZheZZ  ·  v{config.APPLICATION_VERSION}"
-                "  ·  LOCAL MEMORY ONLY"
+                "  ·  LOCAL PROCESSING ONLY"
             ),
             background="#0a1220",
             foreground="#58748c",
@@ -718,9 +1090,25 @@ class TrayApplication:
             (window.winfo_screenheight() - window.winfo_height()) // 3,
         )
         window.geometry(f"+{x}+{y}")
-        window.deiconify()
+        self._show_debug_taskbar_entry(window)
         window.lift()
         window.focus_force()
+
+    @staticmethod
+    def _show_debug_taskbar_entry(window: tk.Toplevel) -> None:
+        """Map the custom window with a visible Windows taskbar button."""
+        window.withdraw()
+        window.update_idletasks()
+        try:
+            _configure_taskbar_window(window)
+        except OSError as exc:
+            LOGGER.warning(
+                "Unable to apply the custom taskbar style; "
+                "falling back to the native title bar: %s",
+                exc,
+            )
+            window.overrideredirect(False)
+        window.deiconify()
 
     @staticmethod
     def _create_titlebar_button(
@@ -1066,6 +1454,11 @@ class TrayApplication:
             detection.confidence
             for detection in snapshot.detections
         ]
+        identity_similarities = [
+            detection.identity_similarity
+            for detection in snapshot.detections
+            if detection.identity_similarity is not None
+        ]
         try:
             current_settings = self._settings_store.load()
             camera_name = current_settings.camera_name
@@ -1100,12 +1493,17 @@ class TrayApplication:
                     )
                 ),
                 "safe_decision": (
-                    f"无人脸 ≥ "
-                    f"{current_settings.face_absence_timeout_seconds:g} 秒"
-                    " 且键鼠空闲 ≥ "
-                    f"{current_settings.input_idle_timeout_seconds:g} 秒\n"
-                    f"启动宽限期 "
-                    f"{current_settings.startup_grace_period_seconds:g} 秒"
+                    (
+                        "未确认本人 ≥ "
+                        if current_settings.presence_mode
+                        == "REGISTERED_FACE"
+                        else "无人脸 ≥ "
+                    )
+                    + f"{current_settings.face_absence_timeout_seconds:g} 秒"
+                    + " 且键鼠空闲 ≥ "
+                    + f"{current_settings.input_idle_timeout_seconds:g} 秒\n"
+                    + "启动宽限期 "
+                    + f"{current_settings.startup_grace_period_seconds:g} 秒"
                 ),
                 "lock_action": (
                     "全部条件满足才锁定 Windows\n"
@@ -1132,7 +1530,12 @@ class TrayApplication:
         metric_values = {
             "face_count": str(len(snapshot.detections)),
             "confidence": (
-                f"{max(confidences) * 100:.1f}%"
+                (
+                    f"{max(confidences) * 100:.1f}% / "
+                    f"{max(identity_similarities) * 100:.1f}%"
+                    if identity_similarities
+                    else f"{max(confidences) * 100:.1f}% / --"
+                )
                 if confidences
                 else "--"
             ),
@@ -1277,11 +1680,29 @@ class TrayApplication:
                 snapshot.detections,
                 start=1,
             ):
+                registered_mode = (
+                    snapshot.presence_mode == "REGISTERED_FACE"
+                )
+                if registered_mode and detection.is_registered_person is True:
+                    box_color = (80, 255, 120)
+                    corner_color = (0, 255, 255)
+                    label_color = (80, 255, 120)
+                    identity_text = "SELF"
+                elif registered_mode:
+                    box_color = (70, 90, 255)
+                    corner_color = (80, 130, 255)
+                    label_color = (70, 90, 255)
+                    identity_text = "OTHER"
+                else:
+                    box_color = (0, 255, 0)
+                    corner_color = (0, 255, 255)
+                    label_color = (0, 255, 0)
+                    identity_text = "FACE"
                 cv2.rectangle(
                     annotated,
                     (detection.xmin, detection.ymin),
                     (detection.xmax, detection.ymax),
-                    (0, 255, 0),
+                    box_color,
                     2,
                 )
                 corner_length = max(
@@ -1330,13 +1751,17 @@ class TrayApplication:
                         annotated,
                         start,
                         end,
-                        (0, 255, 255),
+                        corner_color,
                         3,
                     )
 
                 confidence_text = (
-                    f"FACE {face_index:02d}  "
-                    f"{detection.confidence * 100:.1f}%"
+                    f"{identity_text} {face_index:02d}  "
+                    + (
+                        f"{detection.identity_similarity * 100:.1f}%"
+                        if detection.identity_similarity is not None
+                        else f"{detection.confidence * 100:.1f}%"
+                    )
                 )
                 (text_width, text_height), baseline = cv2.getTextSize(
                     confidence_text,
@@ -1360,7 +1785,7 @@ class TrayApplication:
                     annotated,
                     (detection.xmin, text_top),
                     (text_right, text_bottom),
-                    (0, 255, 0),
+                    label_color,
                     thickness=-1,
                 )
                 cv2.putText(
@@ -1375,10 +1800,14 @@ class TrayApplication:
                 )
 
             device_text = snapshot.device or "INIT"
+            overlay_device_text = device_text.replace(
+                "检测 ", "FD:"
+            ).replace(" / 识别 ", "/ID:")
             cv2.putText(
                 annotated,
                 (
-                    f"LIVE // {device_text} // "
+                    f"LIVE // {overlay_device_text} // "
+                    f"MODE {'SELF' if snapshot.presence_mode == 'REGISTERED_FACE' else 'ANY'} // "
                     f"FACES {len(snapshot.detections):02d}"
                 ),
                 (10, 20),
@@ -1407,7 +1836,7 @@ class TrayApplication:
             )
             cv2.putText(
                 annotated,
-                "LOCAL MEMORY ONLY // NO RECORDING",
+                "LOCAL PROCESSING // NO RECORDING",
                 (10, frame_height - 8),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.40,
@@ -1470,6 +1899,7 @@ class TrayApplication:
 
     def _close_debug_window(self) -> None:
         self._debug_photo_image = None
+        self._debug_window_icon = None
         self._debug_metric_variables = {}
         self._debug_metric_labels = {}
         self._debug_guide_variables = {}
@@ -1589,6 +2019,305 @@ class TrayApplication:
                 str(exc),
             )
 
+    def _start_face_registration(self) -> None:
+        existing_window = self._registration_window
+        if existing_window is not None and existing_window.winfo_exists():
+            existing_window.deiconify()
+            existing_window.lift()
+            existing_window.focus_force()
+            return
+
+        try:
+            settings = self._settings_store.load()
+        except SettingsError as exc:
+            messagebox.showerror("注册失败", str(exc))
+            return
+        if self._face_template_store.is_registered() and not messagebox.askyesno(
+            "更新本人人脸",
+            "更新会替换现有的加密人脸特征模板。是否继续？",
+            parent=self._settings_window,
+        ):
+            return
+
+        settings_window = self._settings_window
+        if settings_window is not None and settings_window.winfo_exists():
+            settings_window.destroy()
+
+        window = tk.Toplevel(self._root)
+        self._registration_window = window
+        window.title(f"{config.APPLICATION_TITLE} · 注册本人")
+        window.resizable(False, False)
+        window.protocol("WM_DELETE_WINDOW", self._cancel_face_registration)
+
+        content = ttk.Frame(window, padding=16)
+        content.grid(row=0, column=0, sticky="nsew")
+        ttk.Label(
+            content,
+            text="注册本人人脸",
+            font=("Microsoft YaHei UI", 15, "bold"),
+        ).grid(row=0, column=0, sticky="w")
+        ttk.Label(
+            content,
+            text=(
+                "请保证画面中只有你一人，并缓慢左右转头。摄像头画面只在内存中处理，"
+                "不会保存照片或视频。"
+            ),
+            wraplength=600,
+            foreground="#555555",
+            justify="left",
+        ).grid(row=1, column=0, pady=(6, 12), sticky="w")
+
+        preview = tk.Label(
+            content,
+            text="正在等待摄像头……",
+            width=80,
+            height=20,
+            background="#050a10",
+            foreground="#9fb7c9",
+            font=("Microsoft YaHei UI", 10),
+        )
+        preview.grid(row=2, column=0, sticky="ew")
+        self._registration_preview_label = preview
+
+        self._registration_status_variable = tk.StringVar(
+            value="正在安全暂停监控并释放摄像头……"
+        )
+        ttk.Label(
+            content,
+            textvariable=self._registration_status_variable,
+            wraplength=600,
+        ).grid(row=3, column=0, pady=(12, 6), sticky="w")
+        self._registration_progress = ttk.Progressbar(
+            content,
+            orient="horizontal",
+            mode="determinate",
+            maximum=config.FACE_REGISTRATION_SAMPLE_COUNT,
+            length=600,
+        )
+        self._registration_progress.grid(row=4, column=0, sticky="ew")
+        self._registration_cancel_button = ttk.Button(
+            content,
+            text="取消注册",
+            command=self._cancel_face_registration,
+        )
+        self._registration_cancel_button.grid(
+            row=5,
+            column=0,
+            pady=(12, 0),
+            sticky="e",
+        )
+
+        self._registration_cancel_event = threading.Event()
+        self._registration_queue = queue.Queue(maxsize=4)
+        self._registration_resume_after = self._service.is_running()
+        threading.Thread(
+            target=self._face_registration_worker,
+            args=(settings,),
+            name="seat-sentinel-face-registration",
+            daemon=True,
+        ).start()
+        window.after(100, self._poll_face_registration)
+        window.update_idletasks()
+        x = max(0, (window.winfo_screenwidth() - window.winfo_width()) // 2)
+        y = max(0, (window.winfo_screenheight() - window.winfo_height()) // 3)
+        window.geometry(f"+{x}+{y}")
+        window.deiconify()
+        window.lift()
+        window.focus_force()
+
+    def _face_registration_worker(self, settings: AppSettings) -> None:
+        try:
+            self._service.pause_blocking()
+            cancel_event = self._registration_cancel_event
+            if cancel_event is None or cancel_event.is_set():
+                raise FaceRegistrationCancelled("已取消人脸注册")
+            template = register_face_from_camera(
+                settings=settings,
+                template_store=self._face_template_store,
+                cancel_event=cancel_event,
+                callback=lambda update: self._queue_registration_message(
+                    "update", update
+                ),
+            )
+            self._queue_registration_message("success", template)
+        except FaceRegistrationCancelled as exc:
+            self._queue_registration_message("cancelled", str(exc))
+        except (FaceRegistrationError, FaceTemplateError) as exc:
+            self._queue_registration_message("error", str(exc))
+        except Exception as exc:
+            LOGGER.exception("Unexpected face registration failure")
+            self._queue_registration_message("error", str(exc))
+
+    def _queue_registration_message(
+        self,
+        kind: str,
+        payload: object,
+    ) -> None:
+        message_queue = self._registration_queue
+        if message_queue is None:
+            return
+        while True:
+            try:
+                message_queue.put_nowait((kind, payload))
+                return
+            except queue.Full:
+                try:
+                    message_queue.get_nowait()
+                except queue.Empty:
+                    return
+
+    def _poll_face_registration(self) -> None:
+        window = self._registration_window
+        message_queue = self._registration_queue
+        if (
+            window is None
+            or not window.winfo_exists()
+            or message_queue is None
+        ):
+            return
+
+        terminal: Optional[tuple[str, object]] = None
+        while True:
+            try:
+                kind, payload = message_queue.get_nowait()
+            except queue.Empty:
+                break
+            if kind == "update" and isinstance(payload, FaceRegistrationUpdate):
+                self._render_registration_update(payload)
+            elif kind in {"success", "cancelled", "error"}:
+                terminal = (kind, payload)
+
+        if terminal is None:
+            window.after(100, self._poll_face_registration)
+            return
+
+        kind, payload = terminal
+        if self._registration_cancel_button is not None:
+            self._registration_cancel_button.configure(state="disabled")
+        if kind == "success":
+            if self._registration_status_variable is not None:
+                self._registration_status_variable.set(
+                    "注册成功。已加密保存人脸特征模板，未保存任何照片。"
+                )
+            if self._registration_progress is not None:
+                self._registration_progress.configure(
+                    value=config.FACE_REGISTRATION_SAMPLE_COUNT
+                )
+            messagebox.showinfo(
+                "注册成功",
+                "本人人脸注册完成。现在可以在设置中选择“仅本人（需注册）”。",
+                parent=window,
+            )
+        elif kind == "error":
+            if self._registration_status_variable is not None:
+                self._registration_status_variable.set(f"注册失败：{payload}")
+            messagebox.showerror("注册失败", str(payload), parent=window)
+        else:
+            if self._registration_status_variable is not None:
+                self._registration_status_variable.set("已取消人脸注册。")
+
+        restart_monitoring = self._registration_resume_after
+        if kind == "success":
+            try:
+                restart_monitoring = (
+                    restart_monitoring
+                    or self._settings_store.load().presence_mode
+                    == "REGISTERED_FACE"
+                )
+            except SettingsError:
+                pass
+        self._finish_face_registration(restart_monitoring)
+
+    def _render_registration_update(
+        self,
+        update: FaceRegistrationUpdate,
+    ) -> None:
+        if self._registration_status_variable is not None:
+            self._registration_status_variable.set(update.message)
+        if self._registration_progress is not None:
+            self._registration_progress.configure(
+                maximum=update.required_samples,
+                value=update.accepted_samples,
+            )
+        preview = self._registration_preview_label
+        frame = update.frame_bgr
+        if preview is None or frame is None or not preview.winfo_exists():
+            return
+        try:
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            rgb = cv2.resize(rgb, (600, 338), interpolation=cv2.INTER_AREA)
+            photo = ImageTk.PhotoImage(Image.fromarray(rgb))
+        except (cv2.error, OSError, ValueError) as exc:
+            LOGGER.warning("Unable to render registration preview: %s", exc)
+            return
+        self._registration_photo_image = photo
+        preview.configure(image=photo, text="", width=600, height=338)
+
+    def _cancel_face_registration(self) -> None:
+        cancel_event = self._registration_cancel_event
+        if cancel_event is not None:
+            cancel_event.set()
+        if self._registration_status_variable is not None:
+            self._registration_status_variable.set("正在取消并释放摄像头……")
+        if self._registration_cancel_button is not None:
+            self._registration_cancel_button.configure(state="disabled")
+
+    def _finish_face_registration(self, restart_monitoring: bool) -> None:
+        window = self._registration_window
+        if window is not None and window.winfo_exists():
+            window.destroy()
+        self._registration_window = None
+        self._registration_cancel_event = None
+        self._registration_queue = None
+        self._registration_status_variable = None
+        self._registration_progress = None
+        self._registration_preview_label = None
+        self._registration_cancel_button = None
+        self._registration_photo_image = None
+        self._registration_resume_after = False
+        if restart_monitoring:
+            self._service.start_async()
+
+    def _delete_registered_face(self) -> None:
+        if not self._face_template_store.is_registered():
+            messagebox.showinfo(
+                "本人数据",
+                "当前没有已注册的人脸特征模板。",
+                parent=self._settings_window,
+            )
+            return
+        if not messagebox.askyesno(
+            "删除本人人脸数据",
+            "将永久删除本机加密保存的人脸特征模板。删除后会切换为任意人脸模式。是否继续？",
+            parent=self._settings_window,
+        ):
+            return
+        try:
+            self._face_template_store.delete()
+            current = self._settings_store.load()
+            mode_changed = current.presence_mode == "REGISTERED_FACE"
+            if mode_changed:
+                self._settings_store.save(
+                    replace(current, presence_mode="ANY_FACE")
+                )
+        except (FaceTemplateError, SettingsError) as exc:
+            messagebox.showerror(
+                "删除失败",
+                str(exc),
+                parent=self._settings_window,
+            )
+            return
+        messagebox.showinfo(
+            "本人数据",
+            "已删除本人人脸特征模板。未保存照片或视频。",
+            parent=self._settings_window,
+        )
+        window = self._settings_window
+        if window is not None and window.winfo_exists():
+            window.destroy()
+        if mode_changed:
+            self._service.restart_async()
+
     def _show_settings(self) -> None:
         if (
             self._settings_window is not None
@@ -1620,6 +2349,9 @@ class TrayApplication:
 
         variables = {
             "camera_name": tk.StringVar(value=settings.camera_name),
+            "presence_mode": tk.StringVar(
+                value=PRESENCE_MODE_LABELS[settings.presence_mode]
+            ),
             "detection_interval_seconds": tk.StringVar(
                 value=str(settings.detection_interval_seconds)
             ),
@@ -1642,6 +2374,7 @@ class TrayApplication:
 
         rows = [
             ("摄像头", "camera_name"),
+            ("在场判断", "presence_mode"),
             ("检测间隔（秒）", "detection_interval_seconds"),
             ("人脸置信度", "face_confidence_threshold"),
             ("推理设备", "inference_device"),
@@ -1658,11 +2391,15 @@ class TrayApplication:
                 pady=6,
                 sticky="w",
             )
-            if key in {"camera_name", "inference_device"}:
+            if key in {"camera_name", "inference_device", "presence_mode"}:
                 values = (
                     camera_names
                     if key == "camera_name"
-                    else ["NPU", "CPU"]
+                    else (
+                        list(PRESENCE_MODE_VALUES)
+                        if key == "presence_mode"
+                        else ["NPU", "CPU"]
+                    )
                 )
                 widget = ttk.Combobox(
                     content,
@@ -1684,14 +2421,54 @@ class TrayApplication:
                 sticky="ew",
             )
 
+        identity_controls = ttk.LabelFrame(
+            content,
+            text="本人人脸注册",
+            padding=10,
+        )
+        identity_controls.grid(
+            row=len(rows),
+            column=0,
+            columnspan=2,
+            pady=(10, 4),
+            sticky="ew",
+        )
+        identity_status = (
+            "状态：已注册（仅保存 Windows 加密的人脸特征模板）"
+            if self._face_template_store.is_registered()
+            else "状态：未注册"
+        )
+        ttk.Label(identity_controls, text=identity_status).pack(
+            side="left"
+        )
+        ttk.Button(
+            identity_controls,
+            text=(
+                "更新本人"
+                if self._face_template_store.is_registered()
+                else "注册本人"
+            ),
+            command=self._start_face_registration,
+        ).pack(side="right", padx=(8, 0))
+        ttk.Button(
+            identity_controls,
+            text="删除本人数据",
+            command=self._delete_registered_face,
+            state=(
+                "normal"
+                if self._face_template_store.is_registered()
+                else "disabled"
+            ),
+        ).pack(side="right")
+
         ttk.Label(
             content,
             text=(
-                "保存后会安全释放摄像头，并用新设置重新启动监控。"
+                "“仅本人”模式必须先注册。保存后会安全释放摄像头，并用新设置重新启动监控。"
             ),
             foreground="#555555",
         ).grid(
-            row=len(rows),
+            row=len(rows) + 1,
             column=0,
             columnspan=2,
             pady=(10, 8),
@@ -1700,7 +2477,7 @@ class TrayApplication:
 
         buttons = ttk.Frame(content)
         buttons.grid(
-            row=len(rows) + 1,
+            row=len(rows) + 2,
             column=0,
             columnspan=2,
             pady=(8, 0),
@@ -1757,6 +2534,10 @@ class TrayApplication:
             settings = AppSettings.from_mapping(
                 {
                     "camera_name": variables["camera_name"].get(),
+                    "presence_mode": PRESENCE_MODE_VALUES.get(
+                        variables["presence_mode"].get(),
+                        variables["presence_mode"].get(),
+                    ),
                     "detection_interval_seconds": variables[
                         "detection_interval_seconds"
                     ].get(),
@@ -1779,6 +2560,20 @@ class TrayApplication:
                     "frame_height": old_settings.frame_height,
                 }
             )
+            if (
+                settings.presence_mode == "REGISTERED_FACE"
+                and not self._face_template_store.is_registered()
+            ):
+                raise SettingsError(
+                    "选择“仅本人”前必须先完成人脸注册"
+                )
+            if settings.presence_mode == "REGISTERED_FACE":
+                try:
+                    self._face_template_store.load()
+                except FaceTemplateError as exc:
+                    raise SettingsError(
+                        f"本人人脸模板无法使用：{exc}"
+                    ) from exc
             self._settings_store.save(settings)
         except SettingsError as exc:
             messagebox.showerror(
@@ -1803,6 +2598,8 @@ class TrayApplication:
         ).start()
 
     def _shutdown(self) -> None:
+        if self._registration_cancel_event is not None:
+            self._registration_cancel_event.set()
         self._service.shutdown()
         self._tray_icon.stop()
         self._root.after(0, self._root.quit)
@@ -1812,10 +2609,19 @@ def _run_self_test() -> int:
     """Validate packaged resources and NPU/CPU inference without a camera."""
     detector: Optional[FaceDetector] = None
     cpu_detector: Optional[FaceDetector] = None
+    identity_recognizer: Optional[FaceIdentityRecognizer] = None
     test_application: Optional[TrayApplication] = None
     try:
         settings = SettingsStore().load()
         settings.apply_to_runtime()
+        if not config.APPLICATION_ICON_PNG_PATH.is_file():
+            raise RuntimeError("Application icon resource is missing")
+        with Image.open(config.APPLICATION_ICON_PNG_PATH) as icon_source:
+            if icon_source.size != (1024, 1024):
+                raise RuntimeError("Application icon master has an invalid size")
+            alpha_extrema = icon_source.convert("RGBA").getchannel("A").getextrema()
+            if alpha_extrema != (0, 255):
+                raise RuntimeError("Application icon transparency is invalid")
         test_application = TrayApplication()
         locked_icon = test_application._create_icon_image(locked=True)
         unlocked_icon = test_application._create_icon_image(locked=False)
@@ -1823,6 +2629,46 @@ def _run_self_test() -> int:
             raise RuntimeError("Tray icon image has an invalid size")
         if locked_icon.tobytes() == unlocked_icon.tobytes():
             raise RuntimeError("Tray state icons must be visually distinct")
+        test_application._service._update_status(
+            "lock_warning",
+            "5 秒后自动锁屏",
+        )
+        test_application._refresh_lock_warning(schedule_next=False)
+        test_application._root.update_idletasks()
+        warning_window = test_application._lock_warning_window
+        if (
+            warning_window is None
+            or not warning_window.winfo_exists()
+            or not warning_window.winfo_viewable()
+            or test_application._lock_warning_opacity <= 0
+        ):
+            raise RuntimeError("Lock warning overlay could not be shown")
+        warning_style = _get_window_long_ptr(
+            _native_top_level_handle(warning_window),
+            GWL_EXSTYLE,
+        )
+        if (
+            not warning_style & WS_EX_TOOLWINDOW
+            or not warning_style & WS_EX_NOACTIVATE
+            or warning_style & WS_EX_APPWINDOW
+        ):
+            raise RuntimeError(
+                "Lock warning overlay can steal focus or enter the taskbar"
+            )
+        if (
+            test_application._lock_warning_detail_variable is None
+            or test_application._lock_warning_detail_variable.get()
+            != "5 秒后自动锁屏"
+        ):
+            raise RuntimeError("Lock warning countdown was not rendered")
+        test_application._service._update_status(
+            "monitoring",
+            "锁屏倒计时已取消",
+        )
+        test_application._refresh_lock_warning(schedule_next=False)
+        test_application._root.update_idletasks()
+        if warning_window.winfo_viewable():
+            raise RuntimeError("Cancelled lock warning remained visible")
         camera_names = test_application._camera_names()
         if not camera_names:
             LOGGER.warning(
@@ -1871,8 +2717,44 @@ def _run_self_test() -> int:
             raise RuntimeError(
                 "Debug camera selector does not contain the configured camera"
             )
+        test_application._show_settings()
+        test_application._root.update_idletasks()
+        settings_window = test_application._settings_window
+        if settings_window is None or not settings_window.winfo_exists():
+            raise RuntimeError("Settings window could not be created")
+
+        def descendants(widget: tk.Misc) -> list[tk.Misc]:
+            result: list[tk.Misc] = []
+            for child in widget.winfo_children():
+                result.append(child)
+                result.extend(descendants(child))
+            return result
+
+        settings_widgets = descendants(settings_window)
+        mode_selector_found = any(
+            isinstance(widget, ttk.Combobox)
+            and "仅本人（需注册）" in tuple(widget.cget("values"))
+            for widget in settings_widgets
+        )
+        registration_button_found = any(
+            isinstance(widget, ttk.Button)
+            and widget.cget("text") in {"注册本人", "更新本人"}
+            for widget in settings_widgets
+        )
+        if not mode_selector_found or not registration_button_found:
+            raise RuntimeError(
+                "Registered-face controls were not initialized"
+            )
+        settings_window.destroy()
         if not test_application._debug_window.overrideredirect():
             raise RuntimeError("Custom title bar was not enabled")
+        has_taskbar_style, is_unowned = _taskbar_window_state(
+            test_application._debug_window
+        )
+        if not has_taskbar_style or not is_unowned:
+            raise RuntimeError(
+                "Debug window was not configured as a taskbar application"
+            )
         if (
             len(test_application._debug_guide_variables) != 3
             or any(
@@ -1891,6 +2773,13 @@ def _run_self_test() -> int:
         test_application._root.update_idletasks()
         if not test_application._debug_window.winfo_viewable():
             raise RuntimeError("Debug window could not reopen from tray")
+        has_taskbar_style, is_unowned = _taskbar_window_state(
+            test_application._debug_window
+        )
+        if not has_taskbar_style or not is_unowned:
+            raise RuntimeError(
+                "Debug window lost its taskbar style after reopening"
+            )
         test_application._root.destroy()
         test_application = None
 
@@ -1915,11 +2804,37 @@ def _run_self_test() -> int:
         cpu_face_detected = cpu_detector.has_face(frame)
         if cpu_detector.device != "CPU":
             raise RuntimeError("Explicit CPU selection was not honored")
+        identity_recognizer = FaceIdentityRecognizer(
+            config.LANDMARKS_MODEL_XML_PATH,
+            config.LANDMARKS_MODEL_BIN_PATH,
+            config.FACE_REIDENTIFICATION_MODEL_XML_PATH,
+            config.FACE_REIDENTIFICATION_MODEL_BIN_PATH,
+            preferred_device="NPU",
+        )
+        synthetic_face = FaceDetection(
+            confidence=0.95,
+            xmin=160,
+            ymin=40,
+            xmax=480,
+            ymax=350,
+        )
+        identity_embedding = identity_recognizer.extract_embedding(
+            frame,
+            synthetic_face,
+        )
+        if identity_embedding.shape != (256,) or not np.isclose(
+            np.linalg.norm(identity_embedding),
+            1.0,
+            atol=1e-4,
+        ):
+            raise RuntimeError("Face identity descriptor self-test failed")
         LOGGER.info(
             "Self-test passed | primary_device=%s | cpu_device=%s | "
+            "identity_device=%s | "
             "session_locked=%s | synthetic_face=%s | cpu_face=%s",
             detector.device,
             cpu_detector.device,
+            identity_recognizer.device,
             session_locked,
             face_detected,
             cpu_face_detected,
@@ -1938,6 +2853,8 @@ def _run_self_test() -> int:
             detector.close()
         if cpu_detector is not None:
             cpu_detector.close()
+        if identity_recognizer is not None:
+            identity_recognizer.close()
 
 
 def main() -> None:

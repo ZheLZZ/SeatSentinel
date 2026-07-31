@@ -3,6 +3,7 @@
   "detection_interval_seconds": 0.5,
   "face_confidence_threshold": 0.6,
   "inference_device": "NPU",
+  "presence_mode": "ANY_FACE",
   "face_absence_timeout_seconds": 60.0,
   "input_idle_timeout_seconds": 60.0,
   "startup_grace_period_seconds": 30.0,

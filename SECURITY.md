@@ -4,7 +4,10 @@
 
 | Version | Supported |
 | --- | --- |
-| `0.1.1-beta` | Yes |
+| `0.2.2-beta` | Yes |
+| `0.2.1-beta` | No |
+| `0.2.0-beta` | No |
+| `0.1.1-beta` | No |
 | `0.1.0-beta` | No |
 | Earlier development snapshots | No |
 
@@ -30,6 +33,9 @@
 ## Security boundaries
 
 - SeatSentinel 只调用 Windows 锁屏，不实现或绕过 Windows 登录与解锁；
+- 仅本人模式是一对一在场判断，不提供活体检测，不得作为身份认证或 Windows
+  Hello 的替代方案；照片或屏幕视频可能造成误识别；
+- 本人人脸模板通过当前 Windows 用户的 DPAPI 加密保存，删除操作会永久移除模板；
 - 摄像头或推理状态不明确时禁止自动锁屏；
 - 模型下载使用 HTTPS，并校验固定 SHA-256；
 - 正常监控不需要管理员权限；
