@@ -1,6 +1,6 @@
 # SeatSentinel
 
-![Version](https://img.shields.io/badge/version-v0.2.2--beta-f0a020)
+![Version](https://img.shields.io/badge/version-v0.2.5--beta-f0a020)
 ![Platform](https://img.shields.io/badge/platform-Windows%2011-0078D4)
 ![Python](https://img.shields.io/badge/Python-3.13-3776AB)
 ![OpenVINO](https://img.shields.io/badge/OpenVINO-NPU%20%7C%20CPU-00C7B7)
@@ -10,7 +10,8 @@
 SeatSentinel 是一款面向 Windows 11 的本地离席自动锁屏工具。它通过摄像头和
 OpenVINO 调用 NPU 或 CPU 判断电脑前是否有人，再结合 Windows 最近键盘、鼠标活动
 时间，在满足全部安全条件时调用系统锁屏。用户可以选择“任意人脸”或“仅本人”
-两种在场判断方式。
+两种在场判断方式；仅本人模式还能在本人身旁突然出现第二个人时，用屏幕毛玻璃
+临时遮住桌面内容。
 
 摄像头画面和模型推理全部在本机完成。SeatSentinel 不上传、不拍照、不录像，
 画面仅短暂保存在内存中。完整说明见 [PRIVACY.md](PRIVACY.md)。
@@ -27,6 +28,8 @@ OpenVINO 调用 NPU 或 CPU 判断电脑前是否有人，再结合 Windows 最�
 
 - 支持“任意人脸”和“仅本人（需注册）”两种在场判断模式；
 - 仅本人模式在本地完成关键点对齐和人脸特征比对，陌生人不会重置离席计时；
+- 连续确认“本人 + 第二个人”后立即覆盖屏幕工作区毛玻璃，快速左右甩动鼠标即可恢复；
+- 多人脸隐私模糊可在设置页或托盘图标右键菜单中随时开关；
 - 注册时只保存 Windows 用户级加密的 256 维特征模板，不保存注册照片；
 - 优先使用 OpenVINO NPU，失败时自动回退 CPU；
 - 可在调试控制台或设置中随时切换 NPU / CPU；
@@ -37,6 +40,7 @@ OpenVINO 调用 NPU 或 CPU 判断电脑前是否有人，再结合 Windows 最�
 - 视觉控制台可直接下拉切换摄像头并安全重启监控；
 - 科技风实时控制台，显示人脸框、置信度、推理耗时和锁屏判定；
 - 调试控制台打开时显示独立的 Windows 任务栏图标，便于确认和快速切回窗口；
+- 调试控制台提供“彻底退出程序”按钮，可直接结束监控和托盘进程；
 - 达到锁屏条件后先显示 5 秒柔和提示，检测到在场或键鼠操作会立即取消；
 - EXE、调试窗口和托盘统一使用专属图标；监控运行显示彩色图标，暂停时显示灰色图标和琥珀色状态点；
 - 托盘驻留、单实例运行，重复启动时唤出已有调试窗口；
@@ -75,11 +79,34 @@ AND 当前尚未执行锁屏
 本功能不是活体检测或身份认证，照片、屏幕视频等可能造成误识别，因此不能用于
 Windows 解锁或替代 Windows Hello。
 
+## 第二人隐私模糊
+
+本功能仅在“仅本人”模式下生效，默认开启。系统连续两帧确认画面中同时存在已注册本人和
+至少另一张人脸后，会创建一个跨越整个虚拟桌面的 Windows DWM Desktop Acrylic
+窗口，再按各显示器工作区裁切显示范围。双屏共用一个 DWM 合成表面，避免第二块
+屏幕重复创建背景或偶发灰闪；Windows 任务栏不被覆盖，保持清晰并可直接点击。
+如暂时不需要本功能，可在“设置 → 多人脸隐私模糊”取消勾选，也可右键单击
+右下角 SeatSentinel 托盘图标，取消勾选“多人脸隐私模糊”；两处使用同一持久化设置。
+
+覆盖层使用 Windows 分层、无激活和点击穿透属性，视觉强度采用实机确认的 96%。
+毛玻璃显示期间，鼠标点击仍会落到下方的真实窗口，可以关闭提示或操作已知位置的
+控件；下方内容变化由 DWM 实时合成并立即反映。SeatSentinel 不再截取桌面，也不再
+使用 Pillow 缩放、高斯模糊、刷新线程或全屏图片上传，因此不会发生模糊画面递归
+叠加，也不会因 Python 处理桌面像素拖慢点击反馈。
+
+恢复时快速左右（或上下）往返甩动鼠标。手势必须在约 0.9 秒内包含至少三次方向
+反转，普通的单向快速移动不会误解除。完成甩鼠标恢复后，画面必须持续少于 2 人
+满 60 秒，功能才会重新布防；期间只要再次检测到 2 人及以上，60 秒会重新计时。
+摄像头或模型状态异常也会中断本次计时，不会把无法确认的时间算进去。
+
+毛玻璃是用于应急遮挡的置顶界面，不等同于 Windows 安全桌面。需要强安全边界时，
+仍应使用系统锁屏。
+
 ## 从源码运行
 
 环境要求：
 
-- Windows 11 64 位；
+- Windows 11 64 位，Build 22621 或更高版本；
 - Python 3.13 64 位（已在 Python 3.13.12 上验证）；
 - 可用摄像头；
 - NPU 可选，没有 NPU 时自动使用 CPU。
@@ -199,6 +226,10 @@ OpenCV 的 BGR 画面在显示前转换为 RGB，并按原始比例缩放。Tkin
 | `PRESENCE_MODE` | `ANY_FACE` | 任意人脸或仅本人模式 |
 | `FACE_MATCH_SIMILARITY_THRESHOLD` | `0.70` | 本人余弦相似度阈值 |
 | `IDENTITY_MATCH_CONFIRMATION_FRAMES` | `2` | 本人连续确认帧数 |
+| `SECOND_PERSON_CONFIRMATION_FRAMES` | `2` | 第二人连续确认帧数 |
+| `SECOND_PERSON_REARM_CLEAR_SECONDS` | `60.0` | 画面少于 2 人后重新布防所需的连续秒数 |
+| `PRIVACY_BLUR_ENABLED` | `True` | 是否启用多人脸隐私模糊 |
+| `PRIVACY_ACRYLIC_STRENGTH_PERCENT` | `96` | DWM Desktop Acrylic 视觉强度 |
 | `FACE_ABSENCE_TIMEOUT_SECONDS` | `60` | 未确认在场的锁屏计时 |
 | `INPUT_IDLE_TIMEOUT_SECONDS` | `60` | 键鼠空闲锁屏计时 |
 | `STARTUP_GRACE_PERIOD_SECONDS` | `30` | 启动/恢复宽限期 |
@@ -221,6 +252,7 @@ OpenCV 的 BGR 画面在显示前转换为 RGB，并按原始比例缩放。Tkin
 - 不上传画面、检测框或推理结果；
 - 不写入照片或视频文件；
 - 仅本人模式会保存一个由当前 Windows 用户级 DPAPI 加密的特征模板；
+- 第二人隐私模糊由 Windows DWM 实时合成，不截取、处理或保存桌面帧；
 - 不在日志中记录摄像头画面；
 - 锁屏、暂停、摄像头释放和程序退出时立即清空最新帧；
 - 摄像头或推理状态不可靠时采用“禁止锁屏”的安全策略；
@@ -238,9 +270,9 @@ python -m unittest discover -s tests -v
 python app.py --self-test
 ```
 
-`--self-test` 不会打开摄像头。它会验证三组模型及 256 维特征链路，并枚举摄像头
-用于诊断；已保存的设备名称在另一台电脑上不存在时只记录警告，不会把跨设备
-差异误判为程序故障。
+`--self-test` 不会打开摄像头。它会验证三组模型、256 维特征链路以及单窗口跨屏
+DWM Acrylic 的窗口属性、双屏工作区和任务栏裁切，并枚举摄像头用于诊断；已保存的
+设备名称在另一台电脑上不存在时只记录警告，不会把跨设备差异误判为程序故障。
 
 ## 本地构建 EXE
 
@@ -262,6 +294,7 @@ python app.py --self-test
 ├─ detector.py
 ├─ face_identity.py
 ├─ face_registration.py
+├─ dwm_privacy.py
 ├─ camera.py
 ├─ debug_frame.py
 ├─ activity_monitor.py

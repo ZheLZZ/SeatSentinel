@@ -7,12 +7,19 @@ import json
 import os
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
 
 import config
 from app import TrayApplication
+from dwm_privacy import (
+    acrylic_alpha_from_strength,
+    bounding_rect,
+    enumerate_monitor_work_areas,
+    relative_work_regions,
+)
 from debug_frame import DebugFrameBuffer
 from detector import DetectorInferenceError, FaceDetection, FaceDetector
 from face_identity import (
@@ -22,6 +29,11 @@ from face_identity import (
     FaceTemplateStore,
 )
 from main import evaluate_lock_warning, evaluate_presence
+from privacy_blur import (
+    MouseShakeDetector,
+    PrivacyBlurSignal,
+    SecondPersonPrivacyGuard,
+)
 from single_instance import DEBUG_WINDOW_EVENT_NAME, MUTEX_NAME
 from user_settings import AppSettings, SettingsStore
 
@@ -30,15 +42,17 @@ class ApplicationDefaultsTests(unittest.TestCase):
     def test_title_and_lock_timeouts(self) -> None:
         settings = AppSettings.defaults()
         self.assertEqual(config.APPLICATION_TITLE, "SeatSentinel")
-        self.assertEqual(config.APPLICATION_VERSION, "0.2.2-beta")
+        self.assertEqual(config.APPLICATION_VERSION, "0.2.5-beta")
         self.assertEqual(config.USER_DATA_DIRECTORY.name, "SeatSentinel")
         self.assertIn("SeatSentinel", MUTEX_NAME)
         self.assertIn("SeatSentinel", DEBUG_WINDOW_EVENT_NAME)
         self.assertEqual(settings.inference_device, "NPU")
         self.assertEqual(settings.presence_mode, "ANY_FACE")
+        self.assertTrue(settings.privacy_blur_enabled)
         self.assertEqual(settings.face_absence_timeout_seconds, 60)
         self.assertEqual(settings.input_idle_timeout_seconds, 60)
         self.assertEqual(config.LOCK_WARNING_SECONDS, 5.0)
+        self.assertEqual(config.PRIVACY_ACRYLIC_STRENGTH_PERCENT, 96)
         self.assertEqual(os.environ.get("DO_NOT_TRACK"), "1")
         self.assertEqual(os.environ.get("SCARF_NO_ANALYTICS"), "1")
 
@@ -53,6 +67,24 @@ class ApplicationDefaultsTests(unittest.TestCase):
             {"presence_mode": "registered_face"}
         )
         self.assertEqual(settings.presence_mode, "REGISTERED_FACE")
+
+    def test_privacy_blur_setting_is_normalized_and_persisted(self) -> None:
+        disabled = AppSettings.from_mapping(
+            {"privacy_blur_enabled": "false"}
+        )
+        self.assertFalse(disabled.privacy_blur_enabled)
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory) / "settings.json"
+            store = SettingsStore(path=path)
+            store.save(disabled)
+            loaded = store.load()
+            self.assertFalse(loaded.privacy_blur_enabled)
+            self.assertFalse(
+                json.loads(path.read_text(encoding="utf-8"))[
+                    "privacy_blur_enabled"
+                ]
+            )
 
     def test_legacy_settings_are_migrated(self) -> None:
         for legacy_name in ("AwayLock", "PresenceLock"):
@@ -132,6 +164,90 @@ class DebugCameraSelectorTests(unittest.TestCase):
         assert settings_store.saved is not None
         self.assertEqual(settings_store.saved.camera_name, "USB Camera")
         self.assertEqual(service.restart_count, 1)
+
+
+class TrayPrivacyToggleTests(unittest.TestCase):
+    def test_toggle_persists_hides_active_layer_and_restarts_monitoring(self) -> None:
+        current = replace(
+            AppSettings.defaults(),
+            privacy_blur_enabled=True,
+        )
+
+        class FakeSettingsStore:
+            saved: AppSettings | None = None
+
+            def load(self) -> AppSettings:
+                return current
+
+            def save(self, settings: AppSettings) -> None:
+                self.saved = settings
+
+        class FakeService:
+            clear_count = 0
+            restart_count = 0
+
+            def is_running(self) -> bool:
+                return True
+
+            def clear_privacy_blur(self) -> None:
+                self.clear_count += 1
+
+            def restart_async(self) -> None:
+                self.restart_count += 1
+
+        class FakeOverlay:
+            hide_count = 0
+
+            def hide(self) -> None:
+                self.hide_count += 1
+
+        class FakeShake:
+            reset_count = 0
+
+            def reset(self) -> None:
+                self.reset_count += 1
+
+        class FakeVariable:
+            value: bool | None = None
+
+            def set(self, value: bool) -> None:
+                self.value = value
+
+        class FakeTrayIcon:
+            update_count = 0
+
+            def update_menu(self) -> None:
+                self.update_count += 1
+
+        application = TrayApplication.__new__(TrayApplication)
+        settings_store = FakeSettingsStore()
+        service = FakeService()
+        overlay = FakeOverlay()
+        shake = FakeShake()
+        variable = FakeVariable()
+        tray_icon = FakeTrayIcon()
+        application._settings_store = settings_store
+        application._service = service
+        application._privacy_blur_overlay = overlay
+        application._privacy_mouse_shake = shake
+        application._settings_privacy_blur_variable = variable
+        application._tray_icon = tray_icon
+
+        previous_runtime_value = config.PRIVACY_BLUR_ENABLED
+        try:
+            application._toggle_privacy_blur_setting()
+        finally:
+            config.PRIVACY_BLUR_ENABLED = previous_runtime_value
+
+        self.assertIsNotNone(settings_store.saved)
+        assert settings_store.saved is not None
+        self.assertFalse(settings_store.saved.privacy_blur_enabled)
+        self.assertEqual(service.clear_count, 1)
+        self.assertEqual(service.restart_count, 1)
+        self.assertEqual(overlay.hide_count, 1)
+        self.assertEqual(shake.reset_count, 1)
+        self.assertFalse(variable.value)
+        self.assertEqual(tray_icon.update_count, 1)
 
 
 class DetectionParsingTests(unittest.TestCase):
@@ -341,6 +457,132 @@ class PresenceDecisionTests(unittest.TestCase):
                 b"embedding_f32_base64",
                 path.read_bytes(),
             )
+
+
+class PrivacyBlurDecisionTests(unittest.TestCase):
+    def test_second_person_requires_confirmed_owner_and_two_frames(self) -> None:
+        guard = SecondPersonPrivacyGuard(
+            confirmation_frames=2,
+            rearm_clear_seconds=60.0,
+        )
+
+        self.assertFalse(
+            guard.update(False, 2, timestamp=0.0)
+        )
+        self.assertFalse(
+            guard.update(True, 2, timestamp=0.5)
+        )
+        self.assertTrue(
+            guard.update(True, 2, timestamp=1.0)
+        )
+        self.assertFalse(
+            guard.update(True, 2, timestamp=1.5)
+        )
+
+    def test_rearms_after_under_two_people_for_sixty_seconds(self) -> None:
+        guard = SecondPersonPrivacyGuard(
+            confirmation_frames=2,
+            rearm_clear_seconds=60.0,
+        )
+        guard.update(True, 2, timestamp=0.0)
+        self.assertTrue(guard.update(True, 2, timestamp=0.5))
+
+        self.assertFalse(guard.update(False, 1, timestamp=1.0))
+        self.assertFalse(guard.update(False, 0, timestamp=31.0))
+        self.assertFalse(guard.update(False, 1, timestamp=61.0))
+        self.assertFalse(guard.update(True, 2, timestamp=61.5))
+        self.assertTrue(guard.update(True, 2, timestamp=62.0))
+
+    def test_two_people_or_unknown_frame_restarts_rearm_timer(self) -> None:
+        guard = SecondPersonPrivacyGuard(
+            confirmation_frames=2,
+            rearm_clear_seconds=60.0,
+        )
+        guard.update(True, 2, timestamp=0.0)
+        self.assertTrue(guard.update(True, 2, timestamp=0.5))
+        guard.update(False, 1, timestamp=1.0)
+        guard.update(False, 2, timestamp=40.0)
+        guard.update(False, 0, timestamp=41.0)
+        guard.mark_visual_state_unknown()
+        self.assertFalse(guard.update(False, 0, timestamp=100.0))
+        self.assertFalse(guard.update(False, 1, timestamp=160.0))
+        self.assertFalse(guard.update(True, 2, timestamp=160.5))
+        self.assertTrue(guard.update(True, 2, timestamp=161.0))
+
+    def test_signal_activation_and_dismissal_are_latched(self) -> None:
+        signal = PrivacyBlurSignal()
+        self.assertTrue(signal.activate("second person"))
+        first = signal.snapshot()
+        self.assertTrue(first.active)
+        self.assertEqual(first.detail, "second person")
+        self.assertFalse(signal.activate("duplicate"))
+        self.assertTrue(signal.dismiss())
+        self.assertFalse(signal.snapshot().active)
+        self.assertFalse(signal.dismiss())
+
+    def test_quick_back_and_forth_mouse_path_dismisses(self) -> None:
+        detector = MouseShakeDetector()
+        detected = False
+        for index, x in enumerate((0, 190, -20, 200, -30)):
+            detected = detector.record(x, 100, timestamp=index * 0.08)
+        self.assertTrue(detected)
+
+    def test_fast_one_way_mouse_motion_is_not_a_shake(self) -> None:
+        detector = MouseShakeDetector()
+        results = [
+            detector.record(x, 100, timestamp=index * 0.08)
+            for index, x in enumerate((0, 200, 400, 600, 800))
+        ]
+        self.assertNotIn(True, results)
+
+    def test_slow_back_and_forth_mouse_motion_is_not_a_shake(self) -> None:
+        detector = MouseShakeDetector()
+        results = [
+            detector.record(x, 100, timestamp=index * 0.5)
+            for index, x in enumerate((0, 190, -20, 200, -30))
+        ]
+        self.assertNotIn(True, results)
+
+    def test_monitor_union_handles_negative_and_vertical_coordinates(self) -> None:
+        self.assertEqual(
+            bounding_rect(
+                (
+                    (-1920, 0, 0, 1080),
+                    (0, -200, 2560, 1240),
+                )
+            ),
+            (-1920, -200, 2560, 1240),
+        )
+
+    def test_work_areas_are_relative_to_one_cross_screen_window(self) -> None:
+        self.assertEqual(
+            relative_work_regions(
+                (-1920, -200, 2560, 1240),
+                (
+                    (-1920, 0, 0, 1040),
+                    (0, -200, 2560, 1160),
+                ),
+            ),
+            (
+                (0, 200, 1920, 1240),
+                (1920, 0, 4480, 1360),
+            ),
+        )
+
+    def test_user_validated_acrylic_strength_maps_to_layered_alpha(self) -> None:
+        self.assertEqual(acrylic_alpha_from_strength(96), 245)
+
+    @unittest.skipUnless(os.name == "nt", "Windows monitors are required")
+    def test_windows_monitor_enumeration_reports_valid_bounds(self) -> None:
+        monitors = enumerate_monitor_work_areas()
+        self.assertGreaterEqual(len(monitors), 1)
+        self.assertTrue(
+            all(
+                monitor.work[2] > monitor.work[0]
+                and monitor.work[3] > monitor.work[1]
+                for monitor in monitors
+            )
+        )
 
 
 class DebugFrameBufferTests(unittest.TestCase):
