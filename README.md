@@ -106,25 +106,34 @@ Windows 解锁或替代 Windows Hello。
 毛玻璃是用于应急遮挡的置顶界面，不等同于 Windows 安全桌面。需要强安全边界时，
 仍应使用系统锁屏。
 
-## 从源码运行
+## 轻量联网版 / 从源码运行
 
 环境要求：
 
 - Windows 11 64 位，Build 22621 或更高版本；
-- Python 3.13 64 位（已在 Python 3.13.12 上验证）；
 - 可用摄像头；
+- 首次初始化时可以连接 Python.org、PyPI（或清华镜像）和 Intel 官方模型存储；
 - NPU 可选，没有 NPU 时自动使用 CPU。
 
-最简单的方式是右键 `一键启动.ps1`，选择“使用 PowerShell 运行”。脚本会：
+下载轻量联网版后，先完整解压，再双击 `安装并启动.cmd`。不要直接在 ZIP
+预览窗口中运行。首次启动脚本会：
 
-1. 检查 Python 3.13；
-2. 创建 `.venv`；
-3. 安装依赖；
+1. 检查 64 位 Python 3.13；
+2. 如果电脑没有兼容 Python，从 Python.org 下载固定版本并校验 SHA-256，随后
+   安装到 `%LOCALAPPDATA%\SeatSentinel\runtime\Python313`；
+3. 在解压目录创建独立 `.venv` 并安装运行依赖；
 4. 从 Intel Open Model Zoo 下载缺少的人脸检测、关键点和特征模型；
 5. 校验全部六个模型文件的 SHA-256；
 6. 启动 SeatSentinel。
 
-也可以手动安装：
+自动准备的 Python 不写入 PATH、不建立文件关联，也不创建系统快捷方式。首次运行
+需要下载数百 MB 内容并占用数百 MB 磁盘；完成后再次双击只会检查变化，不会重复
+安装。初始化后请勿移动整个解压目录，否则其中的 `.venv` 需要重新创建。
+
+也可以右键 `一键启动.ps1`，选择“使用 PowerShell 运行”；检测不到 Python 时会先
+询问是否自动准备。已经安装兼容的 Python 3.13 64 位时会直接复用。
+
+开发者也可以手动安装：
 
 ```powershell
 py -3.13 -m venv .venv
@@ -288,7 +297,18 @@ DWM Acrylic 的窗口属性、双屏工作区和任务栏裁切，并枚举摄�
 ```
 
 构建脚本会执行依赖检查、PyInstaller 打包、打包版 `--self-test` 和 ZIP 压缩，
-并清理 `build` 中间目录。生成内容已由 `.gitignore` 排除。
+并清理 `build` 中间目录。运行依赖位于 `requirements.txt`，仅构建时需要的
+PyInstaller 位于 `requirements-build.txt`；构建脚本会自动准备构建工具。
+
+生成 GitHub Releases 使用的轻量联网版：
+
+```powershell
+.\构建轻量版.ps1
+```
+
+输出为 `dist\SeatSentinel-v<版本>-Light.zip` 及对应 `.sha256` 文件。轻量版不包含
+Python、`.venv`、OpenVINO、OpenCV 或模型，首次启动时按上述流程联网准备。所有
+生成内容均已由 `.gitignore` 排除。
 
 ## 项目结构
 
@@ -321,8 +341,12 @@ DWM Acrylic 的窗口属性、双屏工作区和任务栏裁切，并枚举摄�
 ├─ SECURITY.md
 ├─ THIRD_PARTY_NOTICES.md
 ├─ ROADMAP.md
+├─ requirements.txt
+├─ requirements-build.txt
+├─ 安装并启动.cmd
 ├─ 一键启动.ps1
 ├─ 打开调试界面.cmd
+├─ 构建轻量版.ps1
 └─ 构建EXE.ps1
 ```
 
