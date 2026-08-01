@@ -32,6 +32,7 @@ from face_identity import (
     FaceTemplateError,
     FaceTemplateStore,
 )
+from privacy_blur import PrivacyBlurSignal, SecondPersonPrivacyGuard
 from session_monitor import SessionMonitor, SessionMonitorError
 from windows_lock import WindowsLockError, lock_workstation
 
@@ -74,6 +75,13 @@ def _clear_debug_frame(
         debug_frame_buffer.clear(status=status, device=device)
     except Exception:
         LOGGER.exception("Unable to clear the in-memory debug frame")
+
+
+def _clear_privacy_blur(
+    privacy_blur_signal: Optional[PrivacyBlurSignal],
+) -> None:
+    if privacy_blur_signal is not None:
+        privacy_blur_signal.clear()
 
 
 def _publish_debug_frame(
@@ -239,6 +247,7 @@ def monitor_until_session_pause(
     stop_event: Optional[Event] = None,
     status_callback: Optional[StatusCallback] = None,
     debug_frame_buffer: Optional[DebugFrameBuffer] = None,
+    privacy_blur_signal: Optional[PrivacyBlurSignal] = None,
 ) -> MonitorOutcome:
     """Monitor until Windows locks or the session state becomes uncertain."""
     registered_face_mode = config.PRESENCE_MODE == "REGISTERED_FACE"
@@ -265,6 +274,22 @@ def monitor_until_session_pause(
     activity_was_healthy = True
     identity_match_streak = 0
     lock_warning_started_at: Optional[float] = None
+    privacy_guard = (
+        SecondPersonPrivacyGuard(
+            confirmation_frames=(
+                config.SECOND_PERSON_CONFIRMATION_FRAMES
+            ),
+            rearm_clear_seconds=(
+                config.SECOND_PERSON_REARM_CLEAR_SECONDS
+            ),
+        )
+        if (
+            registered_face_mode
+            and config.PRIVACY_BLUR_ENABLED
+            and privacy_blur_signal is not None
+        )
+        else None
+    )
 
     LOGGER.info(
         "Monitoring active; grace period is %.0f seconds",
@@ -282,6 +307,7 @@ def monitor_until_session_pause(
 
     while True:
         if stop_event is not None and stop_event.is_set():
+            _clear_privacy_blur(privacy_blur_signal)
             _clear_debug_frame(
                 debug_frame_buffer,
                 "监控已停止 · 调试画面已清空",
@@ -293,6 +319,7 @@ def monitor_until_session_pause(
         wait_seconds = next_detection_at - now
         if wait_seconds > 0:
             if _wait_or_stop(stop_event, wait_seconds):
+                _clear_privacy_blur(privacy_blur_signal)
                 return MonitorOutcome.STOP_REQUESTED
 
         cycle_time = time.monotonic()
@@ -302,6 +329,7 @@ def monitor_until_session_pause(
 
         try:
             if session_monitor.is_locked():
+                _clear_privacy_blur(privacy_blur_signal)
                 _clear_debug_frame(
                     debug_frame_buffer,
                     "Windows 已锁定 · 调试画面已清空",
@@ -317,6 +345,7 @@ def monitor_until_session_pause(
                 )
                 return MonitorOutcome.SESSION_LOCKED
         except SessionMonitorError as exc:
+            _clear_privacy_blur(privacy_blur_signal)
             _clear_debug_frame(
                 debug_frame_buffer,
                 "Windows 会话状态不明 · 调试画面已清空",
@@ -365,6 +394,8 @@ def monitor_until_session_pause(
                 )
                 last_camera_error_log_at = cycle_time
             camera_was_healthy = False
+            if privacy_guard is not None:
+                privacy_guard.mark_visual_state_unknown()
 
             if cycle_time >= next_camera_reconnect_at:
                 camera.release()
@@ -426,6 +457,30 @@ def monitor_until_session_pause(
                     time.perf_counter() - inference_started_at
                 ) * 1000.0
                 inference_ok = True
+                if (
+                    config.PRIVACY_BLUR_ENABLED
+                    and privacy_guard is not None
+                    and privacy_guard.update(
+                        owner_confirmed=presence_detected is True,
+                        face_count=len(detections),
+                        timestamp=cycle_time,
+                    )
+                ):
+                    assert privacy_blur_signal is not None
+                    detail = (
+                        "检测到本人身旁出现第二个人 · "
+                        "快速左右甩动鼠标即可恢复"
+                    )
+                    if privacy_blur_signal.activate(detail):
+                        LOGGER.info(
+                            "Second person confirmed beside the registered "
+                            "user; privacy blur activated"
+                        )
+                        _report_status(
+                            status_callback,
+                            "privacy_blur",
+                            detail,
+                        )
                 if not inference_was_healthy:
                     LOGGER.info("Model inference recovered")
                 inference_was_healthy = True
@@ -454,6 +509,8 @@ def monitor_until_session_pause(
                     )
                     last_inference_error_log_at = cycle_time
                 inference_was_healthy = False
+                if privacy_guard is not None:
+                    privacy_guard.mark_visual_state_unknown()
 
         if presence_detected is True:
             last_seen_time = cycle_time
@@ -589,6 +646,15 @@ def monitor_until_session_pause(
                     "lock_warning",
                     f"{lock_warning_seconds} 秒后自动锁屏",
                 )
+            elif (
+                privacy_blur_signal is not None
+                and privacy_blur_signal.snapshot().active
+            ):
+                _report_status(
+                    status_callback,
+                    "privacy_blur",
+                    privacy_blur_signal.snapshot().detail,
+                )
             elif warning_cancelled:
                 _report_status(
                     status_callback,
@@ -673,6 +739,7 @@ def monitor_until_session_pause(
                 "locked",
                 "Windows 已锁定 · 等待解锁",
             )
+            _clear_privacy_blur(privacy_blur_signal)
             return MonitorOutcome.LOCK_REQUESTED
         except WindowsLockError as exc:
             LOGGER.error("%s", exc)
@@ -896,6 +963,7 @@ def run(
     stop_event: Optional[Event] = None,
     status_callback: Optional[StatusCallback] = None,
     debug_frame_buffer: Optional[DebugFrameBuffer] = None,
+    privacy_blur_signal: Optional[PrivacyBlurSignal] = None,
 ) -> int:
     """Run persistent lock, unlock, and resume cycles."""
     camera: Optional[Camera] = None
@@ -998,6 +1066,7 @@ def run(
                     stop_event=stop_event,
                     status_callback=status_callback,
                     debug_frame_buffer=debug_frame_buffer,
+                    privacy_blur_signal=privacy_blur_signal,
                 )
             finally:
                 camera.release()
@@ -1071,6 +1140,7 @@ def run(
         )
         return 1
     finally:
+        _clear_privacy_blur(privacy_blur_signal)
         if camera is not None:
             camera.release()
         _clear_debug_frame(

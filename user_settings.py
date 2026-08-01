@@ -24,6 +24,7 @@ class AppSettings:
     face_confidence_threshold: float
     inference_device: str
     presence_mode: str
+    privacy_blur_enabled: bool
     face_absence_timeout_seconds: float
     input_idle_timeout_seconds: float
     startup_grace_period_seconds: float
@@ -42,6 +43,7 @@ class AppSettings:
             ),
             inference_device=config.PREFERRED_INFERENCE_DEVICE,
             presence_mode=config.PRESENCE_MODE,
+            privacy_blur_enabled=config.PRIVACY_BLUR_ENABLED,
             face_absence_timeout_seconds=(
                 config.FACE_ABSENCE_TIMEOUT_SECONDS
             ),
@@ -74,6 +76,10 @@ class AppSettings:
                 presence_mode=str(
                     defaults["presence_mode"]
                 ).strip().upper(),
+                privacy_blur_enabled=cls._parse_boolean(
+                    defaults["privacy_blur_enabled"],
+                    "多人脸隐私模糊开关",
+                ),
                 face_absence_timeout_seconds=float(
                     defaults["face_absence_timeout_seconds"]
                 ),
@@ -91,6 +97,20 @@ class AppSettings:
         settings.validate()
         return settings
 
+    @staticmethod
+    def _parse_boolean(value: Any, field_name: str) -> bool:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, int) and value in {0, 1}:
+            return bool(value)
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in {"true", "1", "yes", "on"}:
+                return True
+            if normalized in {"false", "0", "no", "off"}:
+                return False
+        raise SettingsError(f"{field_name}必须为开启或关闭")
+
     def validate(self) -> None:
         if not self.camera_name:
             raise SettingsError("必须选择摄像头")
@@ -102,6 +122,8 @@ class AppSettings:
             raise SettingsError("推理设备只能选择 NPU 或 CPU")
         if self.presence_mode not in {"ANY_FACE", "REGISTERED_FACE"}:
             raise SettingsError("在场判断只能选择任意人脸或仅本人")
+        if not isinstance(self.privacy_blur_enabled, bool):
+            raise SettingsError("多人脸隐私模糊开关必须为布尔值")
         if not 3.0 <= self.face_absence_timeout_seconds <= 3600.0:
             raise SettingsError("无人超时必须在 3 至 3600 秒之间")
         if not 3.0 <= self.input_idle_timeout_seconds <= 3600.0:
@@ -124,6 +146,7 @@ class AppSettings:
         )
         config.PREFERRED_INFERENCE_DEVICE = self.inference_device
         config.PRESENCE_MODE = self.presence_mode
+        config.PRIVACY_BLUR_ENABLED = self.privacy_blur_enabled
         config.FACE_ABSENCE_TIMEOUT_SECONDS = (
             self.face_absence_timeout_seconds
         )

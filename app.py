@@ -25,6 +25,7 @@ import main as monitoring
 import config
 from debug_frame import DebugFrameBuffer, DebugFrameSnapshot
 from detector import FaceDetection, FaceDetector
+from dwm_privacy import DwmPrivacyError, DwmPrivacyOverlay
 from face_identity import (
     FaceIdentityRecognizer,
     FaceTemplateError,
@@ -35,6 +36,11 @@ from face_registration import (
     FaceRegistrationError,
     FaceRegistrationUpdate,
     register_face_from_camera,
+)
+from privacy_blur import (
+    MouseShakeDetector,
+    PrivacyBlurSignal,
+    PrivacyBlurSnapshot,
 )
 from session_monitor import SessionMonitor
 from single_instance import (
@@ -70,6 +76,10 @@ SWP_NOACTIVATE = 0x0010
 SWP_FRAMECHANGED = 0x0020
 SWP_SHOWWINDOW = 0x0040
 HWND_TOPMOST = -1
+
+
+class _CursorPoint(ctypes.Structure):
+    _fields_ = [("x", wintypes.LONG), ("y", wintypes.LONG)]
 
 
 def _native_top_level_handle(window: tk.Misc) -> int:
@@ -213,6 +223,17 @@ def _configure_overlay_window(window: tk.Misc) -> int:
     return handle
 
 
+def _cursor_position() -> tuple[int, int]:
+    """Read the system cursor without installing a global input hook."""
+    point = _CursorPoint()
+    user32 = ctypes.windll.user32
+    user32.GetCursorPos.argtypes = [ctypes.POINTER(_CursorPoint)]
+    user32.GetCursorPos.restype = wintypes.BOOL
+    if not user32.GetCursorPos(ctypes.byref(point)):
+        raise OSError("Unable to read the mouse cursor position")
+    return int(point.x), int(point.y)
+
+
 class MonitoringService:
     """Start, pause, resume, and restart the monitoring worker safely."""
 
@@ -226,6 +247,7 @@ class MonitoringService:
         self._status_detail = "监控尚未启动"
         self._shutting_down = False
         self._debug_frame_buffer = DebugFrameBuffer()
+        self._privacy_blur_signal = PrivacyBlurSignal()
 
     def status_detail(self) -> str:
         with self._state_lock:
@@ -248,6 +270,21 @@ class MonitoringService:
         """Return the latest frame copied safely for the Tkinter thread."""
         return self._debug_frame_buffer.snapshot()
 
+    def privacy_blur_snapshot(self) -> PrivacyBlurSnapshot:
+        return self._privacy_blur_signal.snapshot()
+
+    def dismiss_privacy_blur(self) -> bool:
+        dismissed = self._privacy_blur_signal.dismiss()
+        if dismissed:
+            self._update_status(
+                "monitoring",
+                "已通过甩动鼠标解除隐私模糊 · 继续监控",
+            )
+        return dismissed
+
+    def clear_privacy_blur(self) -> None:
+        self._privacy_blur_signal.clear()
+
     def _update_status(self, state: str, detail: str) -> None:
         with self._state_lock:
             if self._shutting_down:
@@ -264,6 +301,7 @@ class MonitoringService:
         ).start()
 
     def pause_async(self) -> None:
+        self._privacy_blur_signal.clear()
         self._update_status("pausing", "正在暂停并释放摄像头")
         self._debug_frame_buffer.clear(
             "监控正在暂停 · 调试画面已清空"
@@ -277,6 +315,7 @@ class MonitoringService:
 
     def pause_blocking(self) -> None:
         """Stop monitoring synchronously from a non-UI worker thread."""
+        self._privacy_blur_signal.clear()
         self._update_status("pausing", "正在暂停并释放摄像头")
         self._debug_frame_buffer.clear(
             "监控正在暂停 · 调试画面已清空"
@@ -284,6 +323,7 @@ class MonitoringService:
         self._transition(False, False)
 
     def restart_async(self) -> None:
+        self._privacy_blur_signal.clear()
         self._update_status("starting", "正在应用设置并重启监控")
         self._debug_frame_buffer.clear(
             "正在重新启动监控 · 调试画面已清空"
@@ -319,6 +359,7 @@ class MonitoringService:
                 self._stop_event = None
 
             if not should_run:
+                self._privacy_blur_signal.clear()
                 self._update_status("paused", "监控已暂停 · 摄像头已释放")
                 self._debug_frame_buffer.clear(
                     "监控已暂停 · 调试画面已清空"
@@ -353,6 +394,7 @@ class MonitoringService:
             stop_event=stop_event,
             status_callback=self._update_status,
             debug_frame_buffer=self._debug_frame_buffer,
+            privacy_blur_signal=self._privacy_blur_signal,
         )
         with self._state_lock:
             if self._thread is threading.current_thread():
@@ -371,6 +413,7 @@ class MonitoringService:
                 stop_event.set()
             if worker is not None and worker.is_alive():
                 worker.join(timeout=30.0)
+            self._privacy_blur_signal.clear()
             self._debug_frame_buffer.clear(
                 "程序正在退出 · 调试画面已清空"
             )
@@ -392,6 +435,9 @@ class TrayApplication:
         self._root.withdraw()
         self._root.protocol("WM_DELETE_WINDOW", self._root.withdraw)
         self._settings_window: Optional[tk.Toplevel] = None
+        self._settings_privacy_blur_variable: Optional[
+            tk.BooleanVar
+        ] = None
         self._registration_window: Optional[tk.Toplevel] = None
         self._registration_cancel_event: Optional[threading.Event] = None
         self._registration_queue: Optional[
@@ -406,6 +452,13 @@ class TrayApplication:
         self._lock_warning_window: Optional[tk.Toplevel] = None
         self._lock_warning_detail_variable: Optional[tk.StringVar] = None
         self._lock_warning_opacity = 0.0
+        self._privacy_blur_overlay = DwmPrivacyOverlay(
+            config.PRIVACY_ACRYLIC_STRENGTH_PERCENT
+        )
+        self._privacy_blur_next_monitor_check_at = 0.0
+        self._privacy_blur_last_sequence = -1
+        self._privacy_mouse_shake = MouseShakeDetector()
+        self._privacy_cursor_error_logged = False
         self._debug_window: Optional[tk.Toplevel] = None
         self._debug_status_variable: Optional[tk.StringVar] = None
         self._debug_metric_variables: dict[str, tk.StringVar] = {}
@@ -414,6 +467,7 @@ class TrayApplication:
         self._debug_status_badge: Optional[tk.Label] = None
         self._debug_toggle_button: Optional[tk.Button] = None
         self._debug_device_toggle_button: Optional[tk.Button] = None
+        self._debug_exit_button: Optional[tk.Button] = None
         self._debug_camera_variable: Optional[tk.StringVar] = None
         self._debug_camera_combobox: Optional[ttk.Combobox] = None
         self._debug_canvas: Optional[tk.Canvas] = None
@@ -426,6 +480,7 @@ class TrayApplication:
         self._debug_drag_offset_y = 0
         self._debug_signal = debug_signal
         self._show_debug_on_start = show_debug_on_start
+        self._shutdown_started = threading.Event()
         self._settings_store = SettingsStore()
         self._face_template_store = FaceTemplateStore(
             config.FACE_TEMPLATE_PATH
@@ -461,6 +516,13 @@ class TrayApplication:
                     "恢复监控",
                     self._resume,
                     enabled=lambda item: not self._service.is_running(),
+                ),
+                pystray.MenuItem(
+                    "多人脸隐私模糊",
+                    self._toggle_privacy_blur_from_tray,
+                    checked=lambda item: bool(
+                        config.PRIVACY_BLUR_ENABLED
+                    ),
                 ),
                 pystray.MenuItem(
                     "设置",
@@ -563,6 +625,7 @@ class TrayApplication:
         self._service.start_async()
         self._root.after(1000, self._refresh_tray_menu)
         self._root.after(100, self._refresh_lock_warning)
+        self._root.after(80, self._refresh_privacy_blur)
         self._root.after(250, self._poll_debug_signal)
         if self._show_debug_on_start:
             self._root.after(250, self._show_debug_window)
@@ -571,6 +634,7 @@ class TrayApplication:
         except KeyboardInterrupt:
             LOGGER.info("Ctrl+C received; closing tray application")
         finally:
+            self._hide_privacy_blur()
             self._service.shutdown()
             self._tray_icon.stop()
             try:
@@ -716,6 +780,96 @@ class TrayApplication:
                 except tk.TclError:
                     pass
 
+    def _show_privacy_blur(
+        self,
+        snapshot: PrivacyBlurSnapshot,
+    ) -> None:
+        self._hide_privacy_blur()
+        info = self._privacy_blur_overlay.show()
+        self._privacy_blur_last_sequence = snapshot.sequence
+        self._privacy_blur_next_monitor_check_at = time.monotonic() + 1.0
+
+        try:
+            cursor_x, cursor_y = _cursor_position()
+            self._privacy_mouse_shake.reset(cursor_x, cursor_y)
+            self._privacy_cursor_error_logged = False
+        except OSError as exc:
+            self._privacy_mouse_shake.reset()
+            if not self._privacy_cursor_error_logged:
+                LOGGER.warning(
+                    "Unable to initialize the privacy mouse gesture: %s",
+                    exc,
+                )
+                self._privacy_cursor_error_logged = True
+
+        LOGGER.info(
+            "DWM Desktop Acrylic privacy layer is visible across %d "
+            "monitor(s) at %d%% strength",
+            len(info.work_areas),
+            info.strength_percent,
+        )
+
+    def _hide_privacy_blur(self) -> None:
+        self._privacy_blur_overlay.hide()
+        self._privacy_mouse_shake.reset()
+
+    def _refresh_privacy_blur(self, schedule_next: bool = True) -> None:
+        next_delay = 80
+        try:
+            snapshot = self._service.privacy_blur_snapshot()
+            overlay_visible = self._privacy_blur_overlay.is_visible()
+            if snapshot.active:
+                next_delay = config.PRIVACY_MOUSE_POLL_MILLISECONDS
+                if (
+                    not overlay_visible
+                    or snapshot.sequence != self._privacy_blur_last_sequence
+                ):
+                    self._show_privacy_blur(snapshot)
+                elif (
+                    time.monotonic()
+                    >= self._privacy_blur_next_monitor_check_at
+                ):
+                    if self._privacy_blur_overlay.display_geometry_changed():
+                        self._show_privacy_blur(snapshot)
+                    else:
+                        self._privacy_blur_next_monitor_check_at = (
+                            time.monotonic() + 1.0
+                        )
+
+                try:
+                    cursor_x, cursor_y = _cursor_position()
+                    if self._privacy_mouse_shake.record(
+                        cursor_x,
+                        cursor_y,
+                    ):
+                        if self._service.dismiss_privacy_blur():
+                            LOGGER.info(
+                                "Privacy blur dismissed by a mouse shake"
+                            )
+                        self._hide_privacy_blur()
+                    self._privacy_cursor_error_logged = False
+                except OSError as exc:
+                    if not self._privacy_cursor_error_logged:
+                        LOGGER.warning(
+                            "Unable to read the privacy mouse gesture: %s",
+                            exc,
+                        )
+                        self._privacy_cursor_error_logged = True
+            elif overlay_visible:
+                self._hide_privacy_blur()
+        except (DwmPrivacyError, OSError, tk.TclError, ValueError) as exc:
+            LOGGER.error("Unable to maintain the DWM privacy blur: %s", exc)
+            self._hide_privacy_blur()
+        finally:
+            if schedule_next:
+                try:
+                    self._root.after(
+                        max(10, next_delay),
+                        self._refresh_privacy_blur,
+                    )
+                except tk.TclError:
+                    pass
+
     def _poll_debug_signal(self) -> None:
         try:
             if (
@@ -735,6 +889,49 @@ class TrayApplication:
 
     def _resume(self, icon: pystray.Icon, item: pystray.MenuItem) -> None:
         self._service.start_async()
+
+    def _toggle_privacy_blur_from_tray(
+        self,
+        icon: pystray.Icon,
+        item: pystray.MenuItem,
+    ) -> None:
+        self._root.after(0, self._toggle_privacy_blur_setting)
+
+    def _toggle_privacy_blur_setting(self) -> None:
+        was_running = self._service.is_running()
+        try:
+            current = self._settings_store.load()
+            updated = replace(
+                current,
+                privacy_blur_enabled=not current.privacy_blur_enabled,
+            )
+            self._settings_store.save(updated)
+            updated.apply_to_runtime()
+        except SettingsError as exc:
+            messagebox.showerror("设置错误", str(exc))
+            return
+
+        self._service.clear_privacy_blur()
+        self._hide_privacy_blur()
+        variable = self._settings_privacy_blur_variable
+        if variable is not None:
+            try:
+                variable.set(updated.privacy_blur_enabled)
+            except tk.TclError:
+                self._settings_privacy_blur_variable = None
+        if was_running:
+            self._service.restart_async()
+        try:
+            self._tray_icon.update_menu()
+        except Exception as exc:
+            LOGGER.debug(
+                "Unable to update the privacy toggle in the tray menu",
+                exc_info=exc,
+            )
+        LOGGER.info(
+            "Multi-face privacy blur %s from the tray menu",
+            "enabled" if updated.privacy_blur_enabled else "disabled",
+        )
 
     def _show_debug_from_tray(
         self,
@@ -1077,7 +1274,14 @@ class TrayApplication:
             buttons,
             text="关闭控制台",
             command=self._close_debug_window,
-        ).pack(side="left")
+        ).pack(side="left", padx=(0, 8))
+        self._debug_exit_button = self._create_debug_button(
+            buttons,
+            text="彻底退出程序",
+            command=self._exit_from_debug,
+            danger=True,
+        )
+        self._debug_exit_button.pack(side="left")
 
         self._refresh_debug_window()
         window.update_idletasks()
@@ -1387,14 +1591,17 @@ class TrayApplication:
         parent: tk.Misc,
         text: str,
         command: Callable[[], object],
+        danger: bool = False,
     ) -> tk.Button:
+        background = "#5B2430" if danger else "#102337"
+        active_background = "#8A3042" if danger else "#16415a"
         return tk.Button(
             parent,
             text=text,
             command=command,
-            background="#102337",
+            background=background,
             foreground="#dff8ff",
-            activebackground="#16415a",
+            activebackground=active_background,
             activeforeground="#ffffff",
             relief="flat",
             borderwidth=0,
@@ -1907,6 +2114,7 @@ class TrayApplication:
         self._debug_canvas = None
         self._debug_toggle_button = None
         self._debug_device_toggle_button = None
+        self._debug_exit_button = None
         self._debug_camera_variable = None
         self._debug_camera_combobox = None
         self._debug_last_frame_sequence = -1
@@ -1921,6 +2129,9 @@ class TrayApplication:
             self._service.pause_async()
         else:
             self._service.start_async()
+
+    def _exit_from_debug(self) -> None:
+        self._request_shutdown()
 
     def _toggle_inference_device(self) -> None:
         try:
@@ -2352,6 +2563,9 @@ class TrayApplication:
             "presence_mode": tk.StringVar(
                 value=PRESENCE_MODE_LABELS[settings.presence_mode]
             ),
+            "privacy_blur_enabled": tk.BooleanVar(
+                value=settings.privacy_blur_enabled
+            ),
             "detection_interval_seconds": tk.StringVar(
                 value=str(settings.detection_interval_seconds)
             ),
@@ -2371,6 +2585,9 @@ class TrayApplication:
                 value=str(settings.startup_grace_period_seconds)
             ),
         }
+        self._settings_privacy_blur_variable = variables[
+            "privacy_blur_enabled"
+        ]
 
         rows = [
             ("摄像头", "camera_name"),
@@ -2421,13 +2638,36 @@ class TrayApplication:
                 sticky="ew",
             )
 
+        privacy_controls = ttk.LabelFrame(
+            content,
+            text="多人脸隐私模糊",
+            padding=10,
+        )
+        privacy_controls.grid(
+            row=len(rows),
+            column=0,
+            columnspan=2,
+            pady=(10, 4),
+            sticky="ew",
+        )
+        ttk.Checkbutton(
+            privacy_controls,
+            text="启用多人脸隐私模糊：本人身旁出现第二个人时自动开启毛玻璃",
+            variable=variables["privacy_blur_enabled"],
+        ).pack(anchor="w")
+        ttk.Label(
+            privacy_controls,
+            text="也可从右下角托盘图标的右键菜单随时开关",
+            foreground="#666666",
+        ).pack(anchor="w", pady=(4, 0))
+
         identity_controls = ttk.LabelFrame(
             content,
             text="本人人脸注册",
             padding=10,
         )
         identity_controls.grid(
-            row=len(rows),
+            row=len(rows) + 1,
             column=0,
             columnspan=2,
             pady=(10, 4),
@@ -2464,11 +2704,15 @@ class TrayApplication:
         ttk.Label(
             content,
             text=(
-                "“仅本人”模式必须先注册。保存后会安全释放摄像头，并用新设置重新启动监控。"
+                "“仅本人”模式必须先注册；启用多人脸隐私模糊后，确认本人身旁出现"
+                "第二个人时会自动开启全屏毛玻璃，快速左右甩动鼠标即可恢复。"
+                "保存后会安全释放摄像头并重启监控。"
             ),
             foreground="#555555",
+            wraplength=560,
+            justify="left",
         ).grid(
-            row=len(rows) + 1,
+            row=len(rows) + 2,
             column=0,
             columnspan=2,
             pady=(10, 8),
@@ -2477,7 +2721,7 @@ class TrayApplication:
 
         buttons = ttk.Frame(content)
         buttons.grid(
-            row=len(rows) + 2,
+            row=len(rows) + 3,
             column=0,
             columnspan=2,
             pady=(8, 0),
@@ -2526,7 +2770,7 @@ class TrayApplication:
 
     def _save_settings(
         self,
-        variables: dict[str, tk.StringVar],
+        variables: dict[str, tk.Variable],
         window: tk.Toplevel,
         old_settings: AppSettings,
     ) -> None:
@@ -2538,6 +2782,9 @@ class TrayApplication:
                         variables["presence_mode"].get(),
                         variables["presence_mode"].get(),
                     ),
+                    "privacy_blur_enabled": variables[
+                        "privacy_blur_enabled"
+                    ].get(),
                     "detection_interval_seconds": variables[
                         "detection_interval_seconds"
                     ].get(),
@@ -2575,6 +2822,7 @@ class TrayApplication:
                         f"本人人脸模板无法使用：{exc}"
                     ) from exc
             self._settings_store.save(settings)
+            settings.apply_to_runtime()
         except SettingsError as exc:
             messagebox.showerror(
                 "设置错误",
@@ -2583,6 +2831,16 @@ class TrayApplication:
             )
             return
 
+        if not settings.privacy_blur_enabled:
+            self._service.clear_privacy_blur()
+            self._hide_privacy_blur()
+        try:
+            self._tray_icon.update_menu()
+        except Exception as exc:
+            LOGGER.debug(
+                "Unable to refresh the tray menu after saving settings",
+                exc_info=exc,
+            )
         window.destroy()
         self._service.restart_async()
 
@@ -2591,6 +2849,12 @@ class TrayApplication:
         icon: pystray.Icon,
         item: pystray.MenuItem,
     ) -> None:
+        self._request_shutdown()
+
+    def _request_shutdown(self) -> None:
+        if self._shutdown_started.is_set():
+            return
+        self._shutdown_started.set()
         threading.Thread(
             target=self._shutdown,
             name="seat-sentinel-exit",
@@ -2629,6 +2893,21 @@ def _run_self_test() -> int:
             raise RuntimeError("Tray icon image has an invalid size")
         if locked_icon.tobytes() == unlocked_icon.tobytes():
             raise RuntimeError("Tray state icons must be visually distinct")
+        privacy_menu_items = [
+            item
+            for item in test_application._tray_icon.menu.items
+            if str(item.text) == "多人脸隐私模糊"
+        ]
+        if len(privacy_menu_items) != 1:
+            raise RuntimeError(
+                "Tray privacy-blur switch was not initialized"
+            )
+        if bool(privacy_menu_items[0].checked) != bool(
+            settings.privacy_blur_enabled
+        ):
+            raise RuntimeError(
+                "Tray privacy-blur switch does not match saved settings"
+            )
         test_application._service._update_status(
             "lock_warning",
             "5 秒后自动锁屏",
@@ -2669,6 +2948,26 @@ def _run_self_test() -> int:
         test_application._root.update_idletasks()
         if warning_window.winfo_viewable():
             raise RuntimeError("Cancelled lock warning remained visible")
+
+        privacy_diagnostics = (
+            test_application._privacy_blur_overlay.self_test()
+        )
+        if not privacy_diagnostics.get("ok"):
+            raise RuntimeError(
+                "DWM Desktop Acrylic privacy overlay self-test failed: "
+                f"{privacy_diagnostics}"
+            )
+        if (
+            privacy_diagnostics.get("strength_percent")
+            != config.PRIVACY_ACRYLIC_STRENGTH_PERCENT
+        ):
+            raise RuntimeError(
+                "DWM privacy strength does not match the configured value"
+            )
+        if int(privacy_diagnostics.get("monitor_count", 0)) < 1:
+            raise RuntimeError(
+                "DWM privacy self-test did not find an active monitor"
+            )
         camera_names = test_application._camera_names()
         if not camera_names:
             LOGGER.warning(
@@ -2704,6 +3003,14 @@ def _run_self_test() -> int:
             or test_application._debug_photo_image is None
         ):
             raise RuntimeError("Debug window could not be created")
+        if (
+            test_application._debug_exit_button is None
+            or test_application._debug_exit_button.cget("text")
+            != "彻底退出程序"
+        ):
+            raise RuntimeError(
+                "Debug window exit-program button was not initialized"
+            )
         if (
             test_application._debug_camera_combobox is None
             or test_application._debug_camera_variable is None
@@ -2741,9 +3048,18 @@ def _run_self_test() -> int:
             and widget.cget("text") in {"注册本人", "更新本人"}
             for widget in settings_widgets
         )
-        if not mode_selector_found or not registration_button_found:
+        privacy_switch_found = any(
+            isinstance(widget, ttk.Checkbutton)
+            and "多人脸隐私模糊" in str(widget.cget("text"))
+            for widget in settings_widgets
+        )
+        if (
+            not mode_selector_found
+            or not registration_button_found
+            or not privacy_switch_found
+        ):
             raise RuntimeError(
-                "Registered-face controls were not initialized"
+                "Registered-face or privacy controls were not initialized"
             )
         settings_window.destroy()
         if not test_application._debug_window.overrideredirect():
@@ -2831,11 +3147,14 @@ def _run_self_test() -> int:
         LOGGER.info(
             "Self-test passed | primary_device=%s | cpu_device=%s | "
             "identity_device=%s | "
-            "session_locked=%s | synthetic_face=%s | cpu_face=%s",
+            "session_locked=%s | monitors=%d | acrylic_strength=%d%% | "
+            "synthetic_face=%s | cpu_face=%s",
             detector.device,
             cpu_detector.device,
             identity_recognizer.device,
             session_locked,
+            int(privacy_diagnostics["monitor_count"]),
+            int(privacy_diagnostics["strength_percent"]),
             face_detected,
             cpu_face_detected,
         )
