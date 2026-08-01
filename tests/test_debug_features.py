@@ -52,6 +52,7 @@ class ApplicationDefaultsTests(unittest.TestCase):
         self.assertEqual(settings.face_absence_timeout_seconds, 60)
         self.assertEqual(settings.input_idle_timeout_seconds, 60)
         self.assertEqual(config.LOCK_WARNING_SECONDS, 5.0)
+        self.assertEqual(config.SECOND_PERSON_AUTO_DISMISS_SECONDS, 3.0)
         self.assertEqual(config.PRIVACY_ACRYLIC_STRENGTH_PERCENT, 96)
         self.assertEqual(os.environ.get("DO_NOT_TRACK"), "1")
         self.assertEqual(os.environ.get("SCARF_NO_ANALYTICS"), "1")
@@ -492,6 +493,78 @@ class PrivacyBlurDecisionTests(unittest.TestCase):
         self.assertFalse(guard.update(False, 1, timestamp=61.0))
         self.assertFalse(guard.update(True, 2, timestamp=61.5))
         self.assertTrue(guard.update(True, 2, timestamp=62.0))
+
+    def test_auto_dismisses_after_owner_is_alone_for_three_seconds(self) -> None:
+        guard = SecondPersonPrivacyGuard(
+            confirmation_frames=2,
+            rearm_clear_seconds=60.0,
+            auto_dismiss_owner_alone_seconds=3.0,
+        )
+        guard.evaluate(True, 2, timestamp=0.0)
+        self.assertTrue(
+            guard.evaluate(True, 2, timestamp=0.5).activate
+        )
+
+        self.assertFalse(
+            guard.evaluate(True, 1, timestamp=1.0).auto_dismiss
+        )
+        self.assertFalse(
+            guard.evaluate(True, 1, timestamp=3.9).auto_dismiss
+        )
+        self.assertTrue(
+            guard.evaluate(True, 1, timestamp=4.0).auto_dismiss
+        )
+        self.assertFalse(
+            guard.evaluate(True, 1, timestamp=4.5).auto_dismiss
+        )
+
+    def test_auto_dismiss_requires_confirmed_owner_alone(self) -> None:
+        guard = SecondPersonPrivacyGuard(
+            confirmation_frames=2,
+            rearm_clear_seconds=60.0,
+            auto_dismiss_owner_alone_seconds=3.0,
+        )
+        guard.evaluate(True, 2, timestamp=0.0)
+        guard.evaluate(True, 2, timestamp=0.5)
+
+        self.assertFalse(
+            guard.evaluate(False, 1, timestamp=1.0).auto_dismiss
+        )
+        self.assertFalse(
+            guard.evaluate(False, 1, timestamp=5.0).auto_dismiss
+        )
+        self.assertFalse(
+            guard.evaluate(True, 1, timestamp=5.5).auto_dismiss
+        )
+        self.assertFalse(
+            guard.evaluate(True, 1, timestamp=8.4).auto_dismiss
+        )
+        self.assertTrue(
+            guard.evaluate(True, 1, timestamp=8.5).auto_dismiss
+        )
+
+    def test_unknown_or_second_person_restarts_auto_dismiss_timer(self) -> None:
+        guard = SecondPersonPrivacyGuard(
+            confirmation_frames=2,
+            rearm_clear_seconds=60.0,
+            auto_dismiss_owner_alone_seconds=3.0,
+        )
+        guard.evaluate(True, 2, timestamp=0.0)
+        guard.evaluate(True, 2, timestamp=0.5)
+        guard.evaluate(True, 1, timestamp=1.0)
+        guard.mark_visual_state_unknown()
+        guard.evaluate(True, 1, timestamp=3.0)
+        guard.evaluate(True, 2, timestamp=5.0)
+
+        self.assertFalse(
+            guard.evaluate(True, 1, timestamp=6.0).auto_dismiss
+        )
+        self.assertFalse(
+            guard.evaluate(True, 1, timestamp=8.9).auto_dismiss
+        )
+        self.assertTrue(
+            guard.evaluate(True, 1, timestamp=9.0).auto_dismiss
+        )
 
     def test_two_people_or_unknown_frame_restarts_rearm_timer(self) -> None:
         guard = SecondPersonPrivacyGuard(
