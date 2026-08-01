@@ -282,6 +282,9 @@ def monitor_until_session_pause(
             rearm_clear_seconds=(
                 config.SECOND_PERSON_REARM_CLEAR_SECONDS
             ),
+            auto_dismiss_owner_alone_seconds=(
+                config.SECOND_PERSON_AUTO_DISMISS_SECONDS
+            ),
         )
         if (
             registered_face_mode
@@ -460,25 +463,43 @@ def monitor_until_session_pause(
                 if (
                     config.PRIVACY_BLUR_ENABLED
                     and privacy_guard is not None
-                    and privacy_guard.update(
+                ):
+                    privacy_decision = privacy_guard.evaluate(
                         owner_confirmed=presence_detected is True,
                         face_count=len(detections),
                         timestamp=cycle_time,
                     )
-                ):
                     assert privacy_blur_signal is not None
-                    detail = (
-                        "检测到本人身旁出现第二个人 · "
-                        "快速左右甩动鼠标即可恢复"
-                    )
-                    if privacy_blur_signal.activate(detail):
+                    if privacy_decision.activate:
+                        detail = (
+                            "检测到本人身旁出现第二个人 · 快速甩动鼠标，"
+                            "或仅剩本人 3 秒后自动恢复"
+                        )
+                        if privacy_blur_signal.activate(detail):
+                            LOGGER.info(
+                                "Second person confirmed beside the "
+                                "registered user; privacy blur activated"
+                            )
+                            _report_status(
+                                status_callback,
+                                "privacy_blur",
+                                detail,
+                            )
+                    elif (
+                        privacy_decision.auto_dismiss
+                        and privacy_blur_signal.dismiss()
+                    ):
+                        detail = (
+                            "画面仅剩本人已满 3 秒 · "
+                            "隐私模糊已自动解除"
+                        )
                         LOGGER.info(
-                            "Second person confirmed beside the registered "
-                            "user; privacy blur activated"
+                            "Privacy blur automatically dismissed after "
+                            "the registered user was alone for 3 seconds"
                         )
                         _report_status(
                             status_callback,
-                            "privacy_blur",
+                            "monitoring",
                             detail,
                         )
                 if not inference_was_healthy:

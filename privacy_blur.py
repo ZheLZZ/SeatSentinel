@@ -20,6 +20,14 @@ class PrivacyBlurSnapshot:
     activated_at: Optional[float] = None
 
 
+@dataclass(frozen=True)
+class SecondPersonPrivacyDecision:
+    """Actions produced by one reliable face-analysis result."""
+
+    activate: bool = False
+    auto_dismiss: bool = False
+
+
 class PrivacyBlurSignal:
     """Safely hand privacy-overlay requests between worker and UI threads."""
 
@@ -69,16 +77,26 @@ class SecondPersonPrivacyGuard:
         self,
         confirmation_frames: int = 2,
         rearm_clear_seconds: float = 60.0,
+        auto_dismiss_owner_alone_seconds: float = 3.0,
     ) -> None:
         if confirmation_frames < 1:
             raise ValueError("Confirmation frames must be positive")
         if rearm_clear_seconds <= 0:
             raise ValueError("Rearm clear time must be positive")
+        if auto_dismiss_owner_alone_seconds <= 0:
+            raise ValueError("Auto-dismiss time must be positive")
+        if auto_dismiss_owner_alone_seconds >= rearm_clear_seconds:
+            raise ValueError("Auto-dismiss time must precede rearm time")
         self._confirmation_frames = confirmation_frames
         self._rearm_clear_seconds = rearm_clear_seconds
+        self._auto_dismiss_owner_alone_seconds = (
+            auto_dismiss_owner_alone_seconds
+        )
         self._second_person_streak = 0
         self._clear_started_at: Optional[float] = None
+        self._owner_alone_started_at: Optional[float] = None
         self._triggered_for_episode = False
+        self._auto_dismissed_for_episode = False
 
     def update(
         self,
@@ -87,12 +105,26 @@ class SecondPersonPrivacyGuard:
         timestamp: Optional[float] = None,
     ) -> bool:
         """Return True once per confirmed second-person episode."""
+        return self.evaluate(
+            owner_confirmed,
+            face_count,
+            timestamp,
+        ).activate
+
+    def evaluate(
+        self,
+        owner_confirmed: bool,
+        face_count: int,
+        timestamp: Optional[float] = None,
+    ) -> SecondPersonPrivacyDecision:
+        """Return activation and safe automatic-dismiss decisions."""
         if face_count < 0:
             raise ValueError("Face count cannot be negative")
         now = time.monotonic() if timestamp is None else timestamp
         second_person_present = owner_confirmed and face_count >= 2
         if second_person_present:
             self._clear_started_at = None
+            self._owner_alone_started_at = None
             self._second_person_streak += 1
             if (
                 not self._triggered_for_episode
@@ -100,11 +132,27 @@ class SecondPersonPrivacyGuard:
                 >= self._confirmation_frames
             ):
                 self._triggered_for_episode = True
-                return True
-            return False
+                self._auto_dismissed_for_episode = False
+                return SecondPersonPrivacyDecision(activate=True)
+            return SecondPersonPrivacyDecision()
 
         self._second_person_streak = 0
+        auto_dismiss = False
         if self._triggered_for_episode:
+            owner_alone = owner_confirmed and face_count == 1
+            if owner_alone:
+                if self._owner_alone_started_at is None:
+                    self._owner_alone_started_at = now
+                elif (
+                    not self._auto_dismissed_for_episode
+                    and now - self._owner_alone_started_at
+                    >= self._auto_dismiss_owner_alone_seconds
+                ):
+                    auto_dismiss = True
+                    self._auto_dismissed_for_episode = True
+            else:
+                self._owner_alone_started_at = None
+
             if face_count < 2:
                 if self._clear_started_at is None:
                     self._clear_started_at = now
@@ -114,14 +162,20 @@ class SecondPersonPrivacyGuard:
                 ):
                     self._triggered_for_episode = False
                     self._clear_started_at = None
+                    self._owner_alone_started_at = None
+                    self._auto_dismissed_for_episode = False
             else:
                 self._clear_started_at = None
-        return False
+        else:
+            self._clear_started_at = None
+            self._owner_alone_started_at = None
+        return SecondPersonPrivacyDecision(auto_dismiss=auto_dismiss)
 
     def mark_visual_state_unknown(self) -> None:
         """Break a clear-period timer when no trustworthy frame exists."""
         self._second_person_streak = 0
         self._clear_started_at = None
+        self._owner_alone_started_at = None
 
 
 class MouseShakeDetector:
