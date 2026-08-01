@@ -24,6 +24,59 @@ try {
         throw "未找到项目运行环境。请先运行一键启动.ps1。"
     }
 
+    $runtimeRequirements = Join-Path $PSScriptRoot "requirements.txt"
+    $buildRequirements = Join-Path `
+        $PSScriptRoot `
+        "requirements-build.txt"
+    $buildDependencyMarker = Join-Path `
+        $PSScriptRoot `
+        ".venv\.seat-sentinel-build-requirements.sha256"
+    $buildRequirementsHash = (
+        (Get-FileHash `
+            -LiteralPath $runtimeRequirements `
+            -Algorithm SHA256).Hash + ":" +
+        (Get-FileHash `
+            -LiteralPath $buildRequirements `
+            -Algorithm SHA256).Hash
+    )
+    $installedBuildHash = ""
+    if (Test-Path -LiteralPath $buildDependencyMarker) {
+        $installedBuildHash = (
+            Get-Content `
+                -LiteralPath $buildDependencyMarker `
+                -Raw
+        ).Trim()
+    }
+    if ($installedBuildHash -ne $buildRequirementsHash) {
+        Write-Host "==> 安装或更新构建工具" -ForegroundColor Cyan
+        & $virtualPython -m pip install `
+            --disable-pip-version-check `
+            --no-cache-dir `
+            --retries 2 `
+            --timeout 30 `
+            -r $buildRequirements
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host (
+                "PyPI 官方源连接失败，自动切换到清华镜像重试。"
+            ) -ForegroundColor Yellow
+            & $virtualPython -m pip install `
+                --disable-pip-version-check `
+                --no-cache-dir `
+                --retries 3 `
+                --timeout 60 `
+                --index-url `
+                "https://pypi.tuna.tsinghua.edu.cn/simple" `
+                -r $buildRequirements
+        }
+        if ($LASTEXITCODE -ne 0) {
+            throw "安装构建工具失败（退出码：$LASTEXITCODE）"
+        }
+        Set-Content `
+            -LiteralPath $buildDependencyMarker `
+            -Value $buildRequirementsHash `
+            -Encoding ASCII
+    }
+
     $requiredModels = @(
         "face-detection-retail-0004",
         "landmarks-regression-retail-0009",
@@ -55,6 +108,35 @@ try {
         throw "项目依赖检查失败（退出码：$LASTEXITCODE）"
     }
 
+    $outputDirectory = Join-Path `
+        $PSScriptRoot `
+        "dist\SeatSentinel"
+    $outputExe = Join-Path $outputDirectory "SeatSentinel.exe"
+    $expectedOutputExe = [IO.Path]::GetFullPath($outputExe)
+    $runningOutputProcesses = @(
+        Get-Process `
+            -Name "SeatSentinel" `
+            -ErrorAction SilentlyContinue |
+            Where-Object {
+                try {
+                    [IO.Path]::GetFullPath($_.Path) -eq $expectedOutputExe
+                }
+                catch {
+                    $false
+                }
+            }
+    )
+    if ($runningOutputProcesses.Count -gt 0) {
+        $processIds = (
+            $runningOutputProcesses |
+            ForEach-Object { $_.Id }
+        ) -join ", "
+        throw (
+            "正在运行的 SeatSentinel 占用旧打包目录（PID：$processIds）。" +
+            "请先从托盘退出程序，再重新运行构建脚本。"
+        )
+    }
+
     Write-Host ""
     Write-Host "==> 构建无控制台托盘 EXE，请稍候" -ForegroundColor Cyan
     & $virtualPython -m PyInstaller `
@@ -74,10 +156,6 @@ try {
         throw "PyInstaller 构建失败（退出码：$LASTEXITCODE）"
     }
 
-    $outputDirectory = Join-Path `
-        $PSScriptRoot `
-        "dist\SeatSentinel"
-    $outputExe = Join-Path $outputDirectory "SeatSentinel.exe"
     if (-not (Test-Path -LiteralPath $outputExe)) {
         throw "构建完成但未找到 SeatSentinel.exe"
     }

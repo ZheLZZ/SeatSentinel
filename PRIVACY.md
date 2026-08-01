@@ -64,10 +64,14 @@ SeatSentinel 的正常监控代码不包含上传、远程推理或网络 API �
 
 `一键启动.ps1` 仅在以下情况下联网：
 
-1. 从 PyPI 或配置的镜像安装 Python 依赖；
-2. 从 Intel Open Model Zoo 官方存储地址下载人脸检测、关键点和特征模型。
+1. 电脑没有兼容的 Python 3.13 时，从 Python.org 下载项目专用 Python；
+2. 从 PyPI 或配置的镜像安装 Python 依赖；
+3. 从 Intel Open Model Zoo 官方存储地址下载人脸检测、关键点和特征模型。
 
-下载后的模型必须通过固定 SHA-256 校验。
+Python 安装包和下载后的模型必须通过各自固定的 SHA-256 校验。项目专用 Python
+安装在 `%LOCALAPPDATA%\SeatSentinel\runtime\Python313`，不写入 PATH、不建立
+文件关联，也不创建系统快捷方式。上述联网步骤只下载公开软件和模型，不上传
+摄像头画面、人脸特征、设置或日志。
 
 OpenVINO 包含供其转换工具使用的可选遥测组件。SeatSentinel 不初始化这些转换
 工具，并在导入 OpenVINO 前设置进程级 `DO_NOT_TRACK=1` 和
