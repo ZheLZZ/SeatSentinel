@@ -1,6 +1,6 @@
 # SeatSentinel
 
-![Version](https://img.shields.io/badge/version-v0.2.5--beta-f0a020)
+![Version](https://img.shields.io/badge/version-v0.2.6--beta-f0a020)
 ![Platform](https://img.shields.io/badge/platform-Windows%2011-0078D4)
 ![Python](https://img.shields.io/badge/Python-3.13-3776AB)
 ![OpenVINO](https://img.shields.io/badge/OpenVINO-NPU%20%7C%20CPU-00C7B7)
