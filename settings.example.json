@@ -4,6 +4,8 @@
   "face_confidence_threshold": 0.6,
   "inference_device": "NPU",
   "presence_mode": "ANY_FACE",
+  "camera_monitoring_mode": "CONTINUOUS",
+  "camera_activation_idle_seconds": 20.0,
   "privacy_blur_enabled": true,
   "face_absence_timeout_seconds": 60.0,
   "input_idle_timeout_seconds": 60.0,

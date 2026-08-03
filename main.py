@@ -46,6 +46,8 @@ class MonitorOutcome(Enum):
     LOCK_REQUESTED = "lock_requested"
     SESSION_LOCKED = "session_locked"
     SESSION_STATE_UNKNOWN = "session_state_unknown"
+    INPUT_ACTIVE = "input_active"
+    INPUT_MONITOR_UNAVAILABLE = "input_monitor_unavailable"
     STOP_REQUESTED = "stop_requested"
 
 
@@ -68,11 +70,16 @@ def _clear_debug_frame(
     debug_frame_buffer: Optional[DebugFrameBuffer],
     status: str,
     device: str = "",
+    input_idle_seconds: Optional[float] = None,
 ) -> None:
     if debug_frame_buffer is None:
         return
     try:
-        debug_frame_buffer.clear(status=status, device=device)
+        debug_frame_buffer.clear(
+            status=status,
+            device=device,
+            input_idle_seconds=input_idle_seconds,
+        )
     except Exception:
         LOGGER.exception("Unable to clear the in-memory debug frame")
 
@@ -184,6 +191,26 @@ def _seconds_text(seconds: Optional[float]) -> str:
     return f"{seconds:.1f}"
 
 
+def camera_should_be_active(
+    camera_monitoring_mode: str,
+    input_idle_seconds: Optional[float],
+    activation_idle_seconds: float,
+) -> bool:
+    """Return whether the selected camera strategy allows capture now."""
+    if activation_idle_seconds <= 0:
+        raise ValueError("Camera activation idle time must be positive")
+    if camera_monitoring_mode == "CONTINUOUS":
+        return True
+    if camera_monitoring_mode != "IDLE_TRIGGERED":
+        raise ValueError(
+            f"Unsupported camera monitoring mode: {camera_monitoring_mode}"
+        )
+    return bool(
+        input_idle_seconds is not None
+        and input_idle_seconds >= activation_idle_seconds
+    )
+
+
 def evaluate_presence(
     detections: list[FaceDetection],
     presence_mode: str,
@@ -288,6 +315,7 @@ def monitor_until_session_pause(
         )
         if (
             registered_face_mode
+            and config.CAMERA_MONITORING_MODE == "CONTINUOUS"
             and config.PRIVACY_BLUR_ENABLED
             and privacy_blur_signal is not None
         )
@@ -365,6 +393,51 @@ def monitor_until_session_pause(
                 "会话状态不明 · 摄像头即将释放",
             )
             return MonitorOutcome.SESSION_STATE_UNKNOWN
+
+        if config.CAMERA_MONITORING_MODE == "IDLE_TRIGGERED":
+            try:
+                activation_idle_seconds = (
+                    activity_monitor.seconds_since_last_input()
+                )
+            except ActivityMonitorError as exc:
+                _clear_privacy_blur(privacy_blur_signal)
+                _clear_debug_frame(
+                    debug_frame_buffer,
+                    "无法确认键鼠状态 · 摄像头即将释放",
+                    device_text,
+                )
+                LOGGER.warning(
+                    "Unable to read keyboard/mouse activity in idle-triggered "
+                    "mode; releasing the camera: %s",
+                    exc,
+                )
+                _report_status(
+                    status_callback,
+                    "waiting",
+                    "无法确认键鼠状态 · 摄像头即将释放",
+                )
+                return MonitorOutcome.INPUT_MONITOR_UNAVAILABLE
+
+            if not camera_should_be_active(
+                config.CAMERA_MONITORING_MODE,
+                activation_idle_seconds,
+                config.CAMERA_ACTIVATION_IDLE_SECONDS,
+            ):
+                _clear_privacy_blur(privacy_blur_signal)
+                _clear_debug_frame(
+                    debug_frame_buffer,
+                    "检测到键鼠操作 · 摄像头已进入待机",
+                    device_text,
+                )
+                LOGGER.info(
+                    "Keyboard/mouse activity resumed; releasing the camera"
+                )
+                _report_status(
+                    status_callback,
+                    "standby",
+                    "检测到键鼠操作 · 摄像头已进入待机",
+                )
+                return MonitorOutcome.INPUT_ACTIVE
 
         camera_ok, frame = camera.read()
         inference_ok = False
@@ -889,9 +962,154 @@ def wait_for_session_ready(
             return None
 
 
+def wait_for_camera_activation(
+    activity_monitor: ActivityMonitor,
+    session_monitor: SessionMonitor,
+    stop_event: Optional[Event] = None,
+    status_callback: Optional[StatusCallback] = None,
+    debug_frame_buffer: Optional[DebugFrameBuffer] = None,
+    debug_device: str = "",
+) -> Optional[bool]:
+    """Wait until the configured strategy permits opening the camera.
+
+    Returns False when Windows locks before activation and None when stopped.
+    """
+    if config.CAMERA_MONITORING_MODE == "CONTINUOUS":
+        return True
+
+    last_session_error_log_at = float("-inf")
+    last_activity_error_log_at = float("-inf")
+    last_reported_remaining: Optional[int] = None
+
+    while True:
+        if stop_event is not None and stop_event.is_set():
+            _clear_debug_frame(
+                debug_frame_buffer,
+                "监控已停止 · 调试画面已清空",
+                debug_device,
+            )
+            return None
+
+        now = time.monotonic()
+        try:
+            if session_monitor.is_locked():
+                _clear_debug_frame(
+                    debug_frame_buffer,
+                    "Windows 已锁定 · 摄像头保持关闭",
+                    debug_device,
+                )
+                _report_status(
+                    status_callback,
+                    "locked",
+                    "Windows 已锁定 · 摄像头保持关闭",
+                )
+                return False
+        except SessionMonitorError as exc:
+            _clear_debug_frame(
+                debug_frame_buffer,
+                "会话状态不明 · 摄像头保持关闭",
+                debug_device,
+            )
+            if (
+                now - last_session_error_log_at
+                >= config.SESSION_STATE_LOG_INTERVAL_SECONDS
+            ):
+                LOGGER.warning(
+                    "Session state unavailable while camera is in standby: %s",
+                    exc,
+                )
+                _report_status(
+                    status_callback,
+                    "waiting",
+                    "会话状态不明 · 摄像头保持关闭",
+                )
+                last_session_error_log_at = now
+            if _wait_or_stop(
+                stop_event,
+                config.SESSION_STATE_POLL_INTERVAL_SECONDS,
+            ):
+                return None
+            continue
+
+        try:
+            input_idle_seconds = activity_monitor.seconds_since_last_input()
+        except ActivityMonitorError as exc:
+            _clear_debug_frame(
+                debug_frame_buffer,
+                "无法确认键鼠状态 · 摄像头保持关闭",
+                debug_device,
+            )
+            if (
+                now - last_activity_error_log_at
+                >= config.ERROR_LOG_INTERVAL_SECONDS
+            ):
+                LOGGER.warning(
+                    "Unable to read keyboard/mouse activity; camera remains "
+                    "closed in idle-triggered mode: %s",
+                    exc,
+                )
+                _report_status(
+                    status_callback,
+                    "waiting",
+                    "无法确认键鼠状态 · 摄像头保持关闭",
+                )
+                last_activity_error_log_at = now
+            if _wait_or_stop(
+                stop_event,
+                config.SESSION_STATE_POLL_INTERVAL_SECONDS,
+            ):
+                return None
+            continue
+
+        if camera_should_be_active(
+            config.CAMERA_MONITORING_MODE,
+            input_idle_seconds,
+            config.CAMERA_ACTIVATION_IDLE_SECONDS,
+        ):
+            LOGGER.info(
+                "Keyboard/mouse idle for %.1f seconds; activating camera",
+                input_idle_seconds,
+            )
+            _report_status(
+                status_callback,
+                "starting",
+                "键鼠已空闲 %.0f 秒 · 正在开启摄像头"
+                % input_idle_seconds,
+            )
+            return True
+
+        remaining_seconds = max(
+            1,
+            math.ceil(
+                config.CAMERA_ACTIVATION_IDLE_SECONDS
+                - input_idle_seconds
+            ),
+        )
+        detail = (
+            f"键鼠活跃 · 摄像头待机 · "
+            f"空闲满 {config.CAMERA_ACTIVATION_IDLE_SECONDS:g} 秒后开启"
+        )
+        _clear_debug_frame(
+            debug_frame_buffer,
+            detail,
+            debug_device,
+            input_idle_seconds=input_idle_seconds,
+        )
+        if remaining_seconds != last_reported_remaining:
+            _report_status(status_callback, "standby", detail)
+            last_reported_remaining = remaining_seconds
+
+        if _wait_or_stop(
+            stop_event,
+            config.SESSION_STATE_POLL_INTERVAL_SECONDS,
+        ):
+            return None
+
+
 def open_camera_when_session_ready(
     camera: Camera,
     session_monitor: SessionMonitor,
+    activity_monitor: Optional[ActivityMonitor] = None,
     stop_event: Optional[Event] = None,
     status_callback: Optional[StatusCallback] = None,
     debug_frame_buffer: Optional[DebugFrameBuffer] = None,
@@ -944,6 +1162,67 @@ def open_camera_when_session_ready(
             ):
                 return None
             continue
+
+        if config.CAMERA_MONITORING_MODE == "IDLE_TRIGGERED":
+            if activity_monitor is None:
+                _clear_debug_frame(
+                    debug_frame_buffer,
+                    "键鼠监测不可用 · 摄像头保持关闭",
+                    debug_device,
+                )
+                _report_status(
+                    status_callback,
+                    "waiting",
+                    "键鼠监测不可用 · 摄像头保持关闭",
+                )
+                return False
+            try:
+                input_idle_seconds = (
+                    activity_monitor.seconds_since_last_input()
+                )
+            except ActivityMonitorError as exc:
+                _clear_debug_frame(
+                    debug_frame_buffer,
+                    "无法确认键鼠状态 · 摄像头保持关闭",
+                    debug_device,
+                )
+                if (
+                    now - last_error_log_at
+                    >= config.ERROR_LOG_INTERVAL_SECONDS
+                ):
+                    LOGGER.warning(
+                        "Unable to recheck keyboard/mouse activity before "
+                        "opening the camera: %s",
+                        exc,
+                    )
+                    _report_status(
+                        status_callback,
+                        "waiting",
+                        "无法确认键鼠状态 · 摄像头保持关闭",
+                    )
+                    last_error_log_at = now
+                if _wait_or_stop(
+                    stop_event,
+                    config.SESSION_STATE_POLL_INTERVAL_SECONDS,
+                ):
+                    return None
+                continue
+            if not camera_should_be_active(
+                config.CAMERA_MONITORING_MODE,
+                input_idle_seconds,
+                config.CAMERA_ACTIVATION_IDLE_SECONDS,
+            ):
+                _clear_debug_frame(
+                    debug_frame_buffer,
+                    "检测到键鼠操作 · 摄像头保持关闭",
+                    debug_device,
+                )
+                _report_status(
+                    status_callback,
+                    "standby",
+                    "检测到键鼠操作 · 摄像头保持关闭",
+                )
+                return False
 
         try:
             camera.open()
@@ -1063,9 +1342,23 @@ def run(
                 ):
                     return 0
 
+            camera_activation_ready = wait_for_camera_activation(
+                activity_monitor,
+                session_monitor,
+                stop_event=stop_event,
+                status_callback=status_callback,
+                debug_frame_buffer=debug_frame_buffer,
+                debug_device=device_text,
+            )
+            if camera_activation_ready is None:
+                return 0
+            if not camera_activation_ready:
+                continue
+
             camera_opened = open_camera_when_session_ready(
                 camera,
                 session_monitor,
+                activity_monitor=activity_monitor,
                 stop_event=stop_event,
                 status_callback=status_callback,
                 debug_frame_buffer=debug_frame_buffer,
@@ -1100,6 +1393,11 @@ def run(
 
             if outcome is MonitorOutcome.STOP_REQUESTED:
                 return 0
+            if outcome in {
+                MonitorOutcome.INPUT_ACTIVE,
+                MonitorOutcome.INPUT_MONITOR_UNAVAILABLE,
+            }:
+                continue
             if outcome is MonitorOutcome.LOCK_REQUESTED:
                 saw_locked = wait_for_session_ready(
                     session_monitor,

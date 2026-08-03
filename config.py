@@ -16,6 +16,8 @@ DETECTION_INTERVAL_SECONDS = 0.5
 FACE_CONFIDENCE_THRESHOLD = 0.6
 PREFERRED_INFERENCE_DEVICE = "NPU"
 PRESENCE_MODE = "ANY_FACE"
+CAMERA_MONITORING_MODE = "CONTINUOUS"
+CAMERA_ACTIVATION_IDLE_SECONDS = 20.0
 # Open Model Zoo's face recognition demo uses a cosine-distance threshold of
 # 0.30. Similarity is 1 - distance, so the corresponding minimum is 0.70.
 FACE_MATCH_SIMILARITY_THRESHOLD = 0.70
