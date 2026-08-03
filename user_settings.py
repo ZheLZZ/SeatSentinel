@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import os
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -24,6 +24,8 @@ class AppSettings:
     face_confidence_threshold: float
     inference_device: str
     presence_mode: str
+    camera_monitoring_mode: str
+    camera_activation_idle_seconds: float
     privacy_blur_enabled: bool
     face_absence_timeout_seconds: float
     input_idle_timeout_seconds: float
@@ -43,6 +45,10 @@ class AppSettings:
             ),
             inference_device=config.PREFERRED_INFERENCE_DEVICE,
             presence_mode=config.PRESENCE_MODE,
+            camera_monitoring_mode=config.CAMERA_MONITORING_MODE,
+            camera_activation_idle_seconds=(
+                config.CAMERA_ACTIVATION_IDLE_SECONDS
+            ),
             privacy_blur_enabled=config.PRIVACY_BLUR_ENABLED,
             face_absence_timeout_seconds=(
                 config.FACE_ABSENCE_TIMEOUT_SECONDS
@@ -76,6 +82,12 @@ class AppSettings:
                 presence_mode=str(
                     defaults["presence_mode"]
                 ).strip().upper(),
+                camera_monitoring_mode=str(
+                    defaults["camera_monitoring_mode"]
+                ).strip().upper(),
+                camera_activation_idle_seconds=float(
+                    defaults["camera_activation_idle_seconds"]
+                ),
                 privacy_blur_enabled=cls._parse_boolean(
                     defaults["privacy_blur_enabled"],
                     "多人脸隐私模糊开关",
@@ -94,6 +106,11 @@ class AppSettings:
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise SettingsError(f"设置值格式不正确：{exc}") from exc
+        if (
+            settings.camera_monitoring_mode == "IDLE_TRIGGERED"
+            and settings.privacy_blur_enabled
+        ):
+            settings = replace(settings, privacy_blur_enabled=False)
         settings.validate()
         return settings
 
@@ -122,8 +139,24 @@ class AppSettings:
             raise SettingsError("推理设备只能选择 NPU 或 CPU")
         if self.presence_mode not in {"ANY_FACE", "REGISTERED_FACE"}:
             raise SettingsError("在场判断只能选择任意人脸或仅本人")
+        if self.camera_monitoring_mode not in {
+            "CONTINUOUS",
+            "IDLE_TRIGGERED",
+        }:
+            raise SettingsError(
+                "摄像头工作模式只能选择持续监测或键鼠空闲后监测"
+            )
+        if not 1.0 <= self.camera_activation_idle_seconds <= 3600.0:
+            raise SettingsError("空闲开启摄像头时间必须在 1 至 3600 秒之间")
         if not isinstance(self.privacy_blur_enabled, bool):
             raise SettingsError("多人脸隐私模糊开关必须为布尔值")
+        if (
+            self.camera_monitoring_mode == "IDLE_TRIGGERED"
+            and self.privacy_blur_enabled
+        ):
+            raise SettingsError(
+                "键鼠空闲后监测与多人脸隐私模糊不能同时开启"
+            )
         if not 3.0 <= self.face_absence_timeout_seconds <= 3600.0:
             raise SettingsError("无人超时必须在 3 至 3600 秒之间")
         if not 3.0 <= self.input_idle_timeout_seconds <= 3600.0:
@@ -146,6 +179,10 @@ class AppSettings:
         )
         config.PREFERRED_INFERENCE_DEVICE = self.inference_device
         config.PRESENCE_MODE = self.presence_mode
+        config.CAMERA_MONITORING_MODE = self.camera_monitoring_mode
+        config.CAMERA_ACTIVATION_IDLE_SECONDS = (
+            self.camera_activation_idle_seconds
+        )
         config.PRIVACY_BLUR_ENABLED = self.privacy_blur_enabled
         config.FACE_ABSENCE_TIMEOUT_SECONDS = (
             self.face_absence_timeout_seconds

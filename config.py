@@ -8,7 +8,7 @@ from pathlib import Path
 
 
 APPLICATION_TITLE = "SeatSentinel"
-APPLICATION_VERSION = "0.2.5-beta"
+APPLICATION_VERSION = "0.2.6-beta"
 CAMERA_INDEX = 0
 # Windows 当前内置摄像头的设备名称。非空时按名称选择，不再盲用编号 0。
 PREFERRED_CAMERA_NAME = "FHD Camera"
@@ -16,6 +16,8 @@ DETECTION_INTERVAL_SECONDS = 0.5
 FACE_CONFIDENCE_THRESHOLD = 0.6
 PREFERRED_INFERENCE_DEVICE = "NPU"
 PRESENCE_MODE = "ANY_FACE"
+CAMERA_MONITORING_MODE = "CONTINUOUS"
+CAMERA_ACTIVATION_IDLE_SECONDS = 20.0
 # Open Model Zoo's face recognition demo uses a cosine-distance threshold of
 # 0.30. Similarity is 1 - distance, so the corresponding minimum is 0.70.
 FACE_MATCH_SIMILARITY_THRESHOLD = 0.70

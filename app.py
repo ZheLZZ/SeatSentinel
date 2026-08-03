@@ -61,6 +61,14 @@ PRESENCE_MODE_LABELS = {
 PRESENCE_MODE_VALUES = {
     label: value for value, label in PRESENCE_MODE_LABELS.items()
 }
+CAMERA_MONITORING_MODE_LABELS = {
+    "CONTINUOUS": "持续监测",
+    "IDLE_TRIGGERED": "键鼠空闲后监测",
+}
+CAMERA_MONITORING_MODE_VALUES = {
+    label: value
+    for value, label in CAMERA_MONITORING_MODE_LABELS.items()
+}
 
 GWL_EXSTYLE = -20
 GWLP_HWNDPARENT = -8
@@ -523,6 +531,9 @@ class TrayApplication:
                     checked=lambda item: bool(
                         config.PRIVACY_BLUR_ENABLED
                     ),
+                    enabled=lambda item: (
+                        config.CAMERA_MONITORING_MODE == "CONTINUOUS"
+                    ),
                 ),
                 pystray.MenuItem(
                     "设置",
@@ -901,6 +912,12 @@ class TrayApplication:
         was_running = self._service.is_running()
         try:
             current = self._settings_store.load()
+            if current.camera_monitoring_mode != "CONTINUOUS":
+                LOGGER.info(
+                    "Privacy blur toggle ignored because idle-triggered "
+                    "camera monitoring is selected"
+                )
+                return
             updated = replace(
                 current,
                 privacy_blur_enabled=not current.privacy_blur_enabled,
@@ -1619,7 +1636,11 @@ class TrayApplication:
         running = self._service.is_running()
         snapshot = self._service.debug_snapshot()
         now = time.monotonic()
-        if (
+        if snapshot.frame_bgr is None:
+            self._debug_last_frame_time = None
+            self._debug_preview_fps = 0.0
+            self._debug_last_frame_sequence = snapshot.sequence
+        elif (
             snapshot.frame_bgr is not None
             and snapshot.sequence != self._debug_last_frame_sequence
         ):
@@ -2560,6 +2581,14 @@ class TrayApplication:
 
         variables = {
             "camera_name": tk.StringVar(value=settings.camera_name),
+            "camera_monitoring_mode": tk.StringVar(
+                value=CAMERA_MONITORING_MODE_LABELS[
+                    settings.camera_monitoring_mode
+                ]
+            ),
+            "camera_activation_idle_seconds": tk.StringVar(
+                value=str(settings.camera_activation_idle_seconds)
+            ),
             "presence_mode": tk.StringVar(
                 value=PRESENCE_MODE_LABELS[settings.presence_mode]
             ),
@@ -2591,6 +2620,8 @@ class TrayApplication:
 
         rows = [
             ("摄像头", "camera_name"),
+            ("摄像头工作模式", "camera_monitoring_mode"),
+            ("空闲开启摄像头（秒）", "camera_activation_idle_seconds"),
             ("在场判断", "presence_mode"),
             ("检测间隔（秒）", "detection_interval_seconds"),
             ("人脸置信度", "face_confidence_threshold"),
@@ -2600,6 +2631,7 @@ class TrayApplication:
             ("启动/恢复宽限期（秒）", "startup_grace_period_seconds"),
         ]
 
+        camera_activation_entry: Optional[ttk.Entry] = None
         for row_index, (label_text, key) in enumerate(rows):
             ttk.Label(content, text=label_text).grid(
                 row=row_index,
@@ -2608,16 +2640,20 @@ class TrayApplication:
                 pady=6,
                 sticky="w",
             )
-            if key in {"camera_name", "inference_device", "presence_mode"}:
-                values = (
-                    camera_names
-                    if key == "camera_name"
-                    else (
-                        list(PRESENCE_MODE_VALUES)
-                        if key == "presence_mode"
-                        else ["NPU", "CPU"]
-                    )
-                )
+            if key in {
+                "camera_name",
+                "camera_monitoring_mode",
+                "inference_device",
+                "presence_mode",
+            }:
+                if key == "camera_name":
+                    values = camera_names
+                elif key == "camera_monitoring_mode":
+                    values = list(CAMERA_MONITORING_MODE_VALUES)
+                elif key == "presence_mode":
+                    values = list(PRESENCE_MODE_VALUES)
+                else:
+                    values = ["NPU", "CPU"]
                 widget = ttk.Combobox(
                     content,
                     textvariable=variables[key],
@@ -2637,6 +2673,8 @@ class TrayApplication:
                 pady=6,
                 sticky="ew",
             )
+            if key == "camera_activation_idle_seconds":
+                camera_activation_entry = widget
 
         privacy_controls = ttk.LabelFrame(
             content,
@@ -2650,16 +2688,39 @@ class TrayApplication:
             pady=(10, 4),
             sticky="ew",
         )
-        ttk.Checkbutton(
+        privacy_blur_checkbutton = ttk.Checkbutton(
             privacy_controls,
             text="启用多人脸隐私模糊：本人身旁出现第二个人时自动开启毛玻璃",
             variable=variables["privacy_blur_enabled"],
-        ).pack(anchor="w")
+        )
+        privacy_blur_checkbutton.pack(anchor="w")
         ttk.Label(
             privacy_controls,
             text="也可从右下角托盘图标的右键菜单随时开关",
             foreground="#666666",
         ).pack(anchor="w", pady=(4, 0))
+
+        def sync_camera_mode_controls(*_args: object) -> None:
+            selected_mode = CAMERA_MONITORING_MODE_VALUES.get(
+                variables["camera_monitoring_mode"].get(),
+                variables["camera_monitoring_mode"].get(),
+            )
+            idle_triggered = selected_mode == "IDLE_TRIGGERED"
+            if camera_activation_entry is not None:
+                camera_activation_entry.configure(
+                    state="normal" if idle_triggered else "disabled"
+                )
+            if idle_triggered:
+                variables["privacy_blur_enabled"].set(False)
+                privacy_blur_checkbutton.state(["disabled"])
+            else:
+                privacy_blur_checkbutton.state(["!disabled"])
+
+        variables["camera_monitoring_mode"].trace_add(
+            "write",
+            sync_camera_mode_controls,
+        )
+        sync_camera_mode_controls()
 
         identity_controls = ttk.LabelFrame(
             content,
@@ -2704,9 +2765,9 @@ class TrayApplication:
         ttk.Label(
             content,
             text=(
-                "“仅本人”模式必须先注册；启用多人脸隐私模糊后，确认本人身旁出现"
-                "第二个人时会自动开启全屏毛玻璃；快速左右甩动鼠标可立即恢复，"
-                "第二个人离开且画面仅剩本人满 3 秒时也会自动恢复。"
+                "“键鼠空闲后监测”会在达到设定空闲时间后开启摄像头，恢复操作后"
+                "立即释放；该模式与多人脸隐私模糊互斥。持续监测模式下，"
+                "多人脸隐私模糊仍需配合“仅本人”模式和已注册人脸使用。"
                 "保存后会安全释放摄像头并重启监控。"
             ),
             foreground="#555555",
@@ -2779,6 +2840,15 @@ class TrayApplication:
             settings = AppSettings.from_mapping(
                 {
                     "camera_name": variables["camera_name"].get(),
+                    "camera_monitoring_mode": (
+                        CAMERA_MONITORING_MODE_VALUES.get(
+                            variables["camera_monitoring_mode"].get(),
+                            variables["camera_monitoring_mode"].get(),
+                        )
+                    ),
+                    "camera_activation_idle_seconds": variables[
+                        "camera_activation_idle_seconds"
+                    ].get(),
                     "presence_mode": PRESENCE_MODE_VALUES.get(
                         variables["presence_mode"].get(),
                         variables["presence_mode"].get(),
@@ -2909,6 +2979,12 @@ def _run_self_test() -> int:
             raise RuntimeError(
                 "Tray privacy-blur switch does not match saved settings"
             )
+        if bool(privacy_menu_items[0].enabled) != (
+            settings.camera_monitoring_mode == "CONTINUOUS"
+        ):
+            raise RuntimeError(
+                "Tray privacy-blur availability does not match camera mode"
+            )
         test_application._service._update_status(
             "lock_warning",
             "5 秒后自动锁屏",
@@ -3025,6 +3101,23 @@ def _run_self_test() -> int:
             raise RuntimeError(
                 "Debug camera selector does not contain the configured camera"
             )
+        test_application._debug_preview_fps = 1.9
+        test_application._service._debug_frame_buffer.clear(
+            status="摄像头待机",
+            device="SELF-TEST",
+            input_idle_seconds=7.5,
+        )
+        test_application._refresh_debug_window()
+        test_application._root.update_idletasks()
+        if (
+            test_application._debug_metric_variables["input_idle"].get()
+            != "7.5 s"
+            or test_application._debug_metric_variables["preview_fps"].get()
+            != "--"
+        ):
+            raise RuntimeError(
+                "Standby idle timer or preview FPS was not rendered correctly"
+            )
         test_application._show_settings()
         test_application._root.update_idletasks()
         settings_window = test_application._settings_window
@@ -3044,23 +3137,42 @@ def _run_self_test() -> int:
             and "仅本人（需注册）" in tuple(widget.cget("values"))
             for widget in settings_widgets
         )
+        camera_mode_selectors = [
+            widget
+            for widget in settings_widgets
+            if isinstance(widget, ttk.Combobox)
+            and "键鼠空闲后监测" in tuple(widget.cget("values"))
+        ]
         registration_button_found = any(
             isinstance(widget, ttk.Button)
             and widget.cget("text") in {"注册本人", "更新本人"}
             for widget in settings_widgets
         )
-        privacy_switch_found = any(
-            isinstance(widget, ttk.Checkbutton)
-            and "多人脸隐私模糊" in str(widget.cget("text"))
+        privacy_switches = [
+            widget
             for widget in settings_widgets
-        )
+            if isinstance(widget, ttk.Checkbutton)
+            and "多人脸隐私模糊" in str(widget.cget("text"))
+        ]
         if (
             not mode_selector_found
+            or len(camera_mode_selectors) != 1
             or not registration_button_found
-            or not privacy_switch_found
+            or len(privacy_switches) != 1
         ):
             raise RuntimeError(
-                "Registered-face or privacy controls were not initialized"
+                "Camera mode, registered-face, or privacy controls were "
+                "not initialized"
+            )
+        camera_mode_selectors[0].set("键鼠空闲后监测")
+        test_application._root.update_idletasks()
+        if (
+            "disabled" not in privacy_switches[0].state()
+            or test_application._settings_privacy_blur_variable is None
+            or test_application._settings_privacy_blur_variable.get()
+        ):
+            raise RuntimeError(
+                "Idle-triggered mode did not disable privacy blur"
             )
         settings_window.destroy()
         if not test_application._debug_window.overrideredirect():

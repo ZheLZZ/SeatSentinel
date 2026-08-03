@@ -98,8 +98,13 @@ class DebugFrameBuffer:
             self._sequence += 1
             self._captured_at = time.monotonic()
 
-    def clear(self, status: str, device: str = "") -> None:
-        """Immediately discard all image pixels and mark state as unknown."""
+    def clear(
+        self,
+        status: str,
+        device: str = "",
+        input_idle_seconds: Optional[float] = None,
+    ) -> None:
+        """Discard image pixels while retaining any supplied idle metric."""
         with self._lock:
             self._frame_bgr = None
             self._detections = ()
@@ -109,7 +114,7 @@ class DebugFrameBuffer:
             self._device = str(device)
             self._status = str(status)
             self._face_absent_seconds = None
-            self._input_idle_seconds = None
+            self._input_idle_seconds = input_idle_seconds
             self._startup_elapsed_seconds = None
             self._should_lock = None
             self._inference_ms = None
