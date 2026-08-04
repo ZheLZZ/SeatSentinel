@@ -8,7 +8,7 @@ from pathlib import Path
 
 
 APPLICATION_TITLE = "SeatSentinel"
-APPLICATION_VERSION = "0.2.6-beta"
+APPLICATION_VERSION = "0.2.7-beta"
 CAMERA_INDEX = 0
 # Windows 当前内置摄像头的设备名称。非空时按名称选择，不再盲用编号 0。
 PREFERRED_CAMERA_NAME = "FHD Camera"

@@ -1,6 +1,6 @@
 # SeatSentinel 隐私说明
 
-适用版本：`v0.2.6-beta`
+适用版本：`v0.2.7-beta`
 
 SeatSentinel 的设计目标是只在本机判断用户是否仍在电脑前，并在满足安全条件时
 调用 Windows 锁屏。SeatSentinel 不提供云端服务，也不要求用户账户。

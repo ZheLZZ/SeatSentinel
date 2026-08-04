@@ -50,7 +50,7 @@ class ApplicationDefaultsTests(unittest.TestCase):
     def test_title_and_lock_timeouts(self) -> None:
         settings = AppSettings.defaults()
         self.assertEqual(config.APPLICATION_TITLE, "SeatSentinel")
-        self.assertEqual(config.APPLICATION_VERSION, "0.2.6-beta")
+        self.assertEqual(config.APPLICATION_VERSION, "0.2.7-beta")
         self.assertEqual(config.USER_DATA_DIRECTORY.name, "SeatSentinel")
         self.assertIn("SeatSentinel", MUTEX_NAME)
         self.assertIn("SeatSentinel", DEBUG_WINDOW_EVENT_NAME)
