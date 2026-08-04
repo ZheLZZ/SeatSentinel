@@ -653,7 +653,76 @@ class PresenceDecisionTests(unittest.TestCase):
 
 
 class PrivacyBlurDecisionTests(unittest.TestCase):
-    def test_second_person_requires_confirmed_owner_and_two_frames(self) -> None:
+    def test_any_face_monitor_activates_blur_without_face_template(
+        self,
+    ) -> None:
+        class FakeCamera:
+            def read(self) -> tuple[bool, np.ndarray]:
+                return True, np.zeros((32, 32, 3), dtype=np.uint8)
+
+        class FakeDetector:
+            device = "CPU"
+
+            def detect_faces(
+                self,
+                _frame: np.ndarray,
+            ) -> list[FaceDetection]:
+                return [
+                    FaceDetection(0.99, 1, 1, 10, 10),
+                    FaceDetection(0.98, 12, 1, 22, 10),
+                ]
+
+        class FakeActivityMonitor:
+            def seconds_since_last_input(self) -> float:
+                return 0.0
+
+        class FakeSessionMonitor:
+            def __init__(self) -> None:
+                self.check_count = 0
+
+            def is_locked(self) -> bool:
+                self.check_count += 1
+                return self.check_count >= 3
+
+        signal = PrivacyBlurSignal()
+        statuses: list[tuple[str, str]] = []
+        previous_presence_mode = config.PRESENCE_MODE
+        previous_camera_mode = config.CAMERA_MONITORING_MODE
+        previous_privacy_blur = config.PRIVACY_BLUR_ENABLED
+        previous_detection_interval = config.DETECTION_INTERVAL_SECONDS
+        try:
+            config.PRESENCE_MODE = "ANY_FACE"
+            config.CAMERA_MONITORING_MODE = "CONTINUOUS"
+            config.PRIVACY_BLUR_ENABLED = True
+            config.DETECTION_INTERVAL_SECONDS = 0.0
+            outcome = monitor_until_session_pause(
+                FakeCamera(),  # type: ignore[arg-type]
+                FakeDetector(),  # type: ignore[arg-type]
+                FakeActivityMonitor(),  # type: ignore[arg-type]
+                FakeSessionMonitor(),  # type: ignore[arg-type]
+                privacy_blur_signal=signal,
+                status_callback=lambda state, detail: statuses.append(
+                    (state, detail)
+                ),
+            )
+        finally:
+            config.PRESENCE_MODE = previous_presence_mode
+            config.CAMERA_MONITORING_MODE = previous_camera_mode
+            config.PRIVACY_BLUR_ENABLED = previous_privacy_blur
+            config.DETECTION_INTERVAL_SECONDS = (
+                previous_detection_interval
+            )
+
+        self.assertIs(outcome, MonitorOutcome.SESSION_LOCKED)
+        self.assertIn(
+            (
+                "privacy_blur",
+                "检测到至少两个人 · 快速甩动鼠标恢复",
+            ),
+            statuses,
+        )
+
+    def test_multiple_faces_activate_without_registered_owner(self) -> None:
         guard = SecondPersonPrivacyGuard(
             confirmation_frames=2,
             rearm_clear_seconds=60.0,
@@ -662,14 +731,27 @@ class PrivacyBlurDecisionTests(unittest.TestCase):
         self.assertFalse(
             guard.update(False, 2, timestamp=0.0)
         )
-        self.assertFalse(
-            guard.update(True, 2, timestamp=0.5)
-        )
         self.assertTrue(
-            guard.update(True, 2, timestamp=1.0)
+            guard.update(False, 2, timestamp=0.5)
         )
         self.assertFalse(
-            guard.update(True, 2, timestamp=1.5)
+            guard.update(False, 2, timestamp=1.0)
+        )
+
+    def test_single_unregistered_face_never_auto_dismisses(self) -> None:
+        guard = SecondPersonPrivacyGuard(
+            confirmation_frames=2,
+            rearm_clear_seconds=60.0,
+            auto_dismiss_owner_alone_seconds=3.0,
+        )
+        guard.evaluate(False, 2, timestamp=0.0)
+        guard.evaluate(False, 2, timestamp=0.5)
+
+        self.assertFalse(
+            guard.evaluate(False, 1, timestamp=1.0).auto_dismiss
+        )
+        self.assertFalse(
+            guard.evaluate(False, 1, timestamp=10.0).auto_dismiss
         )
 
     def test_rearms_after_under_two_people_for_sixty_seconds(self) -> None:

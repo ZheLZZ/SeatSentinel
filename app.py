@@ -2690,7 +2690,7 @@ class TrayApplication:
         )
         privacy_blur_checkbutton = ttk.Checkbutton(
             privacy_controls,
-            text="启用多人脸隐私模糊：本人身旁出现第二个人时自动开启毛玻璃",
+            text="启用多人脸隐私模糊：画面中出现至少两个人时自动开启毛玻璃",
             variable=variables["privacy_blur_enabled"],
         )
         privacy_blur_checkbutton.pack(anchor="w")
@@ -2767,7 +2767,8 @@ class TrayApplication:
             text=(
                 "“键鼠空闲后监测”会在达到设定空闲时间后开启摄像头，恢复操作后"
                 "立即释放；该模式与多人脸隐私模糊互斥。持续监测模式下，"
-                "多人脸隐私模糊仍需配合“仅本人”模式和已注册人脸使用。"
+                "多人脸隐私模糊无需注册人脸；仅本人模式还可在只剩本人 3 秒后"
+                "自动解除，未注册时可甩动鼠标解除。"
                 "保存后会安全释放摄像头并重启监控。"
             ),
             foreground="#555555",
