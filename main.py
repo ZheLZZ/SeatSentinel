@@ -314,8 +314,7 @@ def monitor_until_session_pause(
             ),
         )
         if (
-            registered_face_mode
-            and config.CAMERA_MONITORING_MODE == "CONTINUOUS"
+            config.CAMERA_MONITORING_MODE == "CONTINUOUS"
             and config.PRIVACY_BLUR_ENABLED
             and privacy_blur_signal is not None
         )
@@ -538,20 +537,30 @@ def monitor_until_session_pause(
                     and privacy_guard is not None
                 ):
                     privacy_decision = privacy_guard.evaluate(
-                        owner_confirmed=presence_detected is True,
+                        owner_confirmed=(
+                            registered_face_mode
+                            and presence_detected is True
+                        ),
                         face_count=len(detections),
                         timestamp=cycle_time,
                     )
                     assert privacy_blur_signal is not None
                     if privacy_decision.activate:
                         detail = (
-                            "检测到本人身旁出现第二个人 · 快速甩动鼠标，"
-                            "或仅剩本人 3 秒后自动恢复"
+                            (
+                                "检测到至少两个人 · 快速甩动鼠标，"
+                                "或仅剩本人 3 秒后自动恢复"
+                            )
+                            if registered_face_mode
+                            else (
+                                "检测到至少两个人 · "
+                                "快速甩动鼠标恢复"
+                            )
                         )
                         if privacy_blur_signal.activate(detail):
                             LOGGER.info(
-                                "Second person confirmed beside the "
-                                "registered user; privacy blur activated"
+                                "Multiple faces confirmed; "
+                                "privacy blur activated"
                             )
                             _report_status(
                                 status_callback,

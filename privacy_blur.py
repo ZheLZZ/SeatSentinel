@@ -71,7 +71,7 @@ class PrivacyBlurSignal:
 
 
 class SecondPersonPrivacyGuard:
-    """Debounce a self-plus-second-person episode into one blur request."""
+    """Debounce a multiple-face episode into one privacy-blur request."""
 
     def __init__(
         self,
@@ -117,11 +117,18 @@ class SecondPersonPrivacyGuard:
         face_count: int,
         timestamp: Optional[float] = None,
     ) -> SecondPersonPrivacyDecision:
-        """Return activation and safe automatic-dismiss decisions."""
+        """Return activation and identity-safe automatic-dismiss decisions.
+
+        Multiple faces are sufficient to activate the privacy blur, so the
+        feature also works without a registered face.  ``owner_confirmed`` is
+        deliberately used only for automatic dismissal: without identity
+        recognition, one remaining face is not enough to prove that the owner
+        rather than the second person is still in front of the computer.
+        """
         if face_count < 0:
             raise ValueError("Face count cannot be negative")
         now = time.monotonic() if timestamp is None else timestamp
-        second_person_present = owner_confirmed and face_count >= 2
+        second_person_present = face_count >= 2
         if second_person_present:
             self._clear_started_at = None
             self._owner_alone_started_at = None
