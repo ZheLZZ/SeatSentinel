@@ -481,6 +481,7 @@ class TrayApplication:
         self._debug_canvas: Optional[tk.Canvas] = None
         self._debug_photo_image: Optional[ImageTk.PhotoImage] = None
         self._debug_window_icon: Optional[ImageTk.PhotoImage] = None
+        self._debug_header_icon: Optional[ImageTk.PhotoImage] = None
         self._debug_last_frame_sequence = -1
         self._debug_last_frame_time: Optional[float] = None
         self._debug_preview_fps = 0.0
@@ -983,7 +984,7 @@ class TrayApplication:
 
         window = tk.Toplevel(self._root)
         self._debug_window = window
-        window.title(f"{config.APPLICATION_TITLE} · 视觉控制台")
+        window.title(f"{config.APPLICATION_TITLE} · 本地隐私守护")
         window.resizable(False, False)
         window.withdraw()
         window.overrideredirect(True)
@@ -991,13 +992,20 @@ class TrayApplication:
             self._tray_locked_image,
             master=window,
         )
+        self._debug_header_icon = ImageTk.PhotoImage(
+            self._tray_locked_image.resize(
+                (40, 40),
+                Image.Resampling.LANCZOS,
+            ),
+            master=window,
+        )
         window.iconphoto(False, self._debug_window_icon)
-        window.configure(background="#173248")
+        window.configure(background="#c8d5e6")
         window.protocol("WM_DELETE_WINDOW", self._close_debug_window)
         window.bind("<Escape>", lambda event: self._close_debug_window())
         window.bind("<Alt-F4>", lambda event: self._close_debug_window())
 
-        shell = tk.Frame(window, background="#060a12")
+        shell = tk.Frame(window, background="#f4f7fb")
         shell.grid(
             row=0,
             column=0,
@@ -1005,51 +1013,57 @@ class TrayApplication:
             pady=1,
             sticky="nsew",
         )
-        content = tk.Frame(shell, background="#060a12")
+        content = tk.Frame(shell, background="#f4f7fb")
         content.grid(
             row=0,
             column=0,
-            padx=18,
-            pady=14,
+            padx=20,
+            pady=16,
             sticky="nsew",
         )
 
-        header = tk.Frame(content, background="#060a12")
+        header = tk.Frame(content, background="#ffffff")
         header.grid(
             row=0,
             column=0,
             columnspan=2,
             sticky="ew",
-            pady=(0, 12),
+            pady=(0, 14),
         )
         header.grid_columnconfigure(0, weight=1)
 
-        title_area = tk.Frame(header, background="#060a12")
-        title_area.grid(row=0, column=0, sticky="w")
+        title_area = tk.Frame(header, background="#ffffff")
+        title_area.grid(row=0, column=0, padx=(10, 0), sticky="w")
+        tk.Label(
+            title_area,
+            image=self._debug_header_icon,
+            background="#ffffff",
+            borderwidth=0,
+        ).pack(side="left", padx=(0, 10))
         title_label = tk.Label(
             title_area,
             text=config.APPLICATION_TITLE,
-            background="#060a12",
-            foreground="#e8f6ff",
-            font=("Segoe UI", 18, "bold"),
+            background="#ffffff",
+            foreground="#14263d",
+            font=("Segoe UI", 19, "bold"),
         )
         title_label.pack(side="left")
         console_label = tk.Label(
             title_area,
-            text="  //  VISION CONSOLE",
-            background="#060a12",
-            foreground="#00d9ff",
-            font=("Consolas", 12, "bold"),
+            text="  │  本地隐私守护",
+            background="#ffffff",
+            foreground="#6d7d91",
+            font=("Microsoft YaHei UI", 10),
         )
-        console_label.pack(side="left", pady=(6, 0))
+        console_label.pack(side="left", pady=(5, 0))
         self._debug_status_badge = tk.Label(
             header,
-            text="● INITIALIZING",
-            background="#0d1726",
-            foreground="#f5c451",
-            padx=12,
+            text="● 初始化",
+            background="#fff8e6",
+            foreground="#b7791f",
+            padx=13,
             pady=6,
-            font=("Consolas", 10, "bold"),
+            font=("Microsoft YaHei UI", 9, "bold"),
         )
         self._debug_status_badge.grid(
             row=0,
@@ -1061,7 +1075,7 @@ class TrayApplication:
             header,
             text="—",
             command=self._minimize_debug_window,
-            hover_background="#173248",
+            hover_background="#e8eef7",
         )
         minimize_button.grid(row=0, column=2, padx=(0, 2))
         close_button = self._create_titlebar_button(
@@ -1081,49 +1095,54 @@ class TrayApplication:
         ):
             self._bind_debug_window_drag(drag_widget)
 
-        vision_column = tk.Frame(content, background="#060a12")
+        vision_column = tk.Frame(content, background="#f4f7fb")
         vision_column.grid(
             row=1,
             column=0,
-            padx=(0, 14),
+            padx=(0, 16),
             sticky="n",
         )
 
-        self._debug_canvas = tk.Canvas(
+        preview_card = tk.Frame(
             vision_column,
+            background="#ffffff",
+            highlightthickness=1,
+            highlightbackground="#d8e2ef",
+            padx=8,
+            pady=8,
+        )
+        preview_card.grid(row=0, column=0, sticky="n")
+        self._debug_canvas = tk.Canvas(
+            preview_card,
             width=640,
             height=360,
-            background="#03070d",
-            highlightthickness=1,
-            highlightbackground="#17657a",
+            background="#e8edf3",
+            highlightthickness=0,
         )
-        self._debug_canvas.grid(
-            row=0,
-            column=0,
-            sticky="n",
-        )
+        self._debug_canvas.pack()
         self._debug_canvas.create_text(
             320,
             180,
-            text="AWAITING VIDEO SIGNAL",
-            fill="#6d8299",
-            font=("Consolas", 13, "bold"),
+            text="等待摄像头画面",
+            fill="#7b8ba0",
+            font=("Microsoft YaHei UI", 12, "bold"),
         )
         self._create_debug_guide_panel(vision_column).grid(
             row=1,
             column=0,
-            pady=(12, 0),
+            pady=(14, 0),
             sticky="ew",
         )
 
-        telemetry = tk.Frame(content, background="#060a12", width=292)
+        telemetry = tk.Frame(content, background="#f4f7fb", width=306)
         telemetry.grid(row=1, column=1, sticky="ns")
         telemetry.grid_propagate(False)
         self._debug_metric_variables = {}
         self._debug_metric_labels = {}
         self._create_debug_metric_card(
             telemetry,
-            "VISION ENGINE",
+            "人脸检测",
+            "◎",
             (
                 ("人脸数量", "face_count"),
                 ("检测 / 本人", "confidence"),
@@ -1133,7 +1152,8 @@ class TrayApplication:
         ).pack(fill="x", pady=(0, 8))
         self._create_debug_metric_card(
             telemetry,
-            "LOCK DECISION",
+            "锁屏判断",
+            "▣",
             (
                 ("离席持续", "face_absent"),
                 ("键鼠空闲", "input_idle"),
@@ -1143,7 +1163,8 @@ class TrayApplication:
         ).pack(fill="x", pady=(0, 8))
         self._create_debug_metric_card(
             telemetry,
-            "SYSTEM LINK",
+            "系统信息",
+            "▤",
             (
                 ("推理设备", "device"),
                 ("画面规格", "resolution"),
@@ -1154,9 +1175,9 @@ class TrayApplication:
 
         status_panel = tk.Frame(
             content,
-            background="#0a1220",
+            background="#ffffff",
             highlightthickness=1,
-            highlightbackground="#173248",
+            highlightbackground="#d8e2ef",
         )
         status_panel.grid(
             row=2,
@@ -1167,10 +1188,10 @@ class TrayApplication:
         )
         tk.Label(
             status_panel,
-            text="STATUS",
-            background="#0a1220",
-            foreground="#00d9ff",
-            font=("Consolas", 9, "bold"),
+            text="●  状态",
+            background="#ffffff",
+            foreground="#2eaf5d",
+            font=("Microsoft YaHei UI", 9, "bold"),
         ).pack(side="left", padx=(12, 10), pady=9)
         self._debug_status_variable = tk.StringVar(
             value="正在初始化监控"
@@ -1178,8 +1199,8 @@ class TrayApplication:
         tk.Label(
             status_panel,
             textvariable=self._debug_status_variable,
-            background="#0a1220",
-            foreground="#b8cada",
+            background="#ffffff",
+            foreground="#4d6078",
             anchor="w",
             wraplength=570,
             justify="left",
@@ -1188,15 +1209,14 @@ class TrayApplication:
         tk.Label(
             status_panel,
             text=(
-                f"AUTHOR // ZheZZ  ·  v{config.APPLICATION_VERSION}"
-                "  ·  LOCAL PROCESSING ONLY"
+                f"v{config.APPLICATION_VERSION}  ·  本地处理模式"
             ),
-            background="#0a1220",
-            foreground="#58748c",
-            font=("Consolas", 8),
+            background="#ffffff",
+            foreground="#8291a4",
+            font=("Microsoft YaHei UI", 8),
         ).pack(side="right", padx=12, pady=9)
 
-        controls = tk.Frame(content, background="#060a12")
+        controls = tk.Frame(content, background="#f4f7fb")
         controls.grid(
             row=3,
             column=0,
@@ -1207,15 +1227,15 @@ class TrayApplication:
 
         camera_controls = tk.Frame(
             controls,
-            background="#060a12",
+            background="#f4f7fb",
         )
         camera_controls.grid(row=0, column=0, sticky="w")
         tk.Label(
             camera_controls,
-            text="CAMERA //",
-            background="#060a12",
-            foreground="#00d9ff",
-            font=("Consolas", 9, "bold"),
+            text="摄像头",
+            background="#f4f7fb",
+            foreground="#31465f",
+            font=("Microsoft YaHei UI", 9, "bold"),
         ).pack(side="left", padx=(0, 7))
         try:
             debug_settings = self._settings_store.load()
@@ -1231,19 +1251,19 @@ class TrayApplication:
         debug_style = ttk.Style(window)
         debug_style.configure(
             "SeatSentinel.TCombobox",
-            fieldbackground="#102337",
-            background="#102337",
-            foreground="#e8f6ff",
-            arrowcolor="#00d9ff",
-            bordercolor="#17657a",
-            lightcolor="#17657a",
-            darkcolor="#17657a",
-            padding=5,
+            fieldbackground="#ffffff",
+            background="#ffffff",
+            foreground="#31465f",
+            arrowcolor="#63758a",
+            bordercolor="#cfdbea",
+            lightcolor="#cfdbea",
+            darkcolor="#cfdbea",
+            padding=6,
         )
         debug_style.map(
             "SeatSentinel.TCombobox",
-            fieldbackground=[("readonly", "#102337")],
-            foreground=[("readonly", "#e8f6ff")],
+            fieldbackground=[("readonly", "#ffffff")],
+            foreground=[("readonly", "#31465f")],
         )
         self._debug_camera_combobox = ttk.Combobox(
             camera_controls,
@@ -1260,11 +1280,11 @@ class TrayApplication:
             self._on_debug_camera_selected,
         )
 
-        buttons = tk.Frame(controls, background="#060a12")
+        buttons = tk.Frame(controls, background="#f4f7fb")
         buttons.grid(row=0, column=1, sticky="e")
         self._create_debug_button(
             buttons,
-            text="打开日志文件夹",
+            text="打开日志",
             command=self._open_log_directory,
         ).pack(side="left", padx=(0, 8))
         self._create_debug_button(
@@ -1272,26 +1292,22 @@ class TrayApplication:
             text="参数设置",
             command=self._show_settings,
         ).pack(side="left", padx=(0, 8))
+        self._debug_toggle_button = self._create_debug_button(
+            buttons,
+            text="暂停监控",
+            command=self._toggle_monitoring,
+            primary=True,
+        )
+        self._debug_toggle_button.pack(
+            side="left",
+            padx=(0, 8),
+        )
         self._debug_device_toggle_button = self._create_debug_button(
             buttons,
             text="切换推理设备",
             command=self._toggle_inference_device,
         )
-        self._debug_device_toggle_button.pack(
-            side="left",
-            padx=(0, 8),
-        )
-        self._debug_toggle_button = self._create_debug_button(
-            buttons,
-            text="暂停监控",
-            command=self._toggle_monitoring,
-        )
-        self._debug_toggle_button.pack(side="left", padx=(0, 8))
-        self._create_debug_button(
-            buttons,
-            text="关闭控制台",
-            command=self._close_debug_window,
-        ).pack(side="left", padx=(0, 8))
+        self._debug_device_toggle_button.pack(side="left", padx=(0, 8))
         self._debug_exit_button = self._create_debug_button(
             buttons,
             text="彻底退出程序",
@@ -1338,15 +1354,19 @@ class TrayApplication:
         command: Callable[[], object],
         hover_background: str,
     ) -> tk.Button:
-        normal_background = "#0d1726"
+        normal_background = "#ffffff"
         button = tk.Button(
             parent,
             text=text,
             command=command,
             background=normal_background,
-            foreground="#dff8ff",
+            foreground="#25384f",
             activebackground=hover_background,
-            activeforeground="#ffffff",
+            activeforeground=(
+                "#ffffff"
+                if hover_background == "#c42b3a"
+                else "#25384f"
+            ),
             relief="flat",
             borderwidth=0,
             width=3,
@@ -1405,11 +1425,11 @@ class TrayApplication:
     ) -> tk.Frame:
         panel = tk.Frame(
             parent,
-            background="#08111d",
+            background="#ffffff",
             highlightthickness=1,
-            highlightbackground="#173248",
+            highlightbackground="#d8e2ef",
         )
-        heading = tk.Frame(panel, background="#08111d")
+        heading = tk.Frame(panel, background="#ffffff")
         heading.grid(
             row=0,
             column=0,
@@ -1419,20 +1439,20 @@ class TrayApplication:
         )
         tk.Label(
             heading,
-            text="HOW IT WORKS",
-            background="#08111d",
-            foreground="#00d9ff",
-            font=("Consolas", 9, "bold"),
+            text="工作原理",
+            background="#ffffff",
+            foreground="#243a55",
+            font=("Microsoft YaHei UI", 10, "bold"),
         ).pack(side="left")
         tk.Label(
             heading,
-            text="  //  工作原理与当前设置",
-            background="#08111d",
-            foreground="#71879b",
+            text="  ·  当前设置",
+            background="#ffffff",
+            foreground="#8795a8",
             font=("Microsoft YaHei UI", 8),
         ).pack(side="left")
 
-        cards = tk.Frame(panel, background="#08111d")
+        cards = tk.Frame(panel, background="#ffffff")
         cards.grid(
             row=1,
             column=0,
@@ -1447,16 +1467,16 @@ class TrayApplication:
             )
         self._debug_guide_variables = {}
         guide_items = (
-            ("01", "本地检测", "local_detection"),
-            ("02", "安全判定", "safe_decision"),
-            ("03", "自动锁屏", "lock_action"),
+            ("1", "本地检测", "local_detection"),
+            ("2", "安全判定", "safe_decision"),
+            ("3", "自动锁屏", "lock_action"),
         )
         for column, (number, title, key) in enumerate(guide_items):
             card = tk.Frame(
                 cards,
-                background="#0b1423",
+                background="#f9fbfe",
                 highlightthickness=1,
-                highlightbackground="#142c40",
+                highlightbackground="#e1e8f1",
             )
             card.grid(
                 row=0,
@@ -1467,22 +1487,23 @@ class TrayApplication:
             tk.Label(
                 card,
                 text=number,
-                background="#0b1423",
-                foreground="#00d9ff",
-                font=("Consolas", 12, "bold"),
+                background="#2f76e8",
+                foreground="#ffffff",
+                width=2,
+                font=("Segoe UI", 9, "bold"),
             ).grid(
                 row=0,
                 column=0,
                 rowspan=2,
-                padx=(9, 8),
+                padx=(9, 9),
                 pady=(9, 0),
                 sticky="n",
             )
             tk.Label(
                 card,
                 text=title,
-                background="#0b1423",
-                foreground="#e3f5ff",
+                background="#f9fbfe",
+                foreground="#273b54",
                 anchor="w",
                 font=("Microsoft YaHei UI", 9, "bold"),
             ).grid(
@@ -1497,8 +1518,8 @@ class TrayApplication:
             tk.Label(
                 card,
                 textvariable=variable,
-                background="#0b1423",
-                foreground="#8399ad",
+                background="#f9fbfe",
+                foreground="#6d7e92",
                 anchor="nw",
                 justify="left",
                 wraplength=150,
@@ -1515,12 +1536,11 @@ class TrayApplication:
         tk.Label(
             panel,
             text=(
-                "TIP  点击底部“参数设置”可修改摄像头、检测阈值和"
-                "各项时间；保存后会自动重启监控  //  "
-                "画面仅驻留内存，不上传、不保存"
+                "ⓘ  所有处理均在本地完成，不上传、不保存。"
+                "可在“参数设置”中调整检测参数与锁屏阈值。"
             ),
-            background="#08111d",
-            foreground="#58748c",
+            background="#f7faff",
+            foreground="#6d819a",
             anchor="w",
             justify="left",
             wraplength=610,
@@ -1539,27 +1559,40 @@ class TrayApplication:
         self,
         parent: tk.Misc,
         title: str,
+        icon_text: str,
         metrics: tuple[tuple[str, str], ...],
     ) -> tk.Frame:
         card = tk.Frame(
             parent,
-            background="#0b1423",
+            background="#ffffff",
             highlightthickness=1,
-            highlightbackground="#173248",
+            highlightbackground="#d8e2ef",
+        )
+        tk.Label(
+            card,
+            text=icon_text,
+            background="#ffffff",
+            foreground="#2f76e8",
+            font=("Segoe UI Symbol", 15, "bold"),
+        ).grid(
+            row=0,
+            column=0,
+            padx=(14, 8),
+            pady=(11, 7),
+            sticky="w",
         )
         tk.Label(
             card,
             text=title,
-            background="#0b1423",
-            foreground="#00d9ff",
+            background="#ffffff",
+            foreground="#243a55",
             anchor="w",
-            font=("Consolas", 9, "bold"),
+            font=("Microsoft YaHei UI", 11, "bold"),
         ).grid(
             row=0,
-            column=0,
-            columnspan=2,
-            padx=11,
-            pady=(8, 5),
+            column=1,
+            padx=(0, 14),
+            pady=(11, 7),
             sticky="ew",
         )
         for row_index, (label_text, key) in enumerate(
@@ -1571,22 +1604,23 @@ class TrayApplication:
             tk.Label(
                 card,
                 text=label_text,
-                background="#0b1423",
-                foreground="#71879b",
+                background="#ffffff",
+                foreground="#66778c",
                 anchor="w",
                 font=("Microsoft YaHei UI", 8),
             ).grid(
                 row=row_index,
                 column=0,
-                padx=(11, 6),
-                pady=3,
+                columnspan=2,
+                padx=(14, 6),
+                pady=4,
                 sticky="w",
             )
             value_label = tk.Label(
                 card,
                 textvariable=variable,
-                background="#0b1423",
-                foreground="#e3f5ff",
+                background="#ffffff",
+                foreground="#344a64",
                 anchor="e",
                 justify="right",
                 wraplength=165 if key == "camera" else 120,
@@ -1594,9 +1628,9 @@ class TrayApplication:
             )
             value_label.grid(
                 row=row_index,
-                column=1,
-                padx=(4, 11),
-                pady=3,
+                column=2,
+                padx=(4, 14),
+                pady=4,
                 sticky="e",
             )
             self._debug_metric_labels[key] = value_label
@@ -1609,20 +1643,38 @@ class TrayApplication:
         text: str,
         command: Callable[[], object],
         danger: bool = False,
+        primary: bool = False,
     ) -> tk.Button:
-        background = "#5B2430" if danger else "#102337"
-        active_background = "#8A3042" if danger else "#16415a"
+        if danger:
+            background = "#fff7f7"
+            foreground = "#d44444"
+            active_background = "#ffe9e9"
+            border_color = "#efaaaa"
+        elif primary:
+            background = "#2f76e8"
+            foreground = "#ffffff"
+            active_background = "#1f63cb"
+            border_color = "#2f76e8"
+        else:
+            background = "#ffffff"
+            foreground = "#3c5069"
+            active_background = "#edf3fb"
+            border_color = "#cfdbea"
         return tk.Button(
             parent,
             text=text,
             command=command,
             background=background,
-            foreground="#dff8ff",
+            foreground=foreground,
             activebackground=active_background,
-            activeforeground="#ffffff",
-            relief="flat",
-            borderwidth=0,
-            padx=14,
+            activeforeground=(
+                "#ffffff" if primary else foreground
+            ),
+            relief="solid",
+            borderwidth=1,
+            highlightbackground=border_color,
+            highlightcolor=border_color,
+            padx=13,
             pady=7,
             cursor="hand2",
             font=("Microsoft YaHei UI", 9),
@@ -1660,22 +1712,26 @@ class TrayApplication:
 
         if self._debug_status_badge is not None:
             if running and snapshot.frame_bgr is not None:
-                badge_text = "● LIVE"
-                badge_color = "#4dff9a"
+                badge_text = "●  LIVE"
+                badge_color = "#2b9f51"
+                badge_background = "#edf9f1"
             elif running:
-                badge_text = "● STANDBY"
-                badge_color = "#f5c451"
+                badge_text = "●  待机"
+                badge_color = "#a86b00"
+                badge_background = "#fff8e6"
             else:
-                badge_text = "● PAUSED"
-                badge_color = "#ff6b7a"
+                badge_text = "●  已暂停"
+                badge_color = "#c74343"
+                badge_background = "#fff0f0"
             self._debug_status_badge.configure(
                 text=badge_text,
                 foreground=badge_color,
+                background=badge_background,
             )
 
         if self._debug_status_variable is not None:
             self._debug_status_variable.set(
-                f"{snapshot.status}  //  {self._service.status_detail()}"
+                f"{snapshot.status}  ·  {self._service.status_detail()}"
             )
 
         confidences = [
@@ -1811,15 +1867,15 @@ class TrayApplication:
         lock_label = self._debug_metric_labels.get("lock_condition")
         if lock_label is not None:
             if snapshot.should_lock is True:
-                lock_color = "#ff6475"
+                lock_color = "#d94747"
             elif snapshot.should_lock is False:
-                lock_color = "#4dff9a"
+                lock_color = "#2b9f51"
             else:
-                lock_color = "#f5c451"
+                lock_color = "#a86b00"
             lock_label.configure(foreground=lock_color)
         device_label = self._debug_metric_labels.get("device")
         if device_label is not None:
-            device_label.configure(foreground="#00d9ff")
+            device_label.configure(foreground="#2f76e8")
 
         if self._debug_device_toggle_button is not None:
             actual_device = snapshot.device.strip().upper()
@@ -1840,7 +1896,7 @@ class TrayApplication:
 
         if self._debug_toggle_button is not None:
             self._debug_toggle_button.configure(
-                text="暂停监控" if running else "恢复监控"
+                text="暂停监控" if running else "开始监控"
             )
         self._render_debug_preview(snapshot)
         window.after(500, self._refresh_debug_window)
@@ -1868,41 +1924,17 @@ class TrayApplication:
             canvas.create_text(
                 320,
                 180,
-                text=f"NO VIDEO SIGNAL\n\n{snapshot.status}",
-                fill="#6d8299",
+                text=f"摄像头待机\n\n{snapshot.status}",
+                fill="#74859a",
                 width=560,
                 justify="center",
-                font=("Consolas", 12, "bold"),
+                font=("Microsoft YaHei UI", 11, "bold"),
             )
             return
 
         try:
             annotated = np.ascontiguousarray(frame.copy())
             frame_height, frame_width = annotated.shape[:2]
-            overlay = annotated.copy()
-            cv2.rectangle(
-                overlay,
-                (0, 0),
-                (frame_width, 30),
-                (10, 18, 28),
-                thickness=-1,
-            )
-            cv2.rectangle(
-                overlay,
-                (0, frame_height - 25),
-                (frame_width, frame_height),
-                (10, 18, 28),
-                thickness=-1,
-            )
-            cv2.addWeighted(overlay, 0.68, annotated, 0.32, 0, annotated)
-            for scanline_y in range(48, frame_height - 30, 48):
-                cv2.line(
-                    annotated,
-                    (0, scanline_y),
-                    (frame_width - 1, scanline_y),
-                    (45, 55, 55),
-                    1,
-                )
 
             for face_index, detection in enumerate(
                 snapshot.detections,
@@ -1912,19 +1944,19 @@ class TrayApplication:
                     snapshot.presence_mode == "REGISTERED_FACE"
                 )
                 if registered_mode and detection.is_registered_person is True:
-                    box_color = (80, 255, 120)
-                    corner_color = (0, 255, 255)
-                    label_color = (80, 255, 120)
+                    box_color = (75, 205, 90)
+                    corner_color = (75, 205, 90)
+                    label_color = (75, 185, 75)
                     identity_text = "SELF"
                 elif registered_mode:
-                    box_color = (70, 90, 255)
-                    corner_color = (80, 130, 255)
-                    label_color = (70, 90, 255)
+                    box_color = (65, 105, 235)
+                    corner_color = (65, 105, 235)
+                    label_color = (65, 105, 220)
                     identity_text = "OTHER"
                 else:
-                    box_color = (0, 255, 0)
-                    corner_color = (0, 255, 255)
-                    label_color = (0, 255, 0)
+                    box_color = (75, 205, 90)
+                    corner_color = (75, 205, 90)
+                    label_color = (75, 185, 75)
                     identity_text = "FACE"
                 cv2.rectangle(
                     annotated,
@@ -2022,71 +2054,49 @@ class TrayApplication:
                     (detection.xmin + 4, text_bottom - baseline - 2),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.48,
-                    (0, 0, 0),
+                    (255, 255, 255),
                     1,
                     cv2.LINE_AA,
                 )
 
-            device_text = snapshot.device or "INIT"
-            overlay_device_text = device_text.replace(
-                "检测 ", "FD:"
-            ).replace(" / 识别 ", "/ID:")
+            overlay = annotated.copy()
+            cv2.rectangle(
+                overlay,
+                (12, 12),
+                (112, 40),
+                (25, 31, 38),
+                thickness=-1,
+            )
+            privacy_width = min(frame_width - 24, 290)
+            cv2.rectangle(
+                overlay,
+                (12, frame_height - 44),
+                (12 + privacy_width, frame_height - 12),
+                (25, 31, 38),
+                thickness=-1,
+            )
+            cv2.addWeighted(overlay, 0.64, annotated, 0.36, 0, annotated)
+
+            resolution_text = f"{frame_width} x {frame_height}"
             cv2.putText(
                 annotated,
-                (
-                    f"LIVE // {overlay_device_text} // "
-                    f"MODE {'SELF' if snapshot.presence_mode == 'REGISTERED_FACE' else 'ANY'} // "
-                    f"FACES {len(snapshot.detections):02d}"
-                ),
-                (10, 20),
+                resolution_text,
+                (23, 31),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.48,
-                (0, 235, 255),
-                1,
-                cv2.LINE_AA,
-            )
-            resolution_text = f"{frame_width}x{frame_height}"
-            (resolution_width, _), _ = cv2.getTextSize(
-                resolution_text,
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.45,
-                1,
-            )
-            cv2.putText(
-                annotated,
-                resolution_text,
-                (frame_width - resolution_width - 10, 20),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.45,
-                (150, 210, 225),
+                (240, 245, 250),
                 1,
                 cv2.LINE_AA,
             )
             cv2.putText(
                 annotated,
-                "LOCAL PROCESSING // NO RECORDING",
-                (10, frame_height - 8),
+                "LOCAL PROCESSING ONLY  /  NO RECORDING",
+                (24, frame_height - 23),
                 cv2.FONT_HERSHEY_SIMPLEX,
-                0.40,
-                (130, 185, 200),
+                0.42,
+                (245, 248, 252),
                 1,
                 cv2.LINE_AA,
-            )
-            center_x = frame_width // 2
-            center_y = frame_height // 2
-            cv2.line(
-                annotated,
-                (center_x - 8, center_y),
-                (center_x + 8, center_y),
-                (0, 210, 230),
-                1,
-            )
-            cv2.line(
-                annotated,
-                (center_x, center_y - 8),
-                (center_x, center_y + 8),
-                (0, 210, 230),
-                1,
             )
 
             rgb = cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB)
@@ -2128,6 +2138,7 @@ class TrayApplication:
     def _close_debug_window(self) -> None:
         self._debug_photo_image = None
         self._debug_window_icon = None
+        self._debug_header_icon = None
         self._debug_metric_variables = {}
         self._debug_metric_labels = {}
         self._debug_guide_variables = {}
@@ -3082,12 +3093,28 @@ def _run_self_test() -> int:
         ):
             raise RuntimeError("Debug window could not be created")
         if (
+            test_application._debug_window.cget("background")
+            != "#c8d5e6"
+            or test_application._debug_header_icon is None
+        ):
+            raise RuntimeError(
+                "Light privacy-dashboard shell was not initialized"
+            )
+        if (
             test_application._debug_exit_button is None
             or test_application._debug_exit_button.cget("text")
             != "彻底退出程序"
         ):
             raise RuntimeError(
                 "Debug window exit-program button was not initialized"
+            )
+        if (
+            test_application._debug_toggle_button is None
+            or test_application._debug_toggle_button.cget("background")
+            != "#2f76e8"
+        ):
+            raise RuntimeError(
+                "Primary monitoring control was not initialized"
             )
         if (
             test_application._debug_camera_combobox is None
