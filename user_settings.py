@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 import config
+from global_hotkey import normalize_hotkey
 
 
 class SettingsError(ValueError):
@@ -27,6 +28,7 @@ class AppSettings:
     camera_monitoring_mode: str
     camera_activation_idle_seconds: float
     privacy_blur_enabled: bool
+    privacy_blur_hotkey: str
     face_absence_timeout_seconds: float
     input_idle_timeout_seconds: float
     startup_grace_period_seconds: float
@@ -50,6 +52,7 @@ class AppSettings:
                 config.CAMERA_ACTIVATION_IDLE_SECONDS
             ),
             privacy_blur_enabled=config.PRIVACY_BLUR_ENABLED,
+            privacy_blur_hotkey=config.PRIVACY_BLUR_HOTKEY,
             face_absence_timeout_seconds=(
                 config.FACE_ABSENCE_TIMEOUT_SECONDS
             ),
@@ -91,6 +94,9 @@ class AppSettings:
                 privacy_blur_enabled=cls._parse_boolean(
                     defaults["privacy_blur_enabled"],
                     "多人脸隐私模糊开关",
+                ),
+                privacy_blur_hotkey=normalize_hotkey(
+                    str(defaults["privacy_blur_hotkey"])
                 ),
                 face_absence_timeout_seconds=float(
                     defaults["face_absence_timeout_seconds"]
@@ -150,6 +156,12 @@ class AppSettings:
             raise SettingsError("空闲开启摄像头时间必须在 1 至 3600 秒之间")
         if not isinstance(self.privacy_blur_enabled, bool):
             raise SettingsError("多人脸隐私模糊开关必须为布尔值")
+        try:
+            normalized_hotkey = normalize_hotkey(self.privacy_blur_hotkey)
+        except ValueError as exc:
+            raise SettingsError(f"毛玻璃快捷键无效：{exc}") from exc
+        if normalized_hotkey != self.privacy_blur_hotkey:
+            raise SettingsError("毛玻璃快捷键格式未规范化")
         if (
             self.camera_monitoring_mode == "IDLE_TRIGGERED"
             and self.privacy_blur_enabled
@@ -184,6 +196,7 @@ class AppSettings:
             self.camera_activation_idle_seconds
         )
         config.PRIVACY_BLUR_ENABLED = self.privacy_blur_enabled
+        config.PRIVACY_BLUR_HOTKEY = self.privacy_blur_hotkey
         config.FACE_ABSENCE_TIMEOUT_SECONDS = (
             self.face_absence_timeout_seconds
         )
