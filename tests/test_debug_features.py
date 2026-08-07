@@ -28,6 +28,7 @@ from face_identity import (
     FaceTemplateError,
     FaceTemplateStore,
 )
+from global_hotkey import normalize_hotkey, parse_hotkey
 from main import (
     MonitorOutcome,
     camera_should_be_active,
@@ -50,7 +51,7 @@ class ApplicationDefaultsTests(unittest.TestCase):
     def test_title_and_lock_timeouts(self) -> None:
         settings = AppSettings.defaults()
         self.assertEqual(config.APPLICATION_TITLE, "SeatSentinel")
-        self.assertEqual(config.APPLICATION_VERSION, "0.2.7-beta")
+        self.assertEqual(config.APPLICATION_VERSION, "0.2.8-beta")
         self.assertEqual(config.USER_DATA_DIRECTORY.name, "SeatSentinel")
         self.assertIn("SeatSentinel", MUTEX_NAME)
         self.assertIn("SeatSentinel", DEBUG_WINDOW_EVENT_NAME)
@@ -59,6 +60,7 @@ class ApplicationDefaultsTests(unittest.TestCase):
         self.assertEqual(settings.camera_monitoring_mode, "CONTINUOUS")
         self.assertEqual(settings.camera_activation_idle_seconds, 20.0)
         self.assertTrue(settings.privacy_blur_enabled)
+        self.assertEqual(settings.privacy_blur_hotkey, "Alt+B")
         self.assertEqual(settings.face_absence_timeout_seconds, 60)
         self.assertEqual(settings.input_idle_timeout_seconds, 60)
         self.assertEqual(config.LOCK_WARNING_SECONDS, 5.0)
@@ -72,6 +74,25 @@ class ApplicationDefaultsTests(unittest.TestCase):
             {"inference_device": "cpu"}
         )
         self.assertEqual(settings.inference_device, "CPU")
+
+    def test_privacy_blur_hotkey_is_normalized(self) -> None:
+        settings = AppSettings.from_mapping(
+            {"privacy_blur_hotkey": " shift + ctrl + f8 "}
+        )
+        self.assertEqual(settings.privacy_blur_hotkey, "Ctrl+Shift+F8")
+        self.assertEqual(normalize_hotkey("windows+page down"), "Win+PageDown")
+
+        parsed = parse_hotkey("Alt+B")
+        self.assertEqual(parsed.display, "Alt+B")
+        self.assertEqual(parsed.virtual_key, ord("B"))
+
+    def test_privacy_blur_hotkey_requires_a_modifier_and_one_key(self) -> None:
+        for invalid in ("B", "Alt", "Alt+B+C", "Ctrl+Alt+未知"):
+            with self.subTest(hotkey=invalid):
+                with self.assertRaises(SettingsError):
+                    AppSettings.from_mapping(
+                        {"privacy_blur_hotkey": invalid}
+                    )
 
     def test_registered_face_mode_setting_is_normalized(self) -> None:
         settings = AppSettings.from_mapping(
@@ -294,6 +315,62 @@ class TrayPrivacyToggleTests(unittest.TestCase):
         self.assertEqual(shake.reset_count, 1)
         self.assertFalse(variable.value)
         self.assertEqual(tray_icon.update_count, 1)
+
+
+class TrayManualPrivacyToggleTests(unittest.TestCase):
+    def test_manual_toggle_works_without_camera_monitoring(self) -> None:
+        class FakeService:
+            dismiss_count = 0
+
+            def privacy_blur_snapshot(self):
+                return PrivacyBlurSignal().snapshot()
+
+            def dismiss_privacy_blur(self, status_detail: str = "") -> bool:
+                self.dismiss_count += 1
+                return False
+
+        class FakeOverlay:
+            hide_count = 0
+
+            def hide(self) -> None:
+                self.hide_count += 1
+
+        class FakeShake:
+            def reset(self) -> None:
+                return None
+
+        class FakeTrayIcon:
+            update_count = 0
+
+            def update_menu(self) -> None:
+                self.update_count += 1
+
+        application = TrayApplication.__new__(TrayApplication)
+        service = FakeService()
+        overlay = FakeOverlay()
+        tray_icon = FakeTrayIcon()
+        refresh_count = 0
+
+        def refresh_blur(schedule_next: bool = True) -> None:
+            nonlocal refresh_count
+            refresh_count += 1
+
+        application._service = service
+        application._privacy_blur_overlay = overlay
+        application._privacy_mouse_shake = FakeShake()
+        application._tray_icon = tray_icon
+        application._manual_privacy_blur_active = False
+        application._refresh_privacy_blur = refresh_blur
+
+        application._toggle_manual_privacy_blur()
+        self.assertTrue(application._manual_privacy_blur_active)
+        self.assertEqual(refresh_count, 1)
+
+        application._toggle_manual_privacy_blur()
+        self.assertFalse(application._manual_privacy_blur_active)
+        self.assertEqual(service.dismiss_count, 1)
+        self.assertEqual(overlay.hide_count, 1)
+        self.assertEqual(tray_icon.update_count, 2)
 
 
 class DetectionParsingTests(unittest.TestCase):

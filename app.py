@@ -37,6 +37,7 @@ from face_registration import (
     FaceRegistrationUpdate,
     register_face_from_camera,
 )
+from global_hotkey import GlobalHotkeyError, WindowsGlobalHotkey
 from privacy_blur import (
     MouseShakeDetector,
     PrivacyBlurSignal,
@@ -281,12 +282,15 @@ class MonitoringService:
     def privacy_blur_snapshot(self) -> PrivacyBlurSnapshot:
         return self._privacy_blur_signal.snapshot()
 
-    def dismiss_privacy_blur(self) -> bool:
+    def dismiss_privacy_blur(
+        self,
+        status_detail: str = "已通过甩动鼠标解除隐私模糊 · 继续监控",
+    ) -> bool:
         dismissed = self._privacy_blur_signal.dismiss()
         if dismissed:
             self._update_status(
                 "monitoring",
-                "已通过甩动鼠标解除隐私模糊 · 继续监控",
+                status_detail,
             )
         return dismissed
 
@@ -465,8 +469,13 @@ class TrayApplication:
         )
         self._privacy_blur_next_monitor_check_at = 0.0
         self._privacy_blur_last_sequence = -1
+        self._manual_privacy_blur_active = False
         self._privacy_mouse_shake = MouseShakeDetector()
         self._privacy_cursor_error_logged = False
+        self._privacy_hotkey_events: queue.SimpleQueue[bool] = (
+            queue.SimpleQueue()
+        )
+        self._privacy_hotkey: Optional[WindowsGlobalHotkey] = None
         self._debug_window: Optional[tk.Toplevel] = None
         self._debug_status_variable: Optional[tk.StringVar] = None
         self._debug_metric_variables: dict[str, tk.StringVar] = {}
@@ -535,6 +544,14 @@ class TrayApplication:
                     enabled=lambda item: (
                         config.CAMERA_MONITORING_MODE == "CONTINUOUS"
                     ),
+                ),
+                pystray.MenuItem(
+                    lambda item: (
+                        "手动毛玻璃"
+                        f"（{config.PRIVACY_BLUR_HOTKEY}）"
+                    ),
+                    self._toggle_manual_privacy_blur_from_tray,
+                    checked=lambda item: self._manual_privacy_blur_active,
                 ),
                 pystray.MenuItem(
                     "设置",
@@ -625,6 +642,7 @@ class TrayApplication:
         return image
 
     def run(self) -> None:
+        hotkey_warning: Optional[str] = None
         try:
             settings = self._settings_store.load()
             settings.apply_to_runtime()
@@ -633,12 +651,27 @@ class TrayApplication:
             self._root.destroy()
             return
 
+        try:
+            self._replace_privacy_hotkey(settings.privacy_blur_hotkey)
+        except GlobalHotkeyError as exc:
+            hotkey_warning = str(exc)
+            LOGGER.warning("Privacy blur hotkey is unavailable: %s", exc)
+
         self._tray_icon.run_detached()
         self._service.start_async()
         self._root.after(1000, self._refresh_tray_menu)
         self._root.after(100, self._refresh_lock_warning)
         self._root.after(80, self._refresh_privacy_blur)
+        self._root.after(50, self._poll_privacy_hotkey)
         self._root.after(250, self._poll_debug_signal)
+        if hotkey_warning is not None:
+            self._root.after(
+                300,
+                lambda detail=hotkey_warning: messagebox.showwarning(
+                    "毛玻璃快捷键未启用",
+                    detail + "。请在设置中换一个组合键。",
+                ),
+            )
         if self._show_debug_on_start:
             self._root.after(250, self._show_debug_window)
         try:
@@ -646,6 +679,8 @@ class TrayApplication:
         except KeyboardInterrupt:
             LOGGER.info("Ctrl+C received; closing tray application")
         finally:
+            self._stop_privacy_hotkey()
+            self._manual_privacy_blur_active = False
             self._hide_privacy_blur()
             self._service.shutdown()
             self._tray_icon.stop()
@@ -830,7 +865,10 @@ class TrayApplication:
         try:
             snapshot = self._service.privacy_blur_snapshot()
             overlay_visible = self._privacy_blur_overlay.is_visible()
-            if snapshot.active:
+            blur_active = bool(
+                snapshot.active or self._manual_privacy_blur_active
+            )
+            if blur_active:
                 next_delay = config.PRIVACY_MOUSE_POLL_MILLISECONDS
                 if (
                     not overlay_visible
@@ -854,11 +892,13 @@ class TrayApplication:
                         cursor_x,
                         cursor_y,
                     ):
+                        self._manual_privacy_blur_active = False
                         if self._service.dismiss_privacy_blur():
                             LOGGER.info(
                                 "Privacy blur dismissed by a mouse shake"
                             )
                         self._hide_privacy_blur()
+                        self._refresh_manual_privacy_menu()
                     self._privacy_cursor_error_logged = False
                 except OSError as exc:
                     if not self._privacy_cursor_error_logged:
@@ -871,6 +911,7 @@ class TrayApplication:
                 self._hide_privacy_blur()
         except (DwmPrivacyError, OSError, tk.TclError, ValueError) as exc:
             LOGGER.error("Unable to maintain the DWM privacy blur: %s", exc)
+            self._manual_privacy_blur_active = False
             self._hide_privacy_blur()
         finally:
             if schedule_next:
@@ -909,6 +950,72 @@ class TrayApplication:
     ) -> None:
         self._root.after(0, self._toggle_privacy_blur_setting)
 
+    def _toggle_manual_privacy_blur_from_tray(
+        self,
+        icon: pystray.Icon,
+        item: pystray.MenuItem,
+    ) -> None:
+        self._root.after(0, self._toggle_manual_privacy_blur)
+
+    def _toggle_manual_privacy_blur(self) -> None:
+        snapshot = self._service.privacy_blur_snapshot()
+        overlay_active = bool(
+            self._manual_privacy_blur_active or snapshot.active
+        )
+        if overlay_active:
+            self._manual_privacy_blur_active = False
+            self._service.dismiss_privacy_blur(
+                "已通过快捷键解除隐私模糊 · 继续监控"
+            )
+            self._hide_privacy_blur()
+            LOGGER.info("Privacy blur dismissed manually")
+        else:
+            self._manual_privacy_blur_active = True
+            self._refresh_privacy_blur(schedule_next=False)
+            LOGGER.info("Privacy blur activated manually")
+        self._refresh_manual_privacy_menu()
+
+    def _refresh_manual_privacy_menu(self) -> None:
+        try:
+            self._tray_icon.update_menu()
+        except Exception as exc:
+            LOGGER.debug(
+                "Unable to update the manual privacy-blur menu item",
+                exc_info=exc,
+            )
+
+    def _enqueue_privacy_hotkey(self) -> None:
+        self._privacy_hotkey_events.put(True)
+
+    def _poll_privacy_hotkey(self) -> None:
+        try:
+            while True:
+                self._privacy_hotkey_events.get_nowait()
+                self._toggle_manual_privacy_blur()
+        except queue.Empty:
+            pass
+        try:
+            self._root.after(50, self._poll_privacy_hotkey)
+        except tk.TclError:
+            pass
+
+    def _replace_privacy_hotkey(self, hotkey: str) -> None:
+        current = self._privacy_hotkey
+        if current is not None and current.hotkey == hotkey:
+            return
+        candidate = WindowsGlobalHotkey(self._enqueue_privacy_hotkey)
+        candidate.start(hotkey)
+        self._privacy_hotkey = candidate
+        if current is not None:
+            current.stop()
+        LOGGER.info("Privacy blur hotkey registered: %s", hotkey)
+
+    def _stop_privacy_hotkey(self) -> None:
+        hotkey = self._privacy_hotkey
+        self._privacy_hotkey = None
+        if hotkey is not None:
+            hotkey.stop()
+
     def _toggle_privacy_blur_setting(self) -> None:
         was_running = self._service.is_running()
         try:
@@ -930,7 +1037,8 @@ class TrayApplication:
             return
 
         self._service.clear_privacy_blur()
-        self._hide_privacy_blur()
+        if not getattr(self, "_manual_privacy_blur_active", False):
+            self._hide_privacy_blur()
         variable = self._settings_privacy_blur_variable
         if variable is not None:
             try:
@@ -2606,6 +2714,9 @@ class TrayApplication:
             "privacy_blur_enabled": tk.BooleanVar(
                 value=settings.privacy_blur_enabled
             ),
+            "privacy_blur_hotkey": tk.StringVar(
+                value=settings.privacy_blur_hotkey
+            ),
             "detection_interval_seconds": tk.StringVar(
                 value=str(settings.detection_interval_seconds)
             ),
@@ -2710,6 +2821,27 @@ class TrayApplication:
             text="也可从右下角托盘图标的右键菜单随时开关",
             foreground="#666666",
         ).pack(anchor="w", pady=(4, 0))
+        hotkey_row = ttk.Frame(privacy_controls)
+        hotkey_row.pack(fill="x", pady=(10, 0))
+        ttk.Label(
+            hotkey_row,
+            text="手动毛玻璃快捷键",
+        ).pack(side="left")
+        ttk.Entry(
+            hotkey_row,
+            textvariable=variables["privacy_blur_hotkey"],
+            width=18,
+        ).pack(side="left", padx=(12, 0))
+        ttk.Label(
+            privacy_controls,
+            text=(
+                "默认 Alt+B；空闲监测、监控暂停或摄像头关闭时也可直接切换，"
+                "再次按下或快速甩动鼠标即可解除"
+            ),
+            foreground="#666666",
+            wraplength=520,
+            justify="left",
+        ).pack(anchor="w", pady=(4, 0))
 
         def sync_camera_mode_controls(*_args: object) -> None:
             selected_mode = CAMERA_MONITORING_MODE_VALUES.get(
@@ -2777,7 +2909,8 @@ class TrayApplication:
             content,
             text=(
                 "“键鼠空闲后监测”会在达到设定空闲时间后开启摄像头，恢复操作后"
-                "立即释放；该模式与多人脸隐私模糊互斥。持续监测模式下，"
+                "立即释放；该模式只与自动多人脸隐私模糊互斥，手动快捷键不受影响。"
+                "持续监测模式下，"
                 "多人脸隐私模糊无需注册人脸；仅本人模式还可在只剩本人 3 秒后"
                 "自动解除，未注册时可甩动鼠标解除。"
                 "保存后会安全释放摄像头并重启监控。"
@@ -2868,6 +3001,9 @@ class TrayApplication:
                     "privacy_blur_enabled": variables[
                         "privacy_blur_enabled"
                     ].get(),
+                    "privacy_blur_hotkey": variables[
+                        "privacy_blur_hotkey"
+                    ].get(),
                     "detection_interval_seconds": variables[
                         "detection_interval_seconds"
                     ].get(),
@@ -2904,9 +3040,21 @@ class TrayApplication:
                     raise SettingsError(
                         f"本人人脸模板无法使用：{exc}"
                     ) from exc
+            previous_hotkey = self._privacy_hotkey
+            self._replace_privacy_hotkey(settings.privacy_blur_hotkey)
+            hotkey_rebound = self._privacy_hotkey is not previous_hotkey
             self._settings_store.save(settings)
             settings.apply_to_runtime()
-        except SettingsError as exc:
+        except (GlobalHotkeyError, SettingsError) as exc:
+            if locals().get("hotkey_rebound", False):
+                try:
+                    self._replace_privacy_hotkey(
+                        old_settings.privacy_blur_hotkey
+                    )
+                except GlobalHotkeyError:
+                    LOGGER.exception(
+                        "Unable to restore the previous privacy hotkey"
+                    )
             messagebox.showerror(
                 "设置错误",
                 str(exc),
@@ -2916,7 +3064,8 @@ class TrayApplication:
 
         if not settings.privacy_blur_enabled:
             self._service.clear_privacy_blur()
-            self._hide_privacy_blur()
+            if not self._manual_privacy_blur_active:
+                self._hide_privacy_blur()
         try:
             self._tray_icon.update_menu()
         except Exception as exc:
@@ -2947,6 +3096,9 @@ class TrayApplication:
     def _shutdown(self) -> None:
         if self._registration_cancel_event is not None:
             self._registration_cancel_event.set()
+        self._stop_privacy_hotkey()
+        self._manual_privacy_blur_active = False
+        self._hide_privacy_blur()
         self._service.shutdown()
         self._tray_icon.stop()
         self._root.after(0, self._root.quit)
@@ -2996,6 +3148,19 @@ def _run_self_test() -> int:
         ):
             raise RuntimeError(
                 "Tray privacy-blur availability does not match camera mode"
+            )
+        manual_privacy_menu_items = [
+            item
+            for item in test_application._tray_icon.menu.items
+            if str(item.text).startswith("手动毛玻璃（")
+        ]
+        if (
+            len(manual_privacy_menu_items) != 1
+            or settings.privacy_blur_hotkey
+            not in str(manual_privacy_menu_items[0].text)
+        ):
+            raise RuntimeError(
+                "Tray manual privacy hotkey was not initialized"
             )
         test_application._service._update_status(
             "lock_warning",
@@ -3182,15 +3347,21 @@ def _run_self_test() -> int:
             if isinstance(widget, ttk.Checkbutton)
             and "多人脸隐私模糊" in str(widget.cget("text"))
         ]
+        hotkey_label_found = any(
+            isinstance(widget, ttk.Label)
+            and widget.cget("text") == "手动毛玻璃快捷键"
+            for widget in settings_widgets
+        )
         if (
             not mode_selector_found
             or len(camera_mode_selectors) != 1
             or not registration_button_found
             or len(privacy_switches) != 1
+            or not hotkey_label_found
         ):
             raise RuntimeError(
-                "Camera mode, registered-face, or privacy controls were "
-                "not initialized"
+                "Camera mode, registered-face, privacy, or hotkey controls "
+                "were not initialized"
             )
         camera_mode_selectors[0].set("键鼠空闲后监测")
         test_application._root.update_idletasks()
