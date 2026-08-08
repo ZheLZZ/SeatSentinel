@@ -29,6 +29,7 @@ class AppSettings:
     camera_activation_idle_seconds: float
     privacy_blur_enabled: bool
     privacy_blur_hotkey: str
+    sedentary_reminder_enabled: bool
     face_absence_timeout_seconds: float
     input_idle_timeout_seconds: float
     startup_grace_period_seconds: float
@@ -53,6 +54,9 @@ class AppSettings:
             ),
             privacy_blur_enabled=config.PRIVACY_BLUR_ENABLED,
             privacy_blur_hotkey=config.PRIVACY_BLUR_HOTKEY,
+            sedentary_reminder_enabled=(
+                config.SEDENTARY_REMINDER_ENABLED
+            ),
             face_absence_timeout_seconds=(
                 config.FACE_ABSENCE_TIMEOUT_SECONDS
             ),
@@ -97,6 +101,10 @@ class AppSettings:
                 ),
                 privacy_blur_hotkey=normalize_hotkey(
                     str(defaults["privacy_blur_hotkey"])
+                ),
+                sedentary_reminder_enabled=cls._parse_boolean(
+                    defaults["sedentary_reminder_enabled"],
+                    "久坐提醒开关",
                 ),
                 face_absence_timeout_seconds=float(
                     defaults["face_absence_timeout_seconds"]
@@ -156,6 +164,8 @@ class AppSettings:
             raise SettingsError("空闲开启摄像头时间必须在 1 至 3600 秒之间")
         if not isinstance(self.privacy_blur_enabled, bool):
             raise SettingsError("多人脸隐私模糊开关必须为布尔值")
+        if not isinstance(self.sedentary_reminder_enabled, bool):
+            raise SettingsError("久坐提醒开关必须为布尔值")
         try:
             normalized_hotkey = normalize_hotkey(self.privacy_blur_hotkey)
         except ValueError as exc:
@@ -197,6 +207,9 @@ class AppSettings:
         )
         config.PRIVACY_BLUR_ENABLED = self.privacy_blur_enabled
         config.PRIVACY_BLUR_HOTKEY = self.privacy_blur_hotkey
+        config.SEDENTARY_REMINDER_ENABLED = (
+            self.sedentary_reminder_enabled
+        )
         config.FACE_ABSENCE_TIMEOUT_SECONDS = (
             self.face_absence_timeout_seconds
         )

@@ -8,7 +8,7 @@ from pathlib import Path
 
 
 APPLICATION_TITLE = "SeatSentinel"
-APPLICATION_VERSION = "0.2.8-beta"
+APPLICATION_VERSION = "0.2.9-beta"
 CAMERA_INDEX = 0
 # Windows 当前内置摄像头的设备名称。非空时按名称选择，不再盲用编号 0。
 PREFERRED_CAMERA_NAME = "FHD Camera"
@@ -33,6 +33,10 @@ FACE_ABSENCE_TIMEOUT_SECONDS = 60
 INPUT_IDLE_TIMEOUT_SECONDS = 60
 STARTUP_GRACE_PERIOD_SECONDS = 30
 LOCK_WARNING_SECONDS = 5.0
+SEDENTARY_REMINDER_ENABLED = True
+SEDENTARY_REMINDER_INTERVAL_SECONDS = 30.0 * 60.0
+SEDENTARY_LEAVE_CONFIRMATION_SECONDS = 30.0
+SEDENTARY_REMINDER_DISPLAY_SECONDS = 1.0
 # 96% is the user-validated layered alpha for DWM Desktop Acrylic.  DWM owns
 # the live blur; SeatSentinel does not capture or process desktop pixels.
 PRIVACY_ACRYLIC_STRENGTH_PERCENT = 96

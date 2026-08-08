@@ -33,6 +33,11 @@ from face_identity import (
     FaceTemplateStore,
 )
 from privacy_blur import PrivacyBlurSignal, SecondPersonPrivacyGuard
+from sedentary_reminder import (
+    SedentaryReminderSignal,
+    SedentaryTracker,
+    format_sedentary_duration,
+)
 from session_monitor import SessionMonitor, SessionMonitorError
 from windows_lock import WindowsLockError, lock_workstation
 
@@ -191,6 +196,30 @@ def _seconds_text(seconds: Optional[float]) -> str:
     return f"{seconds:.1f}"
 
 
+def _observe_sedentary_time(
+    tracker: Optional[SedentaryTracker],
+    signal: Optional[SedentaryReminderSignal],
+    present: Optional[bool],
+    timestamp: float,
+) -> None:
+    if tracker is None:
+        return
+    seated_seconds = tracker.observe(present, timestamp)
+    if seated_seconds is None:
+        return
+    duration_text = format_sedentary_duration(seated_seconds)
+    LOGGER.info(
+        "Continuous seated time reached %.1f seconds; showing reminder",
+        seated_seconds,
+    )
+    if signal is not None:
+        signal.trigger(
+            seated_seconds,
+            f"已经连续坐了 {duration_text}，请注意起身活动",
+            timestamp,
+        )
+
+
 def camera_should_be_active(
     camera_monitoring_mode: str,
     input_idle_seconds: Optional[float],
@@ -275,6 +304,8 @@ def monitor_until_session_pause(
     status_callback: Optional[StatusCallback] = None,
     debug_frame_buffer: Optional[DebugFrameBuffer] = None,
     privacy_blur_signal: Optional[PrivacyBlurSignal] = None,
+    sedentary_tracker: Optional[SedentaryTracker] = None,
+    sedentary_reminder_signal: Optional[SedentaryReminderSignal] = None,
 ) -> MonitorOutcome:
     """Monitor until Windows locks or the session state becomes uncertain."""
     registered_face_mode = config.PRESENCE_MODE == "REGISTERED_FACE"
@@ -359,6 +390,8 @@ def monitor_until_session_pause(
 
         try:
             if session_monitor.is_locked():
+                if sedentary_tracker is not None:
+                    sedentary_tracker.reset()
                 _clear_privacy_blur(privacy_blur_signal)
                 _clear_debug_frame(
                     debug_frame_buffer,
@@ -375,6 +408,12 @@ def monitor_until_session_pause(
                 )
                 return MonitorOutcome.SESSION_LOCKED
         except SessionMonitorError as exc:
+            _observe_sedentary_time(
+                sedentary_tracker,
+                sedentary_reminder_signal,
+                None,
+                cycle_time,
+            )
             _clear_privacy_blur(privacy_blur_signal)
             _clear_debug_frame(
                 debug_frame_buffer,
@@ -422,6 +461,12 @@ def monitor_until_session_pause(
                 activation_idle_seconds,
                 config.CAMERA_ACTIVATION_IDLE_SECONDS,
             ):
+                _observe_sedentary_time(
+                    sedentary_tracker,
+                    sedentary_reminder_signal,
+                    True,
+                    cycle_time,
+                )
                 _clear_privacy_blur(privacy_blur_signal)
                 _clear_debug_frame(
                     debug_frame_buffer,
@@ -614,6 +659,17 @@ def monitor_until_session_pause(
                 inference_was_healthy = False
                 if privacy_guard is not None:
                     privacy_guard.mark_visual_state_unknown()
+
+        _observe_sedentary_time(
+            sedentary_tracker,
+            sedentary_reminder_signal,
+            (
+                presence_detected
+                if camera_ok and inference_ok
+                else None
+            ),
+            cycle_time,
+        )
 
         if presence_detected is True:
             last_seen_time = cycle_time
@@ -865,6 +921,8 @@ def wait_for_session_ready(
     status_callback: Optional[StatusCallback] = None,
     debug_frame_buffer: Optional[DebugFrameBuffer] = None,
     debug_device: str = "",
+    sedentary_tracker: Optional[SedentaryTracker] = None,
+    sedentary_reminder_signal: Optional[SedentaryReminderSignal] = None,
 ) -> Optional[bool]:
     """Wait for a reliably unlocked session.
 
@@ -889,6 +947,12 @@ def wait_for_session_ready(
         try:
             locked = session_monitor.is_locked()
         except SessionMonitorError as exc:
+            _observe_sedentary_time(
+                sedentary_tracker,
+                sedentary_reminder_signal,
+                None,
+                now,
+            )
             _clear_debug_frame(
                 debug_frame_buffer,
                 "无法读取 Windows 会话状态 · 调试画面已清空",
@@ -918,6 +982,8 @@ def wait_for_session_ready(
             continue
 
         if locked:
+            if sedentary_tracker is not None:
+                sedentary_tracker.reset()
             _clear_debug_frame(
                 debug_frame_buffer,
                 "Windows 已锁定 · 调试画面已清空",
@@ -978,6 +1044,8 @@ def wait_for_camera_activation(
     status_callback: Optional[StatusCallback] = None,
     debug_frame_buffer: Optional[DebugFrameBuffer] = None,
     debug_device: str = "",
+    sedentary_tracker: Optional[SedentaryTracker] = None,
+    sedentary_reminder_signal: Optional[SedentaryReminderSignal] = None,
 ) -> Optional[bool]:
     """Wait until the configured strategy permits opening the camera.
 
@@ -1002,6 +1070,8 @@ def wait_for_camera_activation(
         now = time.monotonic()
         try:
             if session_monitor.is_locked():
+                if sedentary_tracker is not None:
+                    sedentary_tracker.reset()
                 _clear_debug_frame(
                     debug_frame_buffer,
                     "Windows 已锁定 · 摄像头保持关闭",
@@ -1014,6 +1084,12 @@ def wait_for_camera_activation(
                 )
                 return False
         except SessionMonitorError as exc:
+            _observe_sedentary_time(
+                sedentary_tracker,
+                sedentary_reminder_signal,
+                None,
+                now,
+            )
             _clear_debug_frame(
                 debug_frame_buffer,
                 "会话状态不明 · 摄像头保持关闭",
@@ -1043,6 +1119,12 @@ def wait_for_camera_activation(
         try:
             input_idle_seconds = activity_monitor.seconds_since_last_input()
         except ActivityMonitorError as exc:
+            _observe_sedentary_time(
+                sedentary_tracker,
+                sedentary_reminder_signal,
+                None,
+                now,
+            )
             _clear_debug_frame(
                 debug_frame_buffer,
                 "无法确认键鼠状态 · 摄像头保持关闭",
@@ -1087,6 +1169,12 @@ def wait_for_camera_activation(
             )
             return True
 
+        _observe_sedentary_time(
+            sedentary_tracker,
+            sedentary_reminder_signal,
+            True,
+            now,
+        )
         remaining_seconds = max(
             1,
             math.ceil(
@@ -1123,6 +1211,8 @@ def open_camera_when_session_ready(
     status_callback: Optional[StatusCallback] = None,
     debug_frame_buffer: Optional[DebugFrameBuffer] = None,
     debug_device: str = "",
+    sedentary_tracker: Optional[SedentaryTracker] = None,
+    sedentary_reminder_signal: Optional[SedentaryReminderSignal] = None,
 ) -> Optional[bool]:
     """Open the camera, retrying failures while the session is unlocked."""
     last_error_log_at = float("-inf")
@@ -1139,6 +1229,8 @@ def open_camera_when_session_ready(
         now = time.monotonic()
         try:
             if session_monitor.is_locked():
+                if sedentary_tracker is not None:
+                    sedentary_tracker.reset()
                 _clear_debug_frame(
                     debug_frame_buffer,
                     "Windows 已锁定 · 调试画面已清空",
@@ -1146,6 +1238,12 @@ def open_camera_when_session_ready(
                 )
                 return False
         except SessionMonitorError as exc:
+            _observe_sedentary_time(
+                sedentary_tracker,
+                sedentary_reminder_signal,
+                None,
+                now,
+            )
             _clear_debug_frame(
                 debug_frame_buffer,
                 "会话状态不明 · 调试画面已清空",
@@ -1190,6 +1288,12 @@ def open_camera_when_session_ready(
                     activity_monitor.seconds_since_last_input()
                 )
             except ActivityMonitorError as exc:
+                _observe_sedentary_time(
+                    sedentary_tracker,
+                    sedentary_reminder_signal,
+                    None,
+                    now,
+                )
                 _clear_debug_frame(
                     debug_frame_buffer,
                     "无法确认键鼠状态 · 摄像头保持关闭",
@@ -1221,6 +1325,12 @@ def open_camera_when_session_ready(
                 input_idle_seconds,
                 config.CAMERA_ACTIVATION_IDLE_SECONDS,
             ):
+                _observe_sedentary_time(
+                    sedentary_tracker,
+                    sedentary_reminder_signal,
+                    True,
+                    now,
+                )
                 _clear_debug_frame(
                     debug_frame_buffer,
                     "检测到键鼠操作 · 摄像头保持关闭",
@@ -1242,6 +1352,12 @@ def open_camera_when_session_ready(
             )
             return True
         except CameraError as exc:
+            _observe_sedentary_time(
+                sedentary_tracker,
+                sedentary_reminder_signal,
+                None,
+                now,
+            )
             _clear_debug_frame(
                 debug_frame_buffer,
                 "无法打开摄像头 · 调试画面已清空",
@@ -1273,6 +1389,7 @@ def run(
     status_callback: Optional[StatusCallback] = None,
     debug_frame_buffer: Optional[DebugFrameBuffer] = None,
     privacy_blur_signal: Optional[PrivacyBlurSignal] = None,
+    sedentary_reminder_signal: Optional[SedentaryReminderSignal] = None,
 ) -> int:
     """Run persistent lock, unlock, and resume cycles."""
     camera: Optional[Camera] = None
@@ -1332,6 +1449,14 @@ def run(
         )
         activity_monitor = ActivityMonitor()
         session_monitor = SessionMonitor()
+        sedentary_tracker = (
+            SedentaryTracker(
+                config.SEDENTARY_REMINDER_INTERVAL_SECONDS,
+                config.SEDENTARY_LEAVE_CONFIRMATION_SECONDS,
+            )
+            if config.SEDENTARY_REMINDER_ENABLED
+            else None
+        )
 
         while True:
             saw_locked = wait_for_session_ready(
@@ -1341,6 +1466,8 @@ def run(
                 status_callback=status_callback,
                 debug_frame_buffer=debug_frame_buffer,
                 debug_device=device_text,
+                sedentary_tracker=sedentary_tracker,
+                sedentary_reminder_signal=sedentary_reminder_signal,
             )
             if saw_locked is None:
                 return 0
@@ -1358,6 +1485,8 @@ def run(
                 status_callback=status_callback,
                 debug_frame_buffer=debug_frame_buffer,
                 debug_device=device_text,
+                sedentary_tracker=sedentary_tracker,
+                sedentary_reminder_signal=sedentary_reminder_signal,
             )
             if camera_activation_ready is None:
                 return 0
@@ -1372,6 +1501,8 @@ def run(
                 status_callback=status_callback,
                 debug_frame_buffer=debug_frame_buffer,
                 debug_device=device_text,
+                sedentary_tracker=sedentary_tracker,
+                sedentary_reminder_signal=sedentary_reminder_signal,
             )
             if camera_opened is None:
                 return 0
@@ -1390,6 +1521,8 @@ def run(
                     status_callback=status_callback,
                     debug_frame_buffer=debug_frame_buffer,
                     privacy_blur_signal=privacy_blur_signal,
+                    sedentary_tracker=sedentary_tracker,
+                    sedentary_reminder_signal=sedentary_reminder_signal,
                 )
             finally:
                 camera.release()
@@ -1415,6 +1548,8 @@ def run(
                     status_callback=status_callback,
                     debug_frame_buffer=debug_frame_buffer,
                     debug_device=device_text,
+                    sedentary_tracker=sedentary_tracker,
+                    sedentary_reminder_signal=sedentary_reminder_signal,
                 )
                 if saw_locked is None:
                     return 0
@@ -1432,6 +1567,8 @@ def run(
                     status_callback=status_callback,
                     debug_frame_buffer=debug_frame_buffer,
                     debug_device=device_text,
+                    sedentary_tracker=sedentary_tracker,
+                    sedentary_reminder_signal=sedentary_reminder_signal,
                 )
                 if saw_locked is None:
                     return 0

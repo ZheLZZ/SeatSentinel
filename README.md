@@ -1,6 +1,6 @@
 # SeatSentinel
 
-![Version](https://img.shields.io/badge/version-v0.2.8--beta-f0a020)
+![Version](https://img.shields.io/badge/version-v0.2.9--beta-f0a020)
 ![Platform](https://img.shields.io/badge/platform-Windows%2011-0078D4)
 ![Python](https://img.shields.io/badge/Python-3.13-3776AB)
 ![OpenVINO](https://img.shields.io/badge/OpenVINO-NPU%20%7C%20CPU-00C7B7)
@@ -44,6 +44,8 @@ OpenVINO 调用 NPU 或 CPU 判断电脑前是否有人，再结合 Windows 最�
 - 调试控制台打开时显示独立的 Windows 任务栏图标，便于确认和快速切回窗口；
 - 调试控制台提供“彻底退出程序”按钮，可直接结束监控和托盘进程；
 - 达到锁屏条件后先显示 5 秒柔和提示，检测到在场或键鼠操作会立即取消；
+- 连续在电脑前满 30 分钟后显示 1 秒久坐提醒，并在仍未离开的每个 30 分钟节点继续提示；
+- 久坐提醒默认开启，可在“设置 → 久坐提醒”中随时关闭或重新开启；
 - EXE、调试窗口和托盘统一使用专属图标；监控运行显示彩色图标，暂停时显示灰色图标和琥珀色状态点；
 - 托盘驻留、单实例运行，重复启动时唤出已有调试窗口；
 - 参数保存在本地，不设置开机自动启动。
@@ -80,6 +82,18 @@ AND 当前尚未执行锁屏
 快捷键仍可使用。“任意人脸”和“仅本人”
 两种在场判断仍然都可以使用。旧版设置缺少该选项时继续采用“持续监测”，不会在
 升级后静默改变摄像头行为。
+
+### 久坐提醒
+
+SeatSentinel 从本轮首次确认在场开始累计连续久坐时间。持续监测模式直接使用人脸
+判断；键鼠空闲后监测模式在摄像头待机时以键鼠活动确认人在电脑前，进入空闲后再由
+摄像头确认。连续 30 秒未确认在场、Windows 锁定、暂停监控或重启监控都会重置本轮
+计时。满 30 分钟时在屏幕顶部显示与锁屏预告相同风格的不抢焦点提醒，内容会写明已
+连续坐了多久；提醒总显示时间为 1 秒。若仍未离开，会在 60、90 分钟等后续节点继续
+提醒。
+
+久坐提醒开关保存在本机设置中。关闭后不会继续累计或弹出提醒；重新开启后从下一轮
+监控首次确认在场时重新计时。
 
 ## 注册本人和切换模式
 
@@ -279,6 +293,10 @@ OpenCV 的 BGR 画面在显示前转换为 RGB，并按原始比例缩放。Tkin
 | `INPUT_IDLE_TIMEOUT_SECONDS` | `60` | 键鼠空闲锁屏计时 |
 | `STARTUP_GRACE_PERIOD_SECONDS` | `30` | 启动/恢复宽限期 |
 | `LOCK_WARNING_SECONDS` | `5` | 锁屏前可取消提示时长 |
+| `SEDENTARY_REMINDER_ENABLED` | `True` | 是否启用久坐提醒 |
+| `SEDENTARY_REMINDER_INTERVAL_SECONDS` | `1800` | 久坐提醒间隔（30 分钟） |
+| `SEDENTARY_LEAVE_CONFIRMATION_SECONDS` | `30` | 连续未确认在场后重置久坐计时所需秒数 |
+| `SEDENTARY_REMINDER_DISPLAY_SECONDS` | `1` | 久坐提醒显示总时长 |
 | `FRAME_WIDTH` | `640` | 摄像头画面宽度 |
 | `FRAME_HEIGHT` | `360` | 摄像头画面高度 |
 

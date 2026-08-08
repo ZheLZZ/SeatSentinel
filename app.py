@@ -43,6 +43,10 @@ from privacy_blur import (
     PrivacyBlurSignal,
     PrivacyBlurSnapshot,
 )
+from sedentary_reminder import (
+    SedentaryReminderSignal,
+    SedentaryReminderSnapshot,
+)
 from session_monitor import SessionMonitor
 from single_instance import (
     DebugWindowSignal,
@@ -257,6 +261,7 @@ class MonitoringService:
         self._shutting_down = False
         self._debug_frame_buffer = DebugFrameBuffer()
         self._privacy_blur_signal = PrivacyBlurSignal()
+        self._sedentary_reminder_signal = SedentaryReminderSignal()
 
     def status_detail(self) -> str:
         with self._state_lock:
@@ -281,6 +286,12 @@ class MonitoringService:
 
     def privacy_blur_snapshot(self) -> PrivacyBlurSnapshot:
         return self._privacy_blur_signal.snapshot()
+
+    def sedentary_reminder_snapshot(self) -> SedentaryReminderSnapshot:
+        return self._sedentary_reminder_signal.snapshot()
+
+    def clear_sedentary_reminder(self) -> None:
+        self._sedentary_reminder_signal.clear()
 
     def dismiss_privacy_blur(
         self,
@@ -314,6 +325,7 @@ class MonitoringService:
 
     def pause_async(self) -> None:
         self._privacy_blur_signal.clear()
+        self._sedentary_reminder_signal.clear()
         self._update_status("pausing", "正在暂停并释放摄像头")
         self._debug_frame_buffer.clear(
             "监控正在暂停 · 调试画面已清空"
@@ -328,6 +340,7 @@ class MonitoringService:
     def pause_blocking(self) -> None:
         """Stop monitoring synchronously from a non-UI worker thread."""
         self._privacy_blur_signal.clear()
+        self._sedentary_reminder_signal.clear()
         self._update_status("pausing", "正在暂停并释放摄像头")
         self._debug_frame_buffer.clear(
             "监控正在暂停 · 调试画面已清空"
@@ -336,6 +349,7 @@ class MonitoringService:
 
     def restart_async(self) -> None:
         self._privacy_blur_signal.clear()
+        self._sedentary_reminder_signal.clear()
         self._update_status("starting", "正在应用设置并重启监控")
         self._debug_frame_buffer.clear(
             "正在重新启动监控 · 调试画面已清空"
@@ -372,6 +386,7 @@ class MonitoringService:
 
             if not should_run:
                 self._privacy_blur_signal.clear()
+                self._sedentary_reminder_signal.clear()
                 self._update_status("paused", "监控已暂停 · 摄像头已释放")
                 self._debug_frame_buffer.clear(
                     "监控已暂停 · 调试画面已清空"
@@ -407,6 +422,7 @@ class MonitoringService:
             status_callback=self._update_status,
             debug_frame_buffer=self._debug_frame_buffer,
             privacy_blur_signal=self._privacy_blur_signal,
+            sedentary_reminder_signal=self._sedentary_reminder_signal,
         )
         with self._state_lock:
             if self._thread is threading.current_thread():
@@ -426,6 +442,7 @@ class MonitoringService:
             if worker is not None and worker.is_alive():
                 worker.join(timeout=30.0)
             self._privacy_blur_signal.clear()
+            self._sedentary_reminder_signal.clear()
             self._debug_frame_buffer.clear(
                 "程序正在退出 · 调试画面已清空"
             )
@@ -464,6 +481,13 @@ class TrayApplication:
         self._lock_warning_window: Optional[tk.Toplevel] = None
         self._lock_warning_detail_variable: Optional[tk.StringVar] = None
         self._lock_warning_opacity = 0.0
+        self._sedentary_reminder_window: Optional[tk.Toplevel] = None
+        self._sedentary_reminder_detail_variable: Optional[
+            tk.StringVar
+        ] = None
+        self._sedentary_reminder_last_sequence = 0
+        self._sedentary_reminder_started_at: Optional[float] = None
+        self._sedentary_reminder_opacity = 0.0
         self._privacy_blur_overlay = DwmPrivacyOverlay(
             config.PRIVACY_ACRYLIC_STRENGTH_PERCENT
         )
@@ -661,6 +685,7 @@ class TrayApplication:
         self._service.start_async()
         self._root.after(1000, self._refresh_tray_menu)
         self._root.after(100, self._refresh_lock_warning)
+        self._root.after(50, self._refresh_sedentary_reminder)
         self._root.after(80, self._refresh_privacy_blur)
         self._root.after(50, self._poll_privacy_hotkey)
         self._root.after(250, self._poll_debug_signal)
@@ -824,6 +849,157 @@ class TrayApplication:
             if schedule_next:
                 try:
                     self._root.after(80, self._refresh_lock_warning)
+                except tk.TclError:
+                    pass
+
+    def _ensure_sedentary_reminder_window(self) -> tk.Toplevel:
+        window = self._sedentary_reminder_window
+        if window is not None and window.winfo_exists():
+            return window
+
+        window = tk.Toplevel(self._root)
+        self._sedentary_reminder_window = window
+        window.withdraw()
+        window.overrideredirect(True)
+        window.attributes("-topmost", True)
+        window.attributes("-alpha", 0.0)
+        window.configure(background="#0F172A")
+
+        width = 500
+        height = 96
+        x = max(16, (window.winfo_screenwidth() - width) // 2)
+        window.geometry(f"{width}x{height}+{x}+36")
+
+        card = tk.Frame(
+            window,
+            background="#0F172A",
+            highlightbackground="#1E6A78",
+            highlightthickness=1,
+            padx=22,
+            pady=14,
+        )
+        card.pack(fill="both", expand=True)
+        accent = tk.Frame(card, background="#25D4E8", width=4)
+        accent.pack(side="left", fill="y", padx=(0, 18))
+        content = tk.Frame(card, background="#0F172A")
+        content.pack(side="left", fill="both", expand=True)
+        tk.Label(
+            content,
+            text="久坐提醒",
+            background="#0F172A",
+            foreground="#F8FAFC",
+            font=("Microsoft YaHei UI", 15, "bold"),
+            anchor="w",
+        ).pack(fill="x")
+        self._sedentary_reminder_detail_variable = tk.StringVar(
+            value="已经连续坐了 30 分钟，请注意起身活动"
+        )
+        tk.Label(
+            content,
+            textvariable=self._sedentary_reminder_detail_variable,
+            background="#0F172A",
+            foreground="#67E8F9",
+            font=("Microsoft YaHei UI", 11, "bold"),
+            anchor="w",
+        ).pack(fill="x", pady=(4, 0))
+
+        window.update_idletasks()
+        try:
+            _configure_overlay_window(window)
+        except OSError as exc:
+            LOGGER.warning(
+                "Unable to configure non-activating sedentary reminder: %s",
+                exc,
+            )
+        window.withdraw()
+        return window
+
+    def _hide_sedentary_reminder(self) -> None:
+        self._sedentary_reminder_started_at = None
+        self._sedentary_reminder_opacity = 0.0
+        window = self._sedentary_reminder_window
+        if window is not None and window.winfo_exists():
+            window.attributes("-alpha", 0.0)
+            window.withdraw()
+
+    def _refresh_sedentary_reminder(
+        self,
+        schedule_next: bool = True,
+    ) -> None:
+        try:
+            snapshot = self._service.sedentary_reminder_snapshot()
+            now = time.monotonic()
+            if snapshot.sequence != self._sedentary_reminder_last_sequence:
+                self._sedentary_reminder_last_sequence = snapshot.sequence
+                if (
+                    snapshot.sequence > 0
+                    and snapshot.triggered_at is not None
+                    and snapshot.detail
+                ):
+                    window = self._ensure_sedentary_reminder_window()
+                    if self._sedentary_reminder_detail_variable is not None:
+                        self._sedentary_reminder_detail_variable.set(
+                            snapshot.detail
+                        )
+                    self._sedentary_reminder_started_at = now
+                    self._sedentary_reminder_opacity = 0.16
+                    window.deiconify()
+                    try:
+                        _configure_overlay_window(window)
+                    except OSError as exc:
+                        LOGGER.warning(
+                            "Unable to show sedentary reminder without "
+                            "focus: %s",
+                            exc,
+                        )
+                else:
+                    self._hide_sedentary_reminder()
+
+            window = self._sedentary_reminder_window
+            started_at = self._sedentary_reminder_started_at
+            if (
+                window is not None
+                and window.winfo_exists()
+                and started_at is not None
+            ):
+                elapsed = max(0.0, now - started_at)
+                duration = config.SEDENTARY_REMINDER_DISPLAY_SECONDS
+                fade_in_seconds = min(0.18, duration / 3.0)
+                fade_out_seconds = min(0.22, duration / 3.0)
+                if elapsed >= duration:
+                    self._sedentary_reminder_opacity = 0.0
+                    self._sedentary_reminder_started_at = None
+                    window.attributes("-alpha", 0.0)
+                    window.withdraw()
+                else:
+                    if elapsed < fade_in_seconds:
+                        opacity = 0.94 * max(
+                            0.17,
+                            elapsed / fade_in_seconds,
+                        )
+                    elif elapsed > duration - fade_out_seconds:
+                        opacity = 0.94 * (
+                            (duration - elapsed) / fade_out_seconds
+                        )
+                    else:
+                        opacity = 0.94
+                    self._sedentary_reminder_opacity = max(
+                        0.0,
+                        min(0.94, opacity),
+                    )
+                    window.attributes(
+                        "-alpha",
+                        self._sedentary_reminder_opacity,
+                    )
+        except tk.TclError:
+            return
+        finally:
+            if schedule_next:
+                try:
+                    self._root.after(
+                        50,
+                        self._refresh_sedentary_reminder,
+                    )
                 except tk.TclError:
                     pass
 
@@ -2717,6 +2893,9 @@ class TrayApplication:
             "privacy_blur_hotkey": tk.StringVar(
                 value=settings.privacy_blur_hotkey
             ),
+            "sedentary_reminder_enabled": tk.BooleanVar(
+                value=settings.sedentary_reminder_enabled
+            ),
             "detection_interval_seconds": tk.StringVar(
                 value=str(settings.detection_interval_seconds)
             ),
@@ -2821,6 +3000,32 @@ class TrayApplication:
             text="也可从右下角托盘图标的右键菜单随时开关",
             foreground="#666666",
         ).pack(anchor="w", pady=(4, 0))
+
+        sedentary_controls = ttk.LabelFrame(
+            content,
+            text="久坐提醒",
+            padding=10,
+        )
+        sedentary_controls.grid(
+            row=len(rows) + 1,
+            column=0,
+            columnspan=2,
+            pady=(10, 4),
+            sticky="ew",
+        )
+        ttk.Checkbutton(
+            sedentary_controls,
+            text=(
+                "启用久坐提醒：连续在场每满 30 分钟提示一次，"
+                "离开 30 秒后重新计时"
+            ),
+            variable=variables["sedentary_reminder_enabled"],
+        ).pack(anchor="w")
+        ttk.Label(
+            sedentary_controls,
+            text="提醒沿用锁屏预告样式，显示 1 秒且不会抢占当前窗口焦点",
+            foreground="#666666",
+        ).pack(anchor="w", pady=(4, 0))
         hotkey_row = ttk.Frame(privacy_controls)
         hotkey_row.pack(fill="x", pady=(10, 0))
         ttk.Label(
@@ -2871,7 +3076,7 @@ class TrayApplication:
             padding=10,
         )
         identity_controls.grid(
-            row=len(rows) + 1,
+            row=len(rows) + 2,
             column=0,
             columnspan=2,
             pady=(10, 4),
@@ -2919,7 +3124,7 @@ class TrayApplication:
             wraplength=560,
             justify="left",
         ).grid(
-            row=len(rows) + 2,
+            row=len(rows) + 3,
             column=0,
             columnspan=2,
             pady=(10, 8),
@@ -2928,7 +3133,7 @@ class TrayApplication:
 
         buttons = ttk.Frame(content)
         buttons.grid(
-            row=len(rows) + 3,
+            row=len(rows) + 4,
             column=0,
             columnspan=2,
             pady=(8, 0),
@@ -3003,6 +3208,9 @@ class TrayApplication:
                     ].get(),
                     "privacy_blur_hotkey": variables[
                         "privacy_blur_hotkey"
+                    ].get(),
+                    "sedentary_reminder_enabled": variables[
+                        "sedentary_reminder_enabled"
                     ].get(),
                     "detection_interval_seconds": variables[
                         "detection_interval_seconds"
@@ -3203,6 +3411,50 @@ def _run_self_test() -> int:
         if warning_window.winfo_viewable():
             raise RuntimeError("Cancelled lock warning remained visible")
 
+        sedentary_detail = (
+            "已经连续坐了 30 分钟，请注意起身活动"
+        )
+        test_application._service._sedentary_reminder_signal.trigger(
+            1800.0,
+            sedentary_detail,
+        )
+        test_application._refresh_sedentary_reminder(schedule_next=False)
+        test_application._root.update_idletasks()
+        sedentary_window = test_application._sedentary_reminder_window
+        if (
+            sedentary_window is None
+            or not sedentary_window.winfo_exists()
+            or not sedentary_window.winfo_viewable()
+            or test_application._sedentary_reminder_opacity <= 0
+        ):
+            raise RuntimeError("Sedentary reminder overlay could not be shown")
+        sedentary_style = _get_window_long_ptr(
+            _native_top_level_handle(sedentary_window),
+            GWL_EXSTYLE,
+        )
+        if (
+            not sedentary_style & WS_EX_TOOLWINDOW
+            or not sedentary_style & WS_EX_NOACTIVATE
+            or sedentary_style & WS_EX_APPWINDOW
+        ):
+            raise RuntimeError(
+                "Sedentary reminder can steal focus or enter the taskbar"
+            )
+        if (
+            test_application._sedentary_reminder_detail_variable is None
+            or test_application._sedentary_reminder_detail_variable.get()
+            != sedentary_detail
+        ):
+            raise RuntimeError("Sedentary duration was not rendered")
+        test_application._sedentary_reminder_started_at = (
+            time.monotonic()
+            - config.SEDENTARY_REMINDER_DISPLAY_SECONDS
+        )
+        test_application._refresh_sedentary_reminder(schedule_next=False)
+        test_application._root.update_idletasks()
+        if sedentary_window.winfo_viewable():
+            raise RuntimeError("Expired sedentary reminder remained visible")
+
         privacy_diagnostics = (
             test_application._privacy_blur_overlay.self_test()
         )
@@ -3347,6 +3599,12 @@ def _run_self_test() -> int:
             if isinstance(widget, ttk.Checkbutton)
             and "多人脸隐私模糊" in str(widget.cget("text"))
         ]
+        sedentary_switches = [
+            widget
+            for widget in settings_widgets
+            if isinstance(widget, ttk.Checkbutton)
+            and "启用久坐提醒" in str(widget.cget("text"))
+        ]
         hotkey_label_found = any(
             isinstance(widget, ttk.Label)
             and widget.cget("text") == "手动毛玻璃快捷键"
@@ -3357,11 +3615,12 @@ def _run_self_test() -> int:
             or len(camera_mode_selectors) != 1
             or not registration_button_found
             or len(privacy_switches) != 1
+            or len(sedentary_switches) != 1
             or not hotkey_label_found
         ):
             raise RuntimeError(
-                "Camera mode, registered-face, privacy, or hotkey controls "
-                "were not initialized"
+                "Camera mode, registered-face, privacy, sedentary, or "
+                "hotkey controls were not initialized"
             )
         camera_mode_selectors[0].set("键鼠空闲后监测")
         test_application._root.update_idletasks()
