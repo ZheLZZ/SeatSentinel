@@ -43,6 +43,11 @@ from privacy_blur import (
     PrivacyBlurSignal,
     SecondPersonPrivacyGuard,
 )
+from sedentary_reminder import (
+    SedentaryReminderSignal,
+    SedentaryTracker,
+    format_sedentary_duration,
+)
 from single_instance import DEBUG_WINDOW_EVENT_NAME, MUTEX_NAME
 from user_settings import AppSettings, SettingsError, SettingsStore
 
@@ -51,7 +56,7 @@ class ApplicationDefaultsTests(unittest.TestCase):
     def test_title_and_lock_timeouts(self) -> None:
         settings = AppSettings.defaults()
         self.assertEqual(config.APPLICATION_TITLE, "SeatSentinel")
-        self.assertEqual(config.APPLICATION_VERSION, "0.2.8-beta")
+        self.assertEqual(config.APPLICATION_VERSION, "0.2.9-beta")
         self.assertEqual(config.USER_DATA_DIRECTORY.name, "SeatSentinel")
         self.assertIn("SeatSentinel", MUTEX_NAME)
         self.assertIn("SeatSentinel", DEBUG_WINDOW_EVENT_NAME)
@@ -61,9 +66,19 @@ class ApplicationDefaultsTests(unittest.TestCase):
         self.assertEqual(settings.camera_activation_idle_seconds, 20.0)
         self.assertTrue(settings.privacy_blur_enabled)
         self.assertEqual(settings.privacy_blur_hotkey, "Alt+B")
+        self.assertTrue(settings.sedentary_reminder_enabled)
         self.assertEqual(settings.face_absence_timeout_seconds, 60)
         self.assertEqual(settings.input_idle_timeout_seconds, 60)
         self.assertEqual(config.LOCK_WARNING_SECONDS, 5.0)
+        self.assertEqual(
+            config.SEDENTARY_REMINDER_INTERVAL_SECONDS,
+            1800.0,
+        )
+        self.assertEqual(
+            config.SEDENTARY_LEAVE_CONFIRMATION_SECONDS,
+            30.0,
+        )
+        self.assertEqual(config.SEDENTARY_REMINDER_DISPLAY_SECONDS, 1.0)
         self.assertEqual(config.SECOND_PERSON_AUTO_DISMISS_SECONDS, 3.0)
         self.assertEqual(config.PRIVACY_ACRYLIC_STRENGTH_PERCENT, 96)
         self.assertEqual(os.environ.get("DO_NOT_TRACK"), "1")
@@ -115,6 +130,24 @@ class ApplicationDefaultsTests(unittest.TestCase):
             self.assertFalse(
                 json.loads(path.read_text(encoding="utf-8"))[
                     "privacy_blur_enabled"
+                ]
+            )
+
+    def test_sedentary_reminder_switch_is_persisted(self) -> None:
+        disabled = AppSettings.from_mapping(
+            {"sedentary_reminder_enabled": "false"}
+        )
+        self.assertFalse(disabled.sedentary_reminder_enabled)
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory) / "settings.json"
+            store = SettingsStore(path=path)
+            store.save(disabled)
+            loaded = store.load()
+            self.assertFalse(loaded.sedentary_reminder_enabled)
+            self.assertFalse(
+                json.loads(path.read_text(encoding="utf-8"))[
+                    "sedentary_reminder_enabled"
                 ]
             )
 
@@ -189,6 +222,7 @@ class ApplicationDefaultsTests(unittest.TestCase):
                         "CONTINUOUS",
                     )
                     self.assertTrue(new_path.is_file())
+                    self.assertTrue(settings.sedentary_reminder_enabled)
 
 
 class DebugCameraSelectorTests(unittest.TestCase):
@@ -612,6 +646,54 @@ class LockWarningDecisionTests(unittest.TestCase):
         self.assertIsNone(started_at)
         self.assertIsNone(remaining)
         self.assertFalse(should_lock)
+
+
+class SedentaryReminderDecisionTests(unittest.TestCase):
+    def test_reminds_at_each_thirty_minute_boundary(self) -> None:
+        tracker = SedentaryTracker(1800.0, 30.0)
+
+        self.assertIsNone(tracker.observe(True, timestamp=100.0))
+        self.assertIsNone(tracker.observe(True, timestamp=1899.9))
+        self.assertEqual(tracker.observe(True, timestamp=1900.0), 1800.0)
+        self.assertIsNone(tracker.observe(True, timestamp=1900.5))
+        self.assertEqual(tracker.observe(True, timestamp=3700.0), 3600.0)
+
+    def test_confirmed_leave_resets_but_short_gap_does_not(self) -> None:
+        tracker = SedentaryTracker(1800.0, 30.0)
+
+        tracker.observe(True, timestamp=0.0)
+        tracker.observe(False, timestamp=900.0)
+        tracker.observe(True, timestamp=929.9)
+        self.assertEqual(tracker.observe(True, timestamp=1800.0), 1800.0)
+
+        tracker.observe(None, timestamp=2000.0)
+        tracker.observe(None, timestamp=2030.0)
+        self.assertIsNone(tracker.observe(True, timestamp=2031.0))
+        self.assertIsNone(tracker.observe(True, timestamp=3830.9))
+        self.assertEqual(tracker.observe(True, timestamp=3831.0), 1800.0)
+
+    def test_signal_and_duration_text_preserve_elapsed_time(self) -> None:
+        signal = SedentaryReminderSignal()
+        signal.trigger(
+            5400.0,
+            "已经连续坐了 1 小时 30 分钟，请注意起身活动",
+            timestamp=25.0,
+        )
+
+        snapshot = signal.snapshot()
+        self.assertEqual(snapshot.sequence, 1)
+        self.assertEqual(snapshot.seated_seconds, 5400.0)
+        self.assertEqual(snapshot.triggered_at, 25.0)
+        self.assertEqual(format_sedentary_duration(1800.0), "30 分钟")
+        self.assertEqual(
+            format_sedentary_duration(5400.0),
+            "1 小时 30 分钟",
+        )
+        signal.clear()
+        cleared = signal.snapshot()
+        self.assertEqual(cleared.sequence, 2)
+        self.assertIsNone(cleared.triggered_at)
+        self.assertEqual(cleared.detail, "")
 
 
 class PresenceDecisionTests(unittest.TestCase):
