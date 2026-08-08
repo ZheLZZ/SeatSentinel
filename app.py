@@ -2868,11 +2868,68 @@ class TrayApplication:
         window = tk.Toplevel(self._root)
         self._settings_window = window
         window.title(f"{config.APPLICATION_TITLE} · 设置")
-        window.resizable(False, False)
+        window.resizable(False, True)
         window.protocol("WM_DELETE_WINDOW", window.destroy)
+        window.columnconfigure(0, weight=1)
+        window.rowconfigure(0, weight=1)
 
-        content = ttk.Frame(window, padding=16)
-        content.grid(row=0, column=0, sticky="nsew")
+        scroll_container = ttk.Frame(window)
+        scroll_container.grid(row=0, column=0, sticky="nsew")
+        scroll_container.columnconfigure(0, weight=1)
+        scroll_container.rowconfigure(0, weight=1)
+
+        frame_background = ttk.Style(window).lookup(
+            "TFrame",
+            "background",
+        )
+        settings_canvas = tk.Canvas(
+            scroll_container,
+            background=frame_background or "#f0f0f0",
+            borderwidth=0,
+            highlightthickness=0,
+            takefocus=False,
+        )
+        settings_scrollbar = ttk.Scrollbar(
+            scroll_container,
+            orient="vertical",
+            command=settings_canvas.yview,
+        )
+        settings_canvas.configure(
+            yscrollcommand=settings_scrollbar.set,
+        )
+        settings_canvas.grid(row=0, column=0, sticky="nsew")
+        settings_scrollbar.grid(row=0, column=1, sticky="ns")
+
+        content = ttk.Frame(settings_canvas, padding=16)
+        content.columnconfigure(1, weight=1)
+        content_window = settings_canvas.create_window(
+            (0, 0),
+            window=content,
+            anchor="nw",
+        )
+
+        def update_scroll_region(_event: tk.Event[tk.Misc]) -> None:
+            bounds = settings_canvas.bbox("all")
+            if bounds is not None:
+                settings_canvas.configure(scrollregion=bounds)
+
+        def stretch_scroll_content(event: tk.Event[tk.Misc]) -> None:
+            settings_canvas.itemconfigure(
+                content_window,
+                width=event.width,
+            )
+
+        def scroll_settings(event: tk.Event[tk.Misc]) -> str:
+            delta = int(getattr(event, "delta", 0))
+            if delta:
+                direction = -1 if delta > 0 else 1
+                units = max(1, abs(delta) // 120)
+                settings_canvas.yview_scroll(direction * units, "units")
+            return "break"
+
+        content.bind("<Configure>", update_scroll_region)
+        settings_canvas.bind("<Configure>", stretch_scroll_content)
+        window.bind("<MouseWheel>", scroll_settings)
 
         variables = {
             "camera_name": tk.StringVar(value=settings.camera_name),
@@ -3131,19 +3188,14 @@ class TrayApplication:
             sticky="w",
         )
 
-        buttons = ttk.Frame(content)
-        buttons.grid(
-            row=len(rows) + 4,
-            column=0,
-            columnspan=2,
-            pady=(8, 0),
-            sticky="e",
-        )
+        buttons = ttk.Frame(window, padding=(16, 10, 24, 16))
+        buttons.grid(row=1, column=0, sticky="ew")
+        buttons.columnconfigure(0, weight=1)
         ttk.Button(
             buttons,
             text="取消",
             command=window.destroy,
-        ).grid(row=0, column=0, padx=(0, 8))
+        ).grid(row=0, column=1, padx=(0, 8))
         ttk.Button(
             buttons,
             text="保存并应用",
@@ -3152,18 +3204,48 @@ class TrayApplication:
                 window,
                 settings,
             ),
-        ).grid(row=0, column=1)
+        ).grid(row=0, column=2)
+
+        def bind_scroll_wheel(widget: tk.Misc) -> None:
+            widget.bind("<MouseWheel>", scroll_settings)
+            for child in widget.winfo_children():
+                bind_scroll_wheel(child)
+
+        bind_scroll_wheel(scroll_container)
+        bind_scroll_wheel(buttons)
 
         window.update_idletasks()
+        screen_width = window.winfo_screenwidth()
+        screen_height = window.winfo_screenheight()
+        content_width = content.winfo_reqwidth()
+        content_height = content.winfo_reqheight()
+        buttons_height = buttons.winfo_reqheight()
+        max_window_height = max(200, screen_height - 96)
+        viewport_height = min(
+            content_height,
+            max(120, max_window_height - buttons_height),
+        )
+        settings_canvas.configure(
+            width=content_width,
+            height=viewport_height,
+        )
+        window.update_idletasks()
+        window_width = window.winfo_reqwidth()
+        window_height = min(window.winfo_reqheight(), max_window_height)
+        window.minsize(
+            window_width,
+            min(window_height, 420),
+        )
+        window.maxsize(window_width, max_window_height)
         x = max(
             0,
-            (window.winfo_screenwidth() - window.winfo_width()) // 2,
+            (screen_width - window_width) // 2,
         )
         y = max(
             0,
-            (window.winfo_screenheight() - window.winfo_height()) // 3,
+            (screen_height - window_height) // 3,
         )
-        window.geometry(f"+{x}+{y}")
+        window.geometry(f"{window_width}x{window_height}+{x}+{y}")
         window.deiconify()
         window.lift()
         window.focus_force()
@@ -3610,6 +3692,28 @@ def _run_self_test() -> int:
             and widget.cget("text") == "手动毛玻璃快捷键"
             for widget in settings_widgets
         )
+        settings_canvases = [
+            widget
+            for widget in settings_widgets
+            if isinstance(widget, tk.Canvas)
+        ]
+        settings_scrollbars = [
+            widget
+            for widget in settings_widgets
+            if isinstance(widget, ttk.Scrollbar)
+            and str(widget.cget("orient")) == "vertical"
+        ]
+        save_buttons = [
+            widget
+            for widget in settings_widgets
+            if isinstance(widget, ttk.Button)
+            and widget.cget("text") == "保存并应用"
+        ]
+        fixed_save_button = (
+            len(save_buttons) == 1
+            and isinstance(save_buttons[0].master, ttk.Frame)
+            and save_buttons[0].master.master is settings_window
+        )
         if (
             not mode_selector_found
             or len(camera_mode_selectors) != 1
@@ -3617,10 +3721,25 @@ def _run_self_test() -> int:
             or len(privacy_switches) != 1
             or len(sedentary_switches) != 1
             or not hotkey_label_found
+            or len(settings_canvases) != 1
+            or len(settings_scrollbars) != 1
+            or not settings_canvases[0].cget("yscrollcommand")
+            or not settings_scrollbars[0].cget("command")
+            or not fixed_save_button
         ):
             raise RuntimeError(
                 "Camera mode, registered-face, privacy, sedentary, or "
-                "hotkey controls were not initialized"
+                "hotkey controls and settings scrolling were not initialized"
+            )
+        camera_mode_before_wheel = camera_mode_selectors[0].get()
+        camera_mode_selectors[0].event_generate(
+            "<MouseWheel>",
+            delta=-120,
+        )
+        test_application._root.update_idletasks()
+        if camera_mode_selectors[0].get() != camera_mode_before_wheel:
+            raise RuntimeError(
+                "Settings scrolling unexpectedly changed a combobox value"
             )
         camera_mode_selectors[0].set("键鼠空闲后监测")
         test_application._root.update_idletasks()
