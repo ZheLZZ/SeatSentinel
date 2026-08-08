@@ -33,6 +33,44 @@ _MODIFIER_ALIASES = {
     "SUPER": ("Win", MOD_WIN),
 }
 _MODIFIER_ORDER = ("Ctrl", "Alt", "Shift", "Win")
+_TK_MODIFIER_KEYSYMS = {
+    "CONTROL_L": "Ctrl",
+    "CONTROL_R": "Ctrl",
+    "ALT_L": "Alt",
+    "ALT_R": "Alt",
+    "META_L": "Win",
+    "META_R": "Win",
+    "SUPER_L": "Win",
+    "SUPER_R": "Win",
+    "WIN_L": "Win",
+    "WIN_R": "Win",
+    "SHIFT_L": "Shift",
+    "SHIFT_R": "Shift",
+}
+_TK_STATE_MODIFIERS = (
+    (0x0004, "Ctrl"),
+    (0x0008, "Alt"),
+    (0x0001, "Shift"),
+    (0x0040, "Win"),
+)
+_TK_NAMED_KEYSYMS = {
+    "SPACE": "Space",
+    "TAB": "Tab",
+    "RETURN": "Enter",
+    "KP_ENTER": "Enter",
+    "ESCAPE": "Esc",
+    "BACKSPACE": "Backspace",
+    "INSERT": "Insert",
+    "DELETE": "Delete",
+    "HOME": "Home",
+    "END": "End",
+    "PRIOR": "PageUp",
+    "NEXT": "PageDown",
+    "LEFT": "Left",
+    "UP": "Up",
+    "RIGHT": "Right",
+    "DOWN": "Down",
+}
 _NAMED_KEYS = {
     "SPACE": ("Space", 0x20),
     "TAB": ("Tab", 0x09),
@@ -151,6 +189,63 @@ def normalize_hotkey(value: str) -> str:
     """Return the stable display form stored in settings."""
 
     return parse_hotkey(value).display
+
+
+def modifier_name_from_tk_keysym(keysym: str) -> Optional[str]:
+    """Return the canonical modifier represented by a Tk key symbol."""
+    return _TK_MODIFIER_KEYSYMS.get(str(keysym).strip().upper())
+
+
+def modifier_names_from_tk_state(state: int) -> tuple[str, ...]:
+    """Decode the Windows/Tk modifier mask in stable display order."""
+    active = {
+        name for mask, name in _TK_STATE_MODIFIERS if int(state) & mask
+    }
+    return tuple(name for name in _MODIFIER_ORDER if name in active)
+
+
+def hotkey_from_tk_key_event(
+    keysym: str,
+    keycode: int,
+    state: int,
+    pressed_modifiers: tuple[str, ...] = (),
+) -> str:
+    """Build a normalized hotkey from one non-modifier Tk key event."""
+    normalized_keysym = str(keysym).strip().upper()
+    key_name: Optional[str] = None
+
+    # On Windows, Tk's keycode is the virtual-key value. Prefer it for
+    # letters and digits so Shift+1 records Shift+1 instead of ``exclam``.
+    numeric_keycode = int(keycode)
+    if 0x30 <= numeric_keycode <= 0x39:
+        key_name = chr(numeric_keycode)
+    elif 0x41 <= numeric_keycode <= 0x5A:
+        key_name = chr(numeric_keycode)
+    elif len(normalized_keysym) == 1 and (
+        "A" <= normalized_keysym <= "Z"
+        or "0" <= normalized_keysym <= "9"
+    ):
+        key_name = normalized_keysym
+    elif (
+        normalized_keysym.startswith("F")
+        and normalized_keysym[1:].isdigit()
+        and 1 <= int(normalized_keysym[1:]) <= 24
+    ):
+        key_name = normalized_keysym
+    else:
+        key_name = _TK_NAMED_KEYSYMS.get(normalized_keysym)
+
+    if key_name is None:
+        raise ValueError(
+            "暂不支持该按键；请选择字母、单个数字、F1-F24 或常用功能键"
+        )
+
+    active_modifiers = set(modifier_names_from_tk_state(state))
+    active_modifiers.update(pressed_modifiers)
+    ordered_modifiers = [
+        name for name in _MODIFIER_ORDER if name in active_modifiers
+    ]
+    return normalize_hotkey("+".join((*ordered_modifiers, key_name)))
 
 
 class WindowsGlobalHotkey:

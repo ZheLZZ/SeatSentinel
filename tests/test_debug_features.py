@@ -9,6 +9,7 @@ import tempfile
 import unittest
 from dataclasses import replace
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 
@@ -28,12 +29,19 @@ from face_identity import (
     FaceTemplateError,
     FaceTemplateStore,
 )
-from global_hotkey import normalize_hotkey, parse_hotkey
+from global_hotkey import (
+    hotkey_from_tk_key_event,
+    modifier_name_from_tk_keysym,
+    modifier_names_from_tk_state,
+    normalize_hotkey,
+    parse_hotkey,
+)
 from main import (
     MonitorOutcome,
     camera_should_be_active,
     evaluate_lock_warning,
     evaluate_presence,
+    evaluate_presence_auto_standby,
     monitor_until_session_pause,
     open_camera_when_session_ready,
     wait_for_camera_activation,
@@ -56,7 +64,7 @@ class ApplicationDefaultsTests(unittest.TestCase):
     def test_title_and_lock_timeouts(self) -> None:
         settings = AppSettings.defaults()
         self.assertEqual(config.APPLICATION_TITLE, "SeatSentinel")
-        self.assertEqual(config.APPLICATION_VERSION, "0.2.9-beta")
+        self.assertEqual(config.APPLICATION_VERSION, "0.2.10-beta")
         self.assertEqual(config.USER_DATA_DIRECTORY.name, "SeatSentinel")
         self.assertIn("SeatSentinel", MUTEX_NAME)
         self.assertIn("SeatSentinel", DEBUG_WINDOW_EVENT_NAME)
@@ -64,6 +72,14 @@ class ApplicationDefaultsTests(unittest.TestCase):
         self.assertEqual(settings.presence_mode, "ANY_FACE")
         self.assertEqual(settings.camera_monitoring_mode, "CONTINUOUS")
         self.assertEqual(settings.camera_activation_idle_seconds, 20.0)
+        self.assertEqual(
+            settings.camera_presence_auto_standby_seconds,
+            10.0,
+        )
+        self.assertEqual(
+            settings.camera_presence_recheck_interval_seconds,
+            60.0,
+        )
         self.assertTrue(settings.privacy_blur_enabled)
         self.assertEqual(settings.privacy_blur_hotkey, "Alt+B")
         self.assertTrue(settings.sedentary_reminder_enabled)
@@ -108,6 +124,44 @@ class ApplicationDefaultsTests(unittest.TestCase):
                     AppSettings.from_mapping(
                         {"privacy_blur_hotkey": invalid}
                     )
+
+    def test_hotkey_capture_supports_letters_digits_and_function_keys(
+        self,
+    ) -> None:
+        self.assertEqual(
+            hotkey_from_tk_key_event("1", 0x31, 0x0008),
+            "Alt+1",
+        )
+        self.assertEqual(
+            hotkey_from_tk_key_event("k", 0x4B, 0x0004),
+            "Ctrl+K",
+        )
+        self.assertEqual(
+            hotkey_from_tk_key_event(
+                "F8",
+                0x77,
+                0,
+                ("Ctrl", "Shift"),
+            ),
+            "Ctrl+Shift+F8",
+        )
+        self.assertEqual(
+            hotkey_from_tk_key_event("exclam", 0x31, 0x0001),
+            "Shift+1",
+        )
+
+    def test_hotkey_capture_requires_a_modifier(self) -> None:
+        with self.assertRaisesRegex(ValueError, "至少需要"):
+            hotkey_from_tk_key_event("B", 0x42, 0)
+
+    def test_hotkey_capture_recognizes_modifier_key_events(self) -> None:
+        self.assertEqual(modifier_name_from_tk_keysym("Control_L"), "Ctrl")
+        self.assertEqual(modifier_name_from_tk_keysym("Alt_R"), "Alt")
+        self.assertEqual(modifier_name_from_tk_keysym("Super_L"), "Win")
+        self.assertEqual(
+            modifier_names_from_tk_state(0x0001 | 0x0004),
+            ("Ctrl", "Shift"),
+        )
 
     def test_registered_face_mode_setting_is_normalized(self) -> None:
         settings = AppSettings.from_mapping(
@@ -156,6 +210,8 @@ class ApplicationDefaultsTests(unittest.TestCase):
             {
                 "camera_monitoring_mode": "idle_triggered",
                 "camera_activation_idle_seconds": 20,
+                "camera_presence_auto_standby_seconds": 10,
+                "camera_presence_recheck_interval_seconds": 60,
                 "privacy_blur_enabled": False,
             }
         )
@@ -164,6 +220,14 @@ class ApplicationDefaultsTests(unittest.TestCase):
             "IDLE_TRIGGERED",
         )
         self.assertEqual(settings.camera_activation_idle_seconds, 20.0)
+        self.assertEqual(
+            settings.camera_presence_auto_standby_seconds,
+            10.0,
+        )
+        self.assertEqual(
+            settings.camera_presence_recheck_interval_seconds,
+            60.0,
+        )
 
     def test_idle_triggered_mode_disables_privacy_blur(self) -> None:
         settings = AppSettings.from_mapping(
@@ -598,6 +662,191 @@ class CameraActivationDecisionTests(unittest.TestCase):
 
         self.assertIs(outcome, MonitorOutcome.INPUT_ACTIVE)
         self.assertEqual(camera.read_count, 0)
+
+    def test_presence_standby_waits_until_recheck_deadline(self) -> None:
+        class FakeActivityMonitor:
+            def seconds_since_last_input(self) -> float:
+                return 60.0
+
+        class FakeSessionMonitor:
+            def is_locked(self) -> bool:
+                return False
+
+        previous_mode = config.CAMERA_MONITORING_MODE
+        previous_activation_seconds = (
+            config.CAMERA_ACTIVATION_IDLE_SECONDS
+        )
+        previous_poll_seconds = config.SESSION_STATE_POLL_INTERVAL_SECONDS
+        try:
+            config.CAMERA_MONITORING_MODE = "IDLE_TRIGGERED"
+            config.CAMERA_ACTIVATION_IDLE_SECONDS = 20.0
+            config.SESSION_STATE_POLL_INTERVAL_SECONDS = 0.0
+            with patch(
+                "main.time.monotonic",
+                side_effect=(100.0, 105.0),
+            ):
+                ready = wait_for_camera_activation(
+                    FakeActivityMonitor(),  # type: ignore[arg-type]
+                    FakeSessionMonitor(),  # type: ignore[arg-type]
+                    presence_recheck_not_before=105.0,
+                )
+        finally:
+            config.CAMERA_MONITORING_MODE = previous_mode
+            config.CAMERA_ACTIVATION_IDLE_SECONDS = (
+                previous_activation_seconds
+            )
+            config.SESSION_STATE_POLL_INTERVAL_SECONDS = (
+                previous_poll_seconds
+            )
+
+        self.assertTrue(ready)
+
+    def test_real_input_cancels_presence_recheck_delay(self) -> None:
+        class FakeActivityMonitor:
+            def __init__(self) -> None:
+                self.values = iter((0.0, 20.0))
+
+            def seconds_since_last_input(self) -> float:
+                return next(self.values)
+
+        class FakeSessionMonitor:
+            def is_locked(self) -> bool:
+                return False
+
+        previous_mode = config.CAMERA_MONITORING_MODE
+        previous_activation_seconds = (
+            config.CAMERA_ACTIVATION_IDLE_SECONDS
+        )
+        previous_poll_seconds = config.SESSION_STATE_POLL_INTERVAL_SECONDS
+        try:
+            config.CAMERA_MONITORING_MODE = "IDLE_TRIGGERED"
+            config.CAMERA_ACTIVATION_IDLE_SECONDS = 20.0
+            config.SESSION_STATE_POLL_INTERVAL_SECONDS = 0.0
+            with patch(
+                "main.time.monotonic",
+                side_effect=(100.0, 101.0),
+            ):
+                ready = wait_for_camera_activation(
+                    FakeActivityMonitor(),  # type: ignore[arg-type]
+                    FakeSessionMonitor(),  # type: ignore[arg-type]
+                    presence_recheck_not_before=200.0,
+                )
+        finally:
+            config.CAMERA_MONITORING_MODE = previous_mode
+            config.CAMERA_ACTIVATION_IDLE_SECONDS = (
+                previous_activation_seconds
+            )
+            config.SESSION_STATE_POLL_INTERVAL_SECONDS = (
+                previous_poll_seconds
+            )
+
+        self.assertTrue(ready)
+
+
+class PresenceAutoStandbyDecisionTests(unittest.TestCase):
+    def test_requires_ten_seconds_of_uninterrupted_presence(self) -> None:
+        started_at, should_standby = evaluate_presence_auto_standby(
+            True,
+            cycle_time=100.0,
+            confirmed_since=None,
+            required_seconds=10.0,
+        )
+        self.assertEqual(started_at, 100.0)
+        self.assertFalse(should_standby)
+
+        started_at, should_standby = evaluate_presence_auto_standby(
+            True,
+            cycle_time=109.9,
+            confirmed_since=started_at,
+            required_seconds=10.0,
+        )
+        self.assertEqual(started_at, 100.0)
+        self.assertFalse(should_standby)
+
+        reset_at, should_standby = evaluate_presence_auto_standby(
+            False,
+            cycle_time=110.0,
+            confirmed_since=started_at,
+            required_seconds=10.0,
+        )
+        self.assertIsNone(reset_at)
+        self.assertFalse(should_standby)
+
+        unknown_at, should_standby = evaluate_presence_auto_standby(
+            None,
+            cycle_time=110.5,
+            confirmed_since=started_at,
+            required_seconds=10.0,
+        )
+        self.assertIsNone(unknown_at)
+        self.assertFalse(should_standby)
+
+        restarted_at, should_standby = evaluate_presence_auto_standby(
+            True,
+            cycle_time=111.0,
+            confirmed_since=reset_at,
+            required_seconds=10.0,
+        )
+        restarted_at, should_standby = evaluate_presence_auto_standby(
+            True,
+            cycle_time=121.0,
+            confirmed_since=restarted_at,
+            required_seconds=10.0,
+        )
+        self.assertEqual(restarted_at, 111.0)
+        self.assertTrue(should_standby)
+
+    def test_idle_monitor_returns_presence_standby_outcome(self) -> None:
+        class FakeCamera:
+            def read(self) -> tuple[bool, np.ndarray]:
+                return True, np.zeros((32, 32, 3), dtype=np.uint8)
+
+        class FakeDetector:
+            device = "CPU"
+
+            def detect_faces(
+                self,
+                _frame: np.ndarray,
+            ) -> list[FaceDetection]:
+                return [FaceDetection(0.99, 1, 1, 10, 10)]
+
+        class FakeActivityMonitor:
+            def seconds_since_last_input(self) -> float:
+                return 60.0
+
+        class FakeSessionMonitor:
+            def is_locked(self) -> bool:
+                return False
+
+        previous_mode = config.CAMERA_MONITORING_MODE
+        previous_presence_mode = config.PRESENCE_MODE
+        previous_standby_seconds = (
+            config.CAMERA_PRESENCE_AUTO_STANDBY_SECONDS
+        )
+        previous_detection_interval = config.DETECTION_INTERVAL_SECONDS
+        try:
+            config.CAMERA_MONITORING_MODE = "IDLE_TRIGGERED"
+            config.PRESENCE_MODE = "ANY_FACE"
+            config.CAMERA_PRESENCE_AUTO_STANDBY_SECONDS = 0.0
+            config.DETECTION_INTERVAL_SECONDS = 0.0
+            outcome = monitor_until_session_pause(
+                FakeCamera(),  # type: ignore[arg-type]
+                FakeDetector(),  # type: ignore[arg-type]
+                FakeActivityMonitor(),  # type: ignore[arg-type]
+                FakeSessionMonitor(),  # type: ignore[arg-type]
+            )
+        finally:
+            config.CAMERA_MONITORING_MODE = previous_mode
+            config.PRESENCE_MODE = previous_presence_mode
+            config.CAMERA_PRESENCE_AUTO_STANDBY_SECONDS = (
+                previous_standby_seconds
+            )
+            config.DETECTION_INTERVAL_SECONDS = previous_detection_interval
+
+        self.assertIs(
+            outcome,
+            MonitorOutcome.PRESENCE_CONFIRMED_STANDBY,
+        )
 
 
 class LockWarningDecisionTests(unittest.TestCase):

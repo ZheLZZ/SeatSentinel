@@ -37,7 +37,13 @@ from face_registration import (
     FaceRegistrationUpdate,
     register_face_from_camera,
 )
-from global_hotkey import GlobalHotkeyError, WindowsGlobalHotkey
+from global_hotkey import (
+    GlobalHotkeyError,
+    WindowsGlobalHotkey,
+    hotkey_from_tk_key_event,
+    modifier_name_from_tk_keysym,
+    modifier_names_from_tk_state,
+)
 from privacy_blur import (
     MouseShakeDetector,
     PrivacyBlurSignal,
@@ -1185,6 +1191,139 @@ class TrayApplication:
         if current is not None:
             current.stop()
         LOGGER.info("Privacy blur hotkey registered: %s", hotkey)
+
+    def _show_privacy_hotkey_capture(
+        self,
+        parent: tk.Toplevel,
+        hotkey_variable: tk.StringVar,
+    ) -> None:
+        """Capture one safe global-hotkey chord without text entry syntax."""
+        dialog = tk.Toplevel(parent)
+        dialog.title("录制毛玻璃快捷键")
+        dialog.transient(parent)
+        dialog.resizable(False, False)
+
+        frame = ttk.Frame(dialog, padding=20)
+        frame.pack(fill="both", expand=True)
+        ttk.Label(
+            frame,
+            text="请直接按下新的快捷键组合",
+            font=("Microsoft YaHei UI", 12, "bold"),
+        ).pack(anchor="w")
+        ttk.Label(
+            frame,
+            text=(
+                "必须按住 Ctrl、Alt、Shift 或 Win 中的至少一个，"
+                "再按一个字母、单个数字、F1-F24 或常用功能键。"
+            ),
+            wraplength=430,
+            justify="left",
+        ).pack(anchor="w", pady=(10, 0))
+        ttk.Label(
+            frame,
+            text=f"当前快捷键：{hotkey_variable.get()}",
+            foreground="#666666",
+        ).pack(anchor="w", pady=(10, 0))
+
+        status_variable = tk.StringVar(
+            value="例如：Alt+1、Ctrl+K、Ctrl+Shift+F8"
+        )
+        status_label = tk.Label(
+            frame,
+            textvariable=status_variable,
+            fg="#35607D",
+            anchor="w",
+            justify="left",
+            wraplength=430,
+        )
+        status_label.pack(fill="x", pady=(18, 0))
+
+        button_row = ttk.Frame(frame)
+        button_row.pack(fill="x", pady=(18, 0))
+        ttk.Button(
+            button_row,
+            text="取消",
+            command=dialog.destroy,
+        ).pack(side="right")
+
+        pressed_modifiers: set[str] = set()
+
+        def set_status(message: str, color: str) -> None:
+            status_variable.set(message)
+            status_label.configure(fg=color)
+
+        def close_after_capture() -> None:
+            if dialog.winfo_exists():
+                dialog.destroy()
+
+        def on_key_press(event: tk.Event[tk.Misc]) -> str:
+            modifier_name = modifier_name_from_tk_keysym(event.keysym)
+            if modifier_name is not None:
+                pressed_modifiers.add(modifier_name)
+                ordered = [
+                    name
+                    for name in ("Ctrl", "Alt", "Shift", "Win")
+                    if name in pressed_modifiers
+                ]
+                set_status(
+                    f"已按住 {'+'.join(ordered)}，请再按一个普通按键",
+                    "#35607D",
+                )
+                return "break"
+
+            state_modifiers = modifier_names_from_tk_state(event.state)
+            if event.keysym == "Escape" and not (
+                pressed_modifiers or state_modifiers
+            ):
+                dialog.destroy()
+                return "break"
+            if not (pressed_modifiers or state_modifiers):
+                set_status(
+                    "不能单独使用字母或数字；请先按住 Ctrl、Alt、Shift 或 Win",
+                    "#B3261E",
+                )
+                return "break"
+
+            try:
+                captured_hotkey = hotkey_from_tk_key_event(
+                    event.keysym,
+                    event.keycode,
+                    event.state,
+                    tuple(pressed_modifiers),
+                )
+            except ValueError as exc:
+                set_status(str(exc), "#B3261E")
+                return "break"
+
+            hotkey_variable.set(captured_hotkey)
+            set_status(
+                f"已录制 {captured_hotkey}，保存设置后生效",
+                "#147A4A",
+            )
+            dialog.after(450, close_after_capture)
+            return "break"
+
+        def on_key_release(event: tk.Event[tk.Misc]) -> str:
+            modifier_name = modifier_name_from_tk_keysym(event.keysym)
+            if modifier_name is not None:
+                pressed_modifiers.discard(modifier_name)
+            return "break"
+
+        dialog.bind("<KeyPress>", on_key_press)
+        dialog.bind("<KeyRelease>", on_key_release)
+        dialog.protocol("WM_DELETE_WINDOW", dialog.destroy)
+        dialog.update_idletasks()
+        x = parent.winfo_rootx() + max(
+            0,
+            (parent.winfo_width() - dialog.winfo_reqwidth()) // 2,
+        )
+        y = parent.winfo_rooty() + max(
+            0,
+            (parent.winfo_height() - dialog.winfo_reqheight()) // 2,
+        )
+        dialog.geometry(f"+{x}+{y}")
+        dialog.grab_set()
+        dialog.after_idle(dialog.focus_force)
 
     def _stop_privacy_hotkey(self) -> None:
         hotkey = self._privacy_hotkey
@@ -2941,6 +3080,12 @@ class TrayApplication:
             "camera_activation_idle_seconds": tk.StringVar(
                 value=str(settings.camera_activation_idle_seconds)
             ),
+            "camera_presence_auto_standby_seconds": tk.StringVar(
+                value=str(settings.camera_presence_auto_standby_seconds)
+            ),
+            "camera_presence_recheck_interval_seconds": tk.StringVar(
+                value=str(settings.camera_presence_recheck_interval_seconds)
+            ),
             "presence_mode": tk.StringVar(
                 value=PRESENCE_MODE_LABELS[settings.presence_mode]
             ),
@@ -2980,6 +3125,14 @@ class TrayApplication:
             ("摄像头", "camera_name"),
             ("摄像头工作模式", "camera_monitoring_mode"),
             ("空闲开启摄像头（秒）", "camera_activation_idle_seconds"),
+            (
+                "连续在场后关闭摄像头（秒）",
+                "camera_presence_auto_standby_seconds",
+            ),
+            (
+                "摄像头待机复查间隔（秒）",
+                "camera_presence_recheck_interval_seconds",
+            ),
             ("在场判断", "presence_mode"),
             ("检测间隔（秒）", "detection_interval_seconds"),
             ("人脸置信度", "face_confidence_threshold"),
@@ -2989,7 +3142,7 @@ class TrayApplication:
             ("启动/恢复宽限期（秒）", "startup_grace_period_seconds"),
         ]
 
-        camera_activation_entry: Optional[ttk.Entry] = None
+        idle_camera_entries: list[ttk.Entry] = []
         for row_index, (label_text, key) in enumerate(rows):
             ttk.Label(content, text=label_text).grid(
                 row=row_index,
@@ -3031,8 +3184,12 @@ class TrayApplication:
                 pady=6,
                 sticky="ew",
             )
-            if key == "camera_activation_idle_seconds":
-                camera_activation_entry = widget
+            if key in {
+                "camera_activation_idle_seconds",
+                "camera_presence_auto_standby_seconds",
+                "camera_presence_recheck_interval_seconds",
+            }:
+                idle_camera_entries.append(widget)
 
         privacy_controls = ttk.LabelFrame(
             content,
@@ -3093,12 +3250,22 @@ class TrayApplication:
             hotkey_row,
             textvariable=variables["privacy_blur_hotkey"],
             width=18,
+            state="readonly",
         ).pack(side="left", padx=(12, 0))
+        ttk.Button(
+            hotkey_row,
+            text="录制",
+            command=lambda: self._show_privacy_hotkey_capture(
+                window,
+                variables["privacy_blur_hotkey"],
+            ),
+        ).pack(side="left", padx=(8, 0))
         ttk.Label(
             privacy_controls,
             text=(
-                "默认 Alt+B；空闲监测、监控暂停或摄像头关闭时也可直接切换，"
-                "再次按下或快速甩动鼠标即可解除"
+                "点击“录制”后直接按组合键，例如 Alt+1 或 Ctrl+K；"
+                "不能单独使用字母或数字。空闲监测、监控暂停或摄像头关闭时"
+                "也可切换，再次按下或快速甩动鼠标即可解除"
             ),
             foreground="#666666",
             wraplength=520,
@@ -3111,8 +3278,8 @@ class TrayApplication:
                 variables["camera_monitoring_mode"].get(),
             )
             idle_triggered = selected_mode == "IDLE_TRIGGERED"
-            if camera_activation_entry is not None:
-                camera_activation_entry.configure(
+            for idle_camera_entry in idle_camera_entries:
+                idle_camera_entry.configure(
                     state="normal" if idle_triggered else "disabled"
                 )
             if idle_triggered:
@@ -3280,6 +3447,12 @@ class TrayApplication:
                     ),
                     "camera_activation_idle_seconds": variables[
                         "camera_activation_idle_seconds"
+                    ].get(),
+                    "camera_presence_auto_standby_seconds": variables[
+                        "camera_presence_auto_standby_seconds"
+                    ].get(),
+                    "camera_presence_recheck_interval_seconds": variables[
+                        "camera_presence_recheck_interval_seconds"
                     ].get(),
                     "presence_mode": PRESENCE_MODE_VALUES.get(
                         variables["presence_mode"].get(),
@@ -3692,6 +3865,12 @@ def _run_self_test() -> int:
             and widget.cget("text") == "手动毛玻璃快捷键"
             for widget in settings_widgets
         )
+        hotkey_capture_buttons = [
+            widget
+            for widget in settings_widgets
+            if isinstance(widget, ttk.Button)
+            and widget.cget("text") == "录制"
+        ]
         settings_canvases = [
             widget
             for widget in settings_widgets
@@ -3721,6 +3900,7 @@ def _run_self_test() -> int:
             or len(privacy_switches) != 1
             or len(sedentary_switches) != 1
             or not hotkey_label_found
+            or len(hotkey_capture_buttons) != 1
             or len(settings_canvases) != 1
             or len(settings_scrollbars) != 1
             or not settings_canvases[0].cget("yscrollcommand")
@@ -3729,7 +3909,8 @@ def _run_self_test() -> int:
         ):
             raise RuntimeError(
                 "Camera mode, registered-face, privacy, sedentary, or "
-                "hotkey controls and settings scrolling were not initialized"
+                "hotkey capture controls and settings scrolling were not "
+                "initialized"
             )
         camera_mode_before_wheel = camera_mode_selectors[0].get()
         camera_mode_selectors[0].event_generate(
@@ -3751,6 +3932,30 @@ def _run_self_test() -> int:
             raise RuntimeError(
                 "Idle-triggered mode did not disable privacy blur"
             )
+        hotkey_capture_buttons[0].invoke()
+        test_application._root.update_idletasks()
+        hotkey_capture_dialogs = [
+            widget
+            for widget in descendants(test_application._root)
+            if isinstance(widget, tk.Toplevel)
+            and widget.title() == "录制毛玻璃快捷键"
+        ]
+        if len(hotkey_capture_dialogs) != 1:
+            raise RuntimeError("Hotkey capture dialog could not be opened")
+        capture_dialog_texts = [
+            str(widget.cget("text"))
+            for widget in descendants(hotkey_capture_dialogs[0])
+            if isinstance(widget, (tk.Label, ttk.Label))
+        ]
+        if not any(
+            "Ctrl、Alt、Shift 或 Win" in text
+            for text in capture_dialog_texts
+        ):
+            raise RuntimeError(
+                "Hotkey capture dialog did not explain modifier requirements"
+            )
+        hotkey_capture_dialogs[0].destroy()
+        test_application._root.update_idletasks()
         settings_window.destroy()
         if not test_application._debug_window.overrideredirect():
             raise RuntimeError("Custom title bar was not enabled")

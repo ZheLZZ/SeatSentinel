@@ -27,6 +27,8 @@ class AppSettings:
     presence_mode: str
     camera_monitoring_mode: str
     camera_activation_idle_seconds: float
+    camera_presence_auto_standby_seconds: float
+    camera_presence_recheck_interval_seconds: float
     privacy_blur_enabled: bool
     privacy_blur_hotkey: str
     sedentary_reminder_enabled: bool
@@ -51,6 +53,12 @@ class AppSettings:
             camera_monitoring_mode=config.CAMERA_MONITORING_MODE,
             camera_activation_idle_seconds=(
                 config.CAMERA_ACTIVATION_IDLE_SECONDS
+            ),
+            camera_presence_auto_standby_seconds=(
+                config.CAMERA_PRESENCE_AUTO_STANDBY_SECONDS
+            ),
+            camera_presence_recheck_interval_seconds=(
+                config.CAMERA_PRESENCE_RECHECK_INTERVAL_SECONDS
             ),
             privacy_blur_enabled=config.PRIVACY_BLUR_ENABLED,
             privacy_blur_hotkey=config.PRIVACY_BLUR_HOTKEY,
@@ -94,6 +102,12 @@ class AppSettings:
                 ).strip().upper(),
                 camera_activation_idle_seconds=float(
                     defaults["camera_activation_idle_seconds"]
+                ),
+                camera_presence_auto_standby_seconds=float(
+                    defaults["camera_presence_auto_standby_seconds"]
+                ),
+                camera_presence_recheck_interval_seconds=float(
+                    defaults["camera_presence_recheck_interval_seconds"]
                 ),
                 privacy_blur_enabled=cls._parse_boolean(
                     defaults["privacy_blur_enabled"],
@@ -162,6 +176,16 @@ class AppSettings:
             )
         if not 1.0 <= self.camera_activation_idle_seconds <= 3600.0:
             raise SettingsError("空闲开启摄像头时间必须在 1 至 3600 秒之间")
+        if not (
+            1.0 <= self.camera_presence_auto_standby_seconds <= 600.0
+        ):
+            raise SettingsError("连续在场关闭摄像头时间必须在 1 至 600 秒之间")
+        if not (
+            1.0
+            <= self.camera_presence_recheck_interval_seconds
+            <= 3600.0
+        ):
+            raise SettingsError("在场待机复查间隔必须在 1 至 3600 秒之间")
         if not isinstance(self.privacy_blur_enabled, bool):
             raise SettingsError("多人脸隐私模糊开关必须为布尔值")
         if not isinstance(self.sedentary_reminder_enabled, bool):
@@ -204,6 +228,12 @@ class AppSettings:
         config.CAMERA_MONITORING_MODE = self.camera_monitoring_mode
         config.CAMERA_ACTIVATION_IDLE_SECONDS = (
             self.camera_activation_idle_seconds
+        )
+        config.CAMERA_PRESENCE_AUTO_STANDBY_SECONDS = (
+            self.camera_presence_auto_standby_seconds
+        )
+        config.CAMERA_PRESENCE_RECHECK_INTERVAL_SECONDS = (
+            self.camera_presence_recheck_interval_seconds
         )
         config.PRIVACY_BLUR_ENABLED = self.privacy_blur_enabled
         config.PRIVACY_BLUR_HOTKEY = self.privacy_blur_hotkey
