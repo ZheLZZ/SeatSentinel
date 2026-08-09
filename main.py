@@ -53,6 +53,7 @@ class MonitorOutcome(Enum):
     SESSION_STATE_UNKNOWN = "session_state_unknown"
     INPUT_ACTIVE = "input_active"
     INPUT_MONITOR_UNAVAILABLE = "input_monitor_unavailable"
+    PRESENCE_CONFIRMED_STANDBY = "presence_confirmed_standby"
     STOP_REQUESTED = "stop_requested"
 
 
@@ -240,6 +241,22 @@ def camera_should_be_active(
     )
 
 
+def evaluate_presence_auto_standby(
+    presence_detected: Optional[bool],
+    cycle_time: float,
+    confirmed_since: Optional[float],
+    required_seconds: float,
+) -> tuple[Optional[float], bool]:
+    """Track uninterrupted presence before an idle-mode camera standby."""
+    if required_seconds < 0:
+        raise ValueError("Presence confirmation time cannot be negative")
+    if presence_detected is not True:
+        return None, False
+
+    started_at = cycle_time if confirmed_since is None else confirmed_since
+    return started_at, cycle_time - started_at >= required_seconds
+
+
 def evaluate_presence(
     detections: list[FaceDetection],
     presence_mode: str,
@@ -331,6 +348,7 @@ def monitor_until_session_pause(
     inference_was_healthy = True
     activity_was_healthy = True
     identity_match_streak = 0
+    presence_confirmed_since: Optional[float] = None
     lock_warning_started_at: Optional[float] = None
     privacy_guard = (
         SecondPersonPrivacyGuard(
@@ -673,6 +691,40 @@ def monitor_until_session_pause(
 
         if presence_detected is True:
             last_seen_time = cycle_time
+
+        if config.CAMERA_MONITORING_MODE == "IDLE_TRIGGERED":
+            (
+                presence_confirmed_since,
+                should_enter_presence_standby,
+            ) = evaluate_presence_auto_standby(
+                presence_detected,
+                cycle_time,
+                presence_confirmed_since,
+                config.CAMERA_PRESENCE_AUTO_STANDBY_SECONDS,
+            )
+            if should_enter_presence_standby:
+                detail = (
+                    "已连续确认在场 %.0f 秒 · 摄像头进入待机 · "
+                    "%.0f 秒后复查"
+                    % (
+                        config.CAMERA_PRESENCE_AUTO_STANDBY_SECONDS,
+                        config.CAMERA_PRESENCE_RECHECK_INTERVAL_SECONDS,
+                    )
+                )
+                LOGGER.info(
+                    "Presence confirmed for %.1f seconds; releasing the "
+                    "camera for a %.1f-second recheck interval",
+                    config.CAMERA_PRESENCE_AUTO_STANDBY_SECONDS,
+                    config.CAMERA_PRESENCE_RECHECK_INTERVAL_SECONDS,
+                )
+                _clear_debug_frame(
+                    debug_frame_buffer,
+                    detail,
+                    device_text,
+                    input_idle_seconds=activation_idle_seconds,
+                )
+                _report_status(status_callback, "standby", detail)
+                return MonitorOutcome.PRESENCE_CONFIRMED_STANDBY
 
         face_absent_seconds = max(0.0, cycle_time - last_seen_time)
 
@@ -1046,6 +1098,7 @@ def wait_for_camera_activation(
     debug_device: str = "",
     sedentary_tracker: Optional[SedentaryTracker] = None,
     sedentary_reminder_signal: Optional[SedentaryReminderSignal] = None,
+    presence_recheck_not_before: Optional[float] = None,
 ) -> Optional[bool]:
     """Wait until the configured strategy permits opening the camera.
 
@@ -1057,6 +1110,7 @@ def wait_for_camera_activation(
     last_session_error_log_at = float("-inf")
     last_activity_error_log_at = float("-inf")
     last_reported_remaining: Optional[int] = None
+    effective_recheck_not_before = presence_recheck_not_before
 
     while True:
         if stop_event is not None and stop_event.is_set():
@@ -1152,11 +1206,22 @@ def wait_for_camera_activation(
                 return None
             continue
 
-        if camera_should_be_active(
+        if input_idle_seconds < config.CAMERA_ACTIVATION_IDLE_SECONDS:
+            # Real keyboard or mouse activity starts a fresh idle cycle and
+            # cancels any remaining presence-confirmed standby interval.
+            effective_recheck_not_before = None
+
+        idle_activation_ready = camera_should_be_active(
             config.CAMERA_MONITORING_MODE,
             input_idle_seconds,
             config.CAMERA_ACTIVATION_IDLE_SECONDS,
-        ):
+        )
+        recheck_remaining_seconds = (
+            max(0.0, effective_recheck_not_before - now)
+            if effective_recheck_not_before is not None
+            else 0.0
+        )
+        if idle_activation_ready and recheck_remaining_seconds <= 0:
             LOGGER.info(
                 "Keyboard/mouse idle for %.1f seconds; activating camera",
                 input_idle_seconds,
@@ -1175,17 +1240,23 @@ def wait_for_camera_activation(
             True,
             now,
         )
-        remaining_seconds = max(
-            1,
-            math.ceil(
-                config.CAMERA_ACTIVATION_IDLE_SECONDS
-                - input_idle_seconds
-            ),
-        )
-        detail = (
-            f"键鼠活跃 · 摄像头待机 · "
-            f"空闲满 {config.CAMERA_ACTIVATION_IDLE_SECONDS:g} 秒后开启"
-        )
+        if idle_activation_ready and recheck_remaining_seconds > 0:
+            remaining_seconds = max(1, math.ceil(recheck_remaining_seconds))
+            detail = (
+                f"已确认在场 · 摄像头待机 · {remaining_seconds} 秒后复查"
+            )
+        else:
+            remaining_seconds = max(
+                1,
+                math.ceil(
+                    config.CAMERA_ACTIVATION_IDLE_SECONDS
+                    - input_idle_seconds
+                ),
+            )
+            detail = (
+                f"键鼠活跃 · 摄像头待机 · "
+                f"空闲满 {config.CAMERA_ACTIVATION_IDLE_SECONDS:g} 秒后开启"
+            )
         _clear_debug_frame(
             debug_frame_buffer,
             detail,
@@ -1396,6 +1467,7 @@ def run(
     detector: Optional[FaceDetector] = None
     identity_recognizer: Optional[FaceIdentityRecognizer] = None
     face_template: Optional[FaceTemplate] = None
+    camera_recheck_not_before: Optional[float] = None
 
     try:
         _clear_debug_frame(
@@ -1487,11 +1559,13 @@ def run(
                 debug_device=device_text,
                 sedentary_tracker=sedentary_tracker,
                 sedentary_reminder_signal=sedentary_reminder_signal,
+                presence_recheck_not_before=camera_recheck_not_before,
             )
             if camera_activation_ready is None:
                 return 0
             if not camera_activation_ready:
                 continue
+            camera_recheck_not_before = None
 
             camera_opened = open_camera_when_session_ready(
                 camera,
@@ -1535,6 +1609,12 @@ def run(
 
             if outcome is MonitorOutcome.STOP_REQUESTED:
                 return 0
+            if outcome is MonitorOutcome.PRESENCE_CONFIRMED_STANDBY:
+                camera_recheck_not_before = (
+                    time.monotonic()
+                    + config.CAMERA_PRESENCE_RECHECK_INTERVAL_SECONDS
+                )
+                continue
             if outcome in {
                 MonitorOutcome.INPUT_ACTIVE,
                 MonitorOutcome.INPUT_MONITOR_UNAVAILABLE,

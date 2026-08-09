@@ -6,6 +6,8 @@
   "presence_mode": "ANY_FACE",
   "camera_monitoring_mode": "CONTINUOUS",
   "camera_activation_idle_seconds": 20.0,
+  "camera_presence_auto_standby_seconds": 10.0,
+  "camera_presence_recheck_interval_seconds": 60.0,
   "privacy_blur_enabled": true,
   "privacy_blur_hotkey": "Alt+B",
   "sedentary_reminder_enabled": true,
