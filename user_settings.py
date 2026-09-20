@@ -40,6 +40,7 @@ class AppSettings:
     frame_height: int
     lock_mode: str = "SYSTEM"
     app_lock_password_hash: str = field(default="", repr=False)
+    app_lock_oled_protection: bool = True
 
     @classmethod
     def defaults(cls) -> "AppSettings":
@@ -136,6 +137,8 @@ class AppSettings:
                 frame_height=int(defaults["frame_height"]),
                 lock_mode=str(defaults["lock_mode"]).strip().upper(),
                 app_lock_password_hash=str(defaults["app_lock_password_hash"]),
+                app_lock_oled_protection=cls._parse_boolean(
+                    defaults["app_lock_oled_protection"], "OLED 锁屏保护开关"),
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise SettingsError(f"设置值格式不正确：{exc}") from exc

@@ -285,6 +285,32 @@ class InputAndPowerTests(unittest.TestCase):
                     key = KeyboardData(vkCode=vk)
                     self.assertEqual(callbacks[13](0, 0x0100, ctypes.addressof(key)), 1)
                     self.assertEqual(callbacks[13](0, 0x0101, ctypes.addressof(key)), 1)
+                for vk in (0xA0, 0xA4, 0xA2):
+                    key = KeyboardData(vkCode=vk)
+                    callbacks[13](0, 0x0101, ctypes.addressof(key))
+                # Waking Enter must not submit an empty password, even on repeat.
+                guard.saver_active = True
+                guard.last_activity = 0
+                key = KeyboardData(vkCode=0x0D)
+                self.assertEqual(callbacks[13](0, 0x0100, ctypes.addressof(key)), 1)
+                self.assertGreater(guard.last_activity, 0)
+                guard.saver_active = False
+                self.assertEqual(callbacks[13](0, 0x0100, ctypes.addressof(key)), 1)
+                self.assertEqual(callbacks[13](0, 0x0101, ctypes.addressof(key)), 1)
+                self.assertEqual(callbacks[13](0, 0x0100, ctypes.addressof(key)), 0)
+                # The waking click's release must also stay blocked after wake.
+                point = ctypes.wintypes.POINT(10, 10)
+                guard.saver_active = True
+                self.assertEqual(callbacks[14](0, 0x0201, ctypes.addressof(point)), 1)
+                guard.saver_active = False
+                self.assertEqual(callbacks[14](0, 0x0202, ctypes.addressof(point)), 1)
+                guard.saver_active = True
+                guard.last_activity = 0
+                self.assertEqual(callbacks[14](0, 0x0200, ctypes.addressof(point)), 0)
+                self.assertEqual(guard.last_activity, 0)
+                point.x += 10
+                self.assertEqual(callbacks[14](0, 0x0200, ctypes.addressof(point)), 0)
+                self.assertGreater(guard.last_activity, 0)
             finally:
                 guard.close()
 

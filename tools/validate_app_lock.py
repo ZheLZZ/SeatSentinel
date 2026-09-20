@@ -22,6 +22,7 @@ sys.path.insert(0, str(ROOT))
 def capture_window(window, path):
     """Render just the test HWND to a bitmap, not the user's screen."""
     from PIL import Image
+    from dwm_privacy import _physical_pixel_context
     user = ctypes.WinDLL("user32", use_last_error=True)
     gdi = ctypes.WinDLL("gdi32", use_last_error=True)
     user.GetAncestor.argtypes = [wintypes.HWND, wintypes.UINT]
@@ -31,6 +32,7 @@ def capture_window(window, path):
     user.GetDC.restype = wintypes.HDC
     user.ReleaseDC.argtypes = [wintypes.HWND, wintypes.HDC]
     user.PrintWindow.argtypes = [wintypes.HWND, wintypes.HDC, wintypes.UINT]
+    user.RedrawWindow.argtypes = [wintypes.HWND, ctypes.c_void_p, wintypes.HRGN, wintypes.UINT]
     for name, args, restype in (
         ("CreateCompatibleDC", [wintypes.HDC], wintypes.HDC),
         ("CreateCompatibleBitmap", [wintypes.HDC, ctypes.c_int, ctypes.c_int], wintypes.HBITMAP),
@@ -42,8 +44,11 @@ def capture_window(window, path):
         func = getattr(gdi, name)
         func.argtypes, func.restype = args, restype
     hwnd = user.GetAncestor(window.winfo_id(), 2)
+    window.update_idletasks()
+    user.RedrawWindow(hwnd, None, None, 0x0185)  # invalidate/erase/update all children
     rect = wintypes.RECT()
-    assert user.GetWindowRect(hwnd, ctypes.byref(rect))
+    with _physical_pixel_context():
+        assert user.GetWindowRect(hwnd, ctypes.byref(rect))
     width, height = rect.right - rect.left, rect.bottom - rect.top
     dc = user.GetDC(hwnd)
     memory = gdi.CreateCompatibleDC(dc)
@@ -65,7 +70,7 @@ def child():
     import tkinter as tk
     import tempfile
     from dataclasses import replace
-    from unittest.mock import patch
+    from unittest.mock import patch, Mock
     from user_settings import AppSettings, SettingsStore
     from app_lock import hash_password
     from app_lock_windows import AppLockWindow, AwakeRequest, user32
@@ -98,6 +103,30 @@ def child():
                 assert user32.GetWindowRect(user32.GetAncestor(window.winfo_id(), 2), ctypes.byref(rect))
             assert (rect.left, rect.top, rect.right, rect.bottom) == monitor.monitor
         capture_window(lock.windows[0], destination / "lock-window.png")
+        # Deterministic idle time while real hooks continue pumping on the desktop.
+        idle = Mock(return_value=59)
+        lock.guard.idle_seconds = idle
+        lock._update_saver()
+        assert not lock._saver_active
+        idle.return_value = 61
+        lock._oled_enabled = False
+        lock._update_saver()
+        assert not lock._saver_active
+        lock._oled_enabled = True
+        lock._update_saver()
+        root.update()
+        assert lock._saver_active and lock.guard.saver_active
+        capture_window(lock.windows[0], destination / "oled-clock.png")
+        from PIL import Image, ImageStat
+        with Image.open(destination / "oled-clock.png") as rendered:
+            assert max(ImageStat.Stat(rendered).mean) < 3, "OLED wallpaper was not hidden"
+            assert rendered.getextrema()[0][1] > 20, "OLED clock did not paint"
+        positions = [c.oled_overlay.coords("oled_clock") for c in lock._canvases]
+        lock._saver_started -= 20
+        lock._update_saver()
+        assert positions != [c.oled_overlay.coords("oled_clock") for c in lock._canvases]
+        lock._submit()
+        assert lock.active and not lock._verifying and not unlocked
         # Native HWNDs on this isolated desktop, with injected display topology.
         # This exercises negative origins, portrait surfaces, primary switching,
         # DPI-change detection and unplug/error recovery without moving user windows.
@@ -117,6 +146,8 @@ def child():
                 assert len(lock.windows) == len(expected)
                 assert lock.password.get() == "unfinished input"
                 assert lock.guard.handles == lock._handles()
+                assert lock._saver_active
+                assert all(c.oled_overlay.winfo_ismapped() for c in lock._canvases)
                 for window, monitor in zip(lock.windows, expected):
                     rect = wintypes.RECT()
                     with _physical_pixel_context():
@@ -130,15 +161,25 @@ def child():
                     with patch("app_lock_windows.user32.GetDpiForWindow", return_value=144):
                         lock._rebuild()
                     assert tuple(lock.windows) != before
+        lock.guard.last_activity = time.monotonic()
+        del lock.guard.idle_seconds
+        lock._update_saver()
+        root.update()
+        assert not lock._saver_active and not lock.guard.saver_active and not unlocked
+        assert lock.password.get() == "unfinished input"
+        assert all(c.oled_overlay is None for c in lock._canvases)
         # PrintWindow may return black for a simulated display entirely outside
         # the real desktop. Check portrait painting within its actual bounds.
         portrait = MonitorWorkArea((0, 0, 540, 960), (0, 0, 540, 920), True)
         with patch("app_lock_windows.enumerate_monitor_work_areas", return_value=[portrait]):
             lock._rebuild()
             root.update()
+            assert not lock._saver_active
+            assert lock._canvases[0].oled_overlay is None
             capture_window(lock.windows[0], destination / "portrait-primary.png")
             from PIL import Image, ImageStat
             with Image.open(destination / "portrait-primary.png") as rendered:
+                assert rendered.size == (540, 960)
                 assert max(ImageStat.Stat(rendered).stddev) > 15, "Portrait surface did not paint"
             assert lock.entry.winfo_viewable() and lock.button.winfo_viewable()
         before = tuple(lock.windows)
@@ -170,6 +211,7 @@ def child():
         pump_until(lambda: bool(unlocked))
         assert not lock.active and lock.guard is None and not errors
         lock.show("", preview=True)
+        assert not lock._saver_active
         lock._preview_deadline = time.monotonic()
         pump_until(lambda: not lock.active)
         assert len(unlocked) == 1  # a preview never completes a real lock
@@ -208,6 +250,13 @@ def child():
                                                      app_lock_password_hash=hash_password("")))
             manual_item(application._tray_icon)
             pump_app_until(lambda: application._service.app_lock_signal.state == "locked")
+            empty_lock = application._app_lock_window
+            empty_lock.guard.last_activity = time.monotonic() - 61
+            empty_lock._update_saver()
+            empty_lock._submit()
+            assert application._application_locked()
+            empty_lock.guard.last_activity = time.monotonic()
+            empty_lock._update_saver()
             application._app_lock_window._submit()
             pump_app_until(lambda: not application._application_locked())
             pump_app_until(lambda: not application._awake_request.active)
@@ -235,7 +284,7 @@ def child():
         application._app_lock_window.close()
         application._awake_request.update(False)
         application._root.destroy()
-    print("PASS: real hooks, monitor coverage, 2/3-display simulations, negative origins, portrait/primary/DPI changes, unplug/error recovery, password, manual lock, preview and cleanup")
+    print("PASS: real hooks, OLED idle/motion/wake, monitor coverage, 2/3-display simulations, negative origins, portrait/primary/DPI changes, unplug/error recovery, password, manual lock, preview and cleanup")
     if "--full-self-test" in sys.argv:
         from app import _run_self_test
         assert _run_self_test() == 0

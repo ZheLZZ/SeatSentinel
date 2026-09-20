@@ -17,6 +17,7 @@ from PIL import ImageTk
 
 from app_lock import UnlockGate
 from lock_screen_theme import LandscapeTheme, LockScreenLayout, clock_text
+from oled_saver import IDLE_SECONDS, clock_position, clock_color
 from dwm_privacy import enumerate_monitor_work_areas, _physical_pixel_context
 
 
@@ -40,6 +41,8 @@ user32.WindowFromPoint.argtypes = [wintypes.POINT]
 user32.WindowFromPoint.restype = wintypes.HWND
 user32.GetAsyncKeyState.argtypes = [ctypes.c_int]
 user32.GetAsyncKeyState.restype = ctypes.c_short
+user32.GetPhysicalCursorPos.argtypes = [ctypes.POINTER(wintypes.POINT)]
+user32.GetPhysicalCursorPos.restype = wintypes.BOOL
 user32.SetWindowPos.argtypes = [wintypes.HWND, wintypes.HWND, ctypes.c_int,
                               ctypes.c_int, ctypes.c_int, ctypes.c_int, wintypes.UINT]
 user32.SetWindowPos.restype = wintypes.BOOL
@@ -78,6 +81,8 @@ class InputGuard:
         self._ready = threading.Event()
         self._thread: threading.Thread | None = None
         self._error: Exception | None = None
+        self.last_activity = time.monotonic()
+        self.saver_active = False
 
     def start(self) -> None:
         self._thread = threading.Thread(target=self._run, daemon=True,
@@ -90,9 +95,17 @@ class InputGuard:
             self.close()
             raise RuntimeError(f"输入保护启动失败：{self._error}")
 
+    def idle_seconds(self) -> float:
+        return max(0.0, time.monotonic() - self.last_activity)
+
     def _run(self) -> None:
         hooks = []
         modifiers: set[int] = set()
+        wake_keys: set[int] = set()
+        wake_buttons: set[int] = set()
+        cursor = wintypes.POINT()
+        last_pointer = (cursor.x, cursor.y) if user32.GetPhysicalCursorPos(ctypes.byref(cursor)) else None
+        button_ups = {0x0202: 0x0201, 0x0205: 0x0204, 0x0208: 0x0207, 0x020C: 0x020B}
         groups = ({0x11, 0xA2, 0xA3}, {0x12, 0xA4, 0xA5}, {0x10, 0xA0, 0xA1})
 
         @HOOKPROC
@@ -101,12 +114,20 @@ class InputGuard:
                 key = ctypes.cast(data, ctypes.POINTER(KeyboardData)).contents
                 vk = int(key.vkCode)
                 down = message in {0x0100, 0x0104}
+                self.last_activity = time.monotonic()
                 for group in groups:
                     if vk in group:
                         if down:
                             modifiers.add(vk)
                         else:
                             modifiers.difference_update(group)
+                # Consume the whole waking key gesture, including auto-repeat.
+                if self.saver_active or vk in wake_keys:
+                    if down:
+                        wake_keys.add(vk)
+                    else:
+                        wake_keys.discard(vk)
+                    return 1
                 if block_key(
                     vk,
                     alt=bool(key.flags & 0x20 or modifiers & groups[1]),
@@ -118,8 +139,22 @@ class InputGuard:
 
         @HOOKPROC
         def mouse(code, message, data):
-            if code >= 0 and message != 0x0200:  # allow pointer movement
+            nonlocal last_pointer
+            if code >= 0:
                 point = ctypes.cast(data, ctypes.POINTER(wintypes.POINT)).contents
+                position = (point.x, point.y)
+                if message != 0x0200 or position != last_pointer:
+                    self.last_activity = time.monotonic()
+                last_pointer = position
+                down_message = button_ups.get(message, message)
+                if self.saver_active or down_message in wake_buttons:
+                    if message in button_ups.values():
+                        wake_buttons.add(message)
+                    elif message in button_ups:
+                        wake_buttons.discard(down_message)
+                    if message != 0x0200:
+                        return 1
+            if code >= 0 and message != 0x0200:  # allow pointer movement
                 target = user32.GetAncestor(user32.WindowFromPoint(point), 2)
                 if target not in self.handles:
                     return 1
@@ -199,15 +234,20 @@ class AppLockWindow:
         self._theme: LandscapeTheme | None = None
         self._last_topology_error = float("-inf")
         self._dpi_signature: tuple[int, ...] = ()
+        self._oled_enabled = True
+        self._saver_active = False
+        self._saver_started = 0.0
 
     @property
     def active(self) -> bool:
         return bool(self.windows)
 
-    def show(self, record: str, *, preview: bool = False) -> None:
+    def show(self, record: str, *, preview: bool = False, oled_protection: bool = True) -> None:
         if self.active:
             return
         self._preview = preview
+        self._oled_enabled = oled_protection
+        self._saver_active = False
         self._generation += 1
         self._preview_deadline = time.monotonic() + 8
         self.gate = None if preview else UnlockGate(record)
@@ -286,7 +326,53 @@ class AppLockWindow:
             canvas.create_text(width / 2, height * 0.73, text="请在主屏输入密码",
                                fill="white", font=font("Microsoft YaHei UI", 24))
             window.bind("<Button-1>", lambda event: self.entry.focus_force())
+        canvas.oled_overlay = None
+        canvas.oled_font = font("Segoe UI Light", 82)
+        canvas.surface_size = (width, height)
+        if self._saver_active:
+            self._show_saver_surface(canvas)
         return canvas
+
+    @staticmethod
+    def _show_saver_surface(canvas) -> None:
+        if canvas.oled_overlay is None:
+            overlay = tk.Canvas(canvas.master, background="black", highlightthickness=0,
+                                borderwidth=0, cursor="none", takefocus=False)
+            overlay.create_text(0, 0, text=clock_text()[0], fill="#303030",
+                                font=canvas.oled_font, tags="oled_clock")
+            canvas.oled_overlay = overlay
+        overlay = canvas.oled_overlay
+        overlay.place(x=0, y=0, relwidth=1, relheight=1)
+        overlay.tk.call("raise", str(overlay))
+
+    def _update_saver(self) -> None:
+        if self._preview or self.guard is None:
+            return
+        now = time.monotonic()
+        wanted = (self._oled_enabled and not self._verifying
+                  and self.guard.idle_seconds() >= IDLE_SECONDS)
+        if wanted != self._saver_active:
+            self._saver_active = wanted
+            self.guard.saver_active = wanted
+            if wanted:
+                self._saver_started = now
+            for canvas in self._canvases:
+                if wanted:
+                    self._show_saver_surface(canvas)
+                else:
+                    canvas.oled_overlay.destroy()
+                    canvas.oled_overlay = None
+            if not wanted:
+                self.entry.focus_force()
+        if self._saver_active:
+            elapsed = now - self._saver_started
+            for index, canvas in enumerate(self._canvases):
+                overlay = canvas.oled_overlay
+                overlay.itemconfigure("oled_clock", text=clock_text()[0], fill=clock_color(elapsed))
+                bounds = overlay.bbox("oled_clock")
+                x, y = clock_position(*canvas.surface_size, bounds[2]-bounds[0],
+                                      bounds[3]-bounds[1], elapsed, index)
+                overlay.coords("oled_clock", x, y)
 
     def _refresh_hint(self) -> None:
         if not self.windows or not hasattr(self, "_primary_canvas"):
@@ -370,7 +456,7 @@ class AppLockWindow:
         self.entry.focus_force()
 
     def _submit(self) -> None:
-        if self._preview or self._verifying or self.gate is None:
+        if self._preview or self._saver_active or self._verifying or self.gate is None:
             return
         if self.gate.retry_seconds:
             self.message.set(f"尝试过于频繁，请 {self.gate.retry_seconds} 秒后重试")
@@ -416,6 +502,7 @@ class AppLockWindow:
                 self.message.set(f"尝试过于频繁，请 {self.gate.retry_seconds} 秒后重试")
             self._rebuild()
             self._refresh_clock()
+            self._update_saver()
             if self.guard is not None:
                 if self.guard._error is not None or not self.guard._thread.is_alive():
                     raise RuntimeError("输入保护已停止")
@@ -441,6 +528,7 @@ class AppLockWindow:
             window.destroy()
         self.windows.clear()
         self._canvases.clear()
+        self._saver_active = False
         self.password.set("")
         self._theme = None
         self._signature = ()

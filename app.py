@@ -878,7 +878,8 @@ class TrayApplication:
                 self._service.clear_privacy_blur()
                 self._hide_privacy_blur()
                 self._app_lock_window.close()  # close a non-locking preview
-                self._app_lock_window.show(settings.app_lock_password_hash)
+                self._app_lock_window.show(settings.app_lock_password_hash,
+                                           oled_protection=settings.app_lock_oled_protection)
                 if self._app_lock_window.active:
                     signal.complete("locked")
                     self._service._update_status("locked", "应用已锁定 · 等待密码解锁 · 后台继续运行")
@@ -3273,6 +3274,7 @@ class TrayApplication:
             "app_lock_new_password": tk.StringVar(),
             "app_lock_confirm_password": tk.StringVar(),
             "app_lock_empty_password": tk.BooleanVar(value=False),
+            "app_lock_oled_protection": tk.BooleanVar(value=settings.app_lock_oled_protection),
             "camera_name": tk.StringVar(value=settings.camera_name),
             "camera_monitoring_mode": tk.StringVar(
                 value=CAMERA_MONITORING_MODE_LABELS[
@@ -3329,6 +3331,7 @@ class TrayApplication:
             ("新应用密码（留空保留）", "app_lock_new_password"),
             ("确认新应用密码", "app_lock_confirm_password"),
             ("空密码", "app_lock_empty_password"),
+            ("OLED 锁屏保护", "app_lock_oled_protection"),
             ("摄像头", "camera_name"),
             ("摄像头工作模式", "camera_monitoring_mode"),
             ("空闲开启摄像头（秒）", "camera_activation_idle_seconds"),
@@ -3364,6 +3367,9 @@ class TrayApplication:
                           "已设为空密码" if verify_password("", record) else
                           "●●●●●●  已设置密码")
                 widget = ttk.Label(content, text=status)
+            elif key == "app_lock_oled_protection":
+                widget = ttk.Checkbutton(content, variable=variables[key],
+                                         text="闲置 1 分钟后显示黑底移动时钟")
             elif key == "app_lock_empty_password":
                 widget = ttk.Checkbutton(content, variable=variables[key],
                                          text="设为空密码（锁定后直接点解锁）")
@@ -3685,6 +3691,7 @@ class TrayApplication:
                 {
                     "lock_mode": lock_mode,
                     "app_lock_password_hash": password_record,
+                    "app_lock_oled_protection": variables["app_lock_oled_protection"].get(),
                     "camera_name": variables["camera_name"].get(),
                     "camera_monitoring_mode": (
                         CAMERA_MONITORING_MODE_VALUES.get(
