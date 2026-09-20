@@ -9,7 +9,6 @@ from __future__ import annotations
 import ctypes
 from ctypes import wintypes
 import logging
-import queue
 import threading
 import time
 import tkinter as tk
@@ -17,7 +16,6 @@ from typing import Callable
 from PIL import ImageTk
 
 from app_lock import UnlockGate
-from private_test_unlock import load_private_test_unlock
 from lock_screen_theme import LandscapeTheme, LockScreenLayout, clock_text
 from dwm_privacy import enumerate_monitor_work_areas, _physical_pixel_context
 
@@ -74,13 +72,12 @@ def block_key(vk: int, *, alt: bool, ctrl: bool, own_focus: bool) -> bool:
 class InputGuard:
     """Short hook callbacks on a dedicated message-pump thread, no key logging."""
 
-    def __init__(self, on_test_chord: Callable[[str], None] | None = None) -> None:
+    def __init__(self) -> None:
         self.handles: tuple[int, ...] = ()
         self._stop = threading.Event()
         self._ready = threading.Event()
         self._thread: threading.Thread | None = None
         self._error: Exception | None = None
-        self._on_test_chord = on_test_chord
 
     def start(self) -> None:
         self._thread = threading.Thread(target=self._run, daemon=True,
@@ -96,7 +93,6 @@ class InputGuard:
     def _run(self) -> None:
         hooks = []
         modifiers: set[int] = set()
-        held_function_keys: set[int] = set()
         groups = ({0x11, 0xA2, 0xA3}, {0x12, 0xA4, 0xA5}, {0x10, 0xA0, 0xA1})
 
         @HOOKPROC
@@ -111,15 +107,6 @@ class InputGuard:
                             modifiers.add(vk)
                         else:
                             modifiers.difference_update(group)
-                if 0x70 <= vk <= 0x87:
-                    if (down and vk not in held_function_keys
-                            and all(modifiers & group for group in groups)
-                            and self._on_test_chord is not None):
-                        self._on_test_chord(f"Ctrl+Alt+Shift+F{vk - 0x6F}")
-                    if down:
-                        held_function_keys.add(vk)
-                    else:
-                        held_function_keys.discard(vk)
                 if block_key(
                     vk,
                     alt=bool(key.flags & 0x20 or modifiers & groups[1]),
@@ -204,8 +191,6 @@ class AppLockWindow:
         self._preview = False
         self._preview_deadline = 0.0
         self._generation = 0
-        self._test_chords: queue.SimpleQueue[str] = queue.SimpleQueue()
-        self._test_unlock = None
         self.password = tk.StringVar(master=root)
         self.message = tk.StringVar(master=root)
         self.password.trace_add("write", lambda *_: self._refresh_hint())
@@ -226,7 +211,6 @@ class AppLockWindow:
         self._generation += 1
         self._preview_deadline = time.monotonic() + 8
         self.gate = None if preview else UnlockGate(record)
-        self._test_unlock = None if preview else load_private_test_unlock()
         self._verifying = False
         self._result = None
         self.password.set("")
@@ -235,9 +219,7 @@ class AppLockWindow:
         try:
             self._rebuild()
             if not preview:
-                self.guard = InputGuard(
-                    self._test_chords.put if self._test_unlock is not None else None
-                )
+                self.guard = InputGuard()
                 self.guard.handles = self._handles()
                 self.guard.start()
             self._tick()
@@ -417,13 +399,6 @@ class AppLockWindow:
         if not self.active:
             return
         try:
-            for _ in range(10):
-                try:
-                    candidate = self._test_chords.get_nowait()
-                except queue.Empty:
-                    break
-                if self._test_unlock is not None and not self._verifying:
-                    self._verify_test_chord(candidate)
             if self._preview and time.monotonic() >= self._preview_deadline:
                 self.close()
                 return
@@ -454,20 +429,6 @@ class AppLockWindow:
             self.close()
             self.on_error(str(exc))
 
-    def _verify_test_chord(self, candidate: str) -> None:
-        """Never do a password derivation on the low-level hook thread."""
-        self._verifying = True
-        generation = self._generation
-        test_unlock = self._test_unlock
-        def verify() -> None:
-            try:
-                success = test_unlock.attempt(candidate)
-            except Exception:
-                success = False
-            if self._generation == generation:
-                self._result = (success, "验证未通过")
-        threading.Thread(target=verify, name="seat-sentinel-test-unlock", daemon=True).start()
-
     def close(self) -> None:
         self._generation += 1
         if self._timer is not None:
@@ -485,6 +446,4 @@ class AppLockWindow:
         self._signature = ()
         self._dpi_signature = ()
         self.gate = None
-        self._test_unlock = None
-        self._test_chords = queue.SimpleQueue()
         self._result = None

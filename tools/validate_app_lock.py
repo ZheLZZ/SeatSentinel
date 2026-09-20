@@ -69,8 +69,6 @@ def child():
     from user_settings import AppSettings, SettingsStore
     from app_lock import hash_password
     from app_lock_windows import AppLockWindow, AwakeRequest, user32
-    from private_test_unlock import PrivateTestUnlock
-    from app_lock import UnlockGate
     from dwm_privacy import enumerate_monitor_work_areas, _physical_pixel_context, MonitorWorkArea
     destination = ROOT / "dist" / "app-lock-validation"
     destination.mkdir(parents=True, exist_ok=True)
@@ -171,17 +169,10 @@ def child():
         lock._submit()
         pump_until(lambda: bool(unlocked))
         assert not lock.active and lock.guard is None and not errors
-        lock.show(hash_password("Test-only!482"))
-        test_chord = "Ctrl+Alt+Shift+F6"
-        lock._test_unlock = PrivateTestUnlock(UnlockGate(hash_password(test_chord)),
-                                              time.time() + 60)
-        lock._test_chords.put(test_chord)
-        pump_until(lambda: len(unlocked) == 2)
-        assert not lock.active and lock.guard is None and not errors
         lock.show("", preview=True)
         lock._preview_deadline = time.monotonic()
         pump_until(lambda: not lock.active)
-        assert len(unlocked) == 2  # a preview never completes a real lock
+        assert len(unlocked) == 1  # a preview never completes a real lock
     finally:
         lock.close()
         wake.update(False)

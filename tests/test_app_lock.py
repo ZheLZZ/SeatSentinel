@@ -1,7 +1,6 @@
 """Regression tests for application-lock authentication and OS-lock separation."""
 
 import tempfile
-import json
 import queue
 import ctypes
 import time
@@ -21,7 +20,6 @@ from app_lock import (AppLockSignal, UnlockGate, hash_password,
 from app_lock_windows import AwakeRequest, InputGuard, KeyboardData, block_key
 from user_settings import AppSettings, SettingsError, SettingsStore
 from app import TrayApplication, LOCK_MODE_LABELS
-from private_test_unlock import load_private_test_unlock
 
 
 class CredentialTests(unittest.TestCase):
@@ -259,37 +257,14 @@ class ManualLockTests(unittest.TestCase):
         self.assertFalse(application._application_locked())
 
 
-class PrivateTestUnlockTests(unittest.TestCase):
-    def test_local_record_requires_matching_version_and_expiry(self):
-        chord = "Ctrl+Alt+Shift+F6"
-        record = {"version": config.APPLICATION_VERSION, "expires_at": 200.0,
-                  "shortcut_hash": hash_password(chord)}
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "private.json"
-            self.assertIsNone(load_private_test_unlock(path))
-            path.write_text(json.dumps(record))
-            now = [100.0]
-            unlock = load_private_test_unlock(path, clock=lambda: now[0])
-            self.assertTrue(unlock.attempt(chord))
-            self.assertFalse(unlock.attempt("Ctrl+Alt+Shift+F8"))
-            now[0] = 201.0
-            self.assertFalse(unlock.attempt(chord))
-            self.assertIsNone(load_private_test_unlock(path, clock=lambda: now[0]))
-            record["version"] = "different-build"
-            path.write_text(json.dumps(record))
-            self.assertIsNone(load_private_test_unlock(path, clock=lambda: 100))
-            path.write_text("broken-json")
-            self.assertIsNone(load_private_test_unlock(path))
-
-
 class InputAndPowerTests(unittest.TestCase):
     def test_password_paste_and_input_method_switch_remain_available(self):
         for key in (0x11, 0xA2, 0xA3, 0x41, 0x56, 0x20, 0x10):
             self.assertFalse(block_key(key, alt=False, ctrl=True, own_focus=True))
 
-    def test_recovery_chord_recognizes_modifiers_even_when_hooks_block_them(self):
-        callbacks, candidates = {}, []
-        guard = InputGuard(candidates.append)
+    def test_modified_function_keys_are_blocked_by_the_real_hook_callback(self):
+        callbacks = {}
+        guard = InputGuard()
         guard.handles = (123,)
         def install(kind, callback, module, thread):
             callbacks[kind] = callback
@@ -303,17 +278,13 @@ class InputAndPowerTests(unittest.TestCase):
             stack.enter_context(patch("app_lock_windows.user32.CallNextHookEx", return_value=0))
             guard.start()
             try:
-                for vk in (0xA2, 0xA4, 0xA0, 0x75, 0x75):
+                for vk in (0xA2, 0xA4, 0xA0):
                     key = KeyboardData(vkCode=vk)
                     callbacks[13](0, 0x0100, ctypes.addressof(key))
-                self.assertEqual(candidates, ["Ctrl+Alt+Shift+F6"])
-                # Auto-repeat must not enqueue more guesses; release re-arms.
-                for vk in (0x75, 0xA0, 0xA4, 0xA2):
+                for vk in range(0x70, 0x88):
                     key = KeyboardData(vkCode=vk)
-                    callbacks[13](0, 0x0101, ctypes.addressof(key))
-                key = KeyboardData(vkCode=0x75)
-                callbacks[13](0, 0x0100, ctypes.addressof(key))
-                self.assertEqual(len(candidates), 1)
+                    self.assertEqual(callbacks[13](0, 0x0100, ctypes.addressof(key)), 1)
+                    self.assertEqual(callbacks[13](0, 0x0101, ctypes.addressof(key)), 1)
             finally:
                 guard.close()
 
