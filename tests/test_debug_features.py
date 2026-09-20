@@ -14,7 +14,7 @@ from unittest.mock import patch
 import numpy as np
 
 import config
-from app import TrayApplication
+from app import TrayApplication, format_tray_title
 from dwm_privacy import (
     acrylic_alpha_from_strength,
     bounding_rect,
@@ -52,6 +52,8 @@ from privacy_blur import (
     SecondPersonPrivacyGuard,
 )
 from sedentary_reminder import (
+    SedentaryDurationSignal,
+    SedentaryDurationSnapshot,
     SedentaryReminderSignal,
     SedentaryTracker,
     format_sedentary_duration,
@@ -943,6 +945,91 @@ class SedentaryReminderDecisionTests(unittest.TestCase):
         self.assertEqual(cleared.sequence, 2)
         self.assertIsNone(cleared.triggered_at)
         self.assertEqual(cleared.detail, "")
+
+    def test_duration_snapshot_follows_the_same_seated_timer(self) -> None:
+        duration_signal = SedentaryDurationSignal()
+        tracker = SedentaryTracker(
+            1800.0,
+            30.0,
+            duration_signal=duration_signal,
+        )
+
+        tracker.observe(True, timestamp=100.0)
+        self.assertEqual(
+            duration_signal.snapshot().seated_seconds,
+            0.0,
+        )
+        tracker.observe(False, timestamp=129.0)
+        self.assertEqual(
+            duration_signal.snapshot().seated_seconds,
+            29.0,
+        )
+        tracker.observe(False, timestamp=159.0)
+        self.assertIsNone(duration_signal.snapshot().seated_seconds)
+
+    def test_tray_title_places_duration_above_monitoring_status(self) -> None:
+        self.assertEqual(
+            format_tray_title(True, True, 3660.0),
+            "已连续未离席：1 小时 1 分钟\n"
+            "SeatSentinel · 监控运行中",
+        )
+        self.assertEqual(
+            format_tray_title(True, True, 30.0),
+            "已连续未离席：不足 1 分钟\n"
+            "SeatSentinel · 监控运行中",
+        )
+        self.assertIn(
+            "已连续未离席：等待确认",
+            format_tray_title(True, True, None),
+        )
+        self.assertIn(
+            "已连续未离席：未计时",
+            format_tray_title(False, True, 120.0),
+        )
+        self.assertIn(
+            "已连续未离席：久坐提醒已关闭",
+            format_tray_title(True, False, None),
+        )
+
+    def test_tray_title_refreshes_while_monitoring_state_is_unchanged(
+        self,
+    ) -> None:
+        class FakeService:
+            seated_seconds = 30.0
+
+            def is_running(self) -> bool:
+                return True
+
+            def sedentary_duration_snapshot(
+                self,
+            ) -> SedentaryDurationSnapshot:
+                return SedentaryDurationSnapshot(
+                    seated_seconds=self.seated_seconds,
+                )
+
+        class FakeTrayIcon:
+            icon = None
+            title = ""
+
+        application = TrayApplication.__new__(TrayApplication)
+        service = FakeService()
+        tray_icon = FakeTrayIcon()
+        application._service = service
+        application._tray_icon = tray_icon
+        application._tray_locked_image = object()
+        application._tray_unlocked_image = object()
+        application._tray_visual_state = None
+        application._tray_title_text = None
+
+        with patch.object(config, "SEDENTARY_REMINDER_ENABLED", True):
+            application._refresh_tray_visual()
+            first_title = tray_icon.title
+            service.seated_seconds = 61.0
+            application._refresh_tray_visual()
+
+        self.assertIn("不足 1 分钟", first_title)
+        self.assertIn("1 分钟", tray_icon.title)
+        self.assertNotEqual(first_title, tray_icon.title)
 
 
 class PresenceDecisionTests(unittest.TestCase):

@@ -50,8 +50,11 @@ from privacy_blur import (
     PrivacyBlurSnapshot,
 )
 from sedentary_reminder import (
+    SedentaryDurationSignal,
+    SedentaryDurationSnapshot,
     SedentaryReminderSignal,
     SedentaryReminderSnapshot,
+    format_sedentary_duration,
 )
 from session_monitor import SessionMonitor
 from single_instance import (
@@ -253,6 +256,34 @@ def _cursor_position() -> tuple[int, int]:
     return int(point.x), int(point.y)
 
 
+def format_tray_title(
+    monitoring_running: bool,
+    sedentary_enabled: bool,
+    seated_seconds: Optional[float],
+) -> str:
+    """Build the two-line Windows tray tooltip."""
+    if not sedentary_enabled:
+        duration_text = "久坐提醒已关闭"
+    elif not monitoring_running:
+        duration_text = "未计时"
+    elif seated_seconds is None:
+        duration_text = "等待确认"
+    elif seated_seconds < 0:
+        raise ValueError("Seated time cannot be negative")
+    elif seated_seconds < 60:
+        duration_text = "不足 1 分钟"
+    else:
+        duration_text = format_sedentary_duration(seated_seconds)
+
+    monitoring_text = (
+        "监控运行中" if monitoring_running else "监控已暂停"
+    )
+    return (
+        f"已连续未离席：{duration_text}\n"
+        f"{config.APPLICATION_TITLE} · {monitoring_text}"
+    )
+
+
 class MonitoringService:
     """Start, pause, resume, and restart the monitoring worker safely."""
 
@@ -268,6 +299,7 @@ class MonitoringService:
         self._debug_frame_buffer = DebugFrameBuffer()
         self._privacy_blur_signal = PrivacyBlurSignal()
         self._sedentary_reminder_signal = SedentaryReminderSignal()
+        self._sedentary_duration_signal = SedentaryDurationSignal()
 
     def status_detail(self) -> str:
         with self._state_lock:
@@ -295,6 +327,9 @@ class MonitoringService:
 
     def sedentary_reminder_snapshot(self) -> SedentaryReminderSnapshot:
         return self._sedentary_reminder_signal.snapshot()
+
+    def sedentary_duration_snapshot(self) -> SedentaryDurationSnapshot:
+        return self._sedentary_duration_signal.snapshot()
 
     def clear_sedentary_reminder(self) -> None:
         self._sedentary_reminder_signal.clear()
@@ -332,6 +367,7 @@ class MonitoringService:
     def pause_async(self) -> None:
         self._privacy_blur_signal.clear()
         self._sedentary_reminder_signal.clear()
+        self._sedentary_duration_signal.clear()
         self._update_status("pausing", "正在暂停并释放摄像头")
         self._debug_frame_buffer.clear(
             "监控正在暂停 · 调试画面已清空"
@@ -347,6 +383,7 @@ class MonitoringService:
         """Stop monitoring synchronously from a non-UI worker thread."""
         self._privacy_blur_signal.clear()
         self._sedentary_reminder_signal.clear()
+        self._sedentary_duration_signal.clear()
         self._update_status("pausing", "正在暂停并释放摄像头")
         self._debug_frame_buffer.clear(
             "监控正在暂停 · 调试画面已清空"
@@ -356,6 +393,7 @@ class MonitoringService:
     def restart_async(self) -> None:
         self._privacy_blur_signal.clear()
         self._sedentary_reminder_signal.clear()
+        self._sedentary_duration_signal.clear()
         self._update_status("starting", "正在应用设置并重启监控")
         self._debug_frame_buffer.clear(
             "正在重新启动监控 · 调试画面已清空"
@@ -393,6 +431,7 @@ class MonitoringService:
             if not should_run:
                 self._privacy_blur_signal.clear()
                 self._sedentary_reminder_signal.clear()
+                self._sedentary_duration_signal.clear()
                 self._update_status("paused", "监控已暂停 · 摄像头已释放")
                 self._debug_frame_buffer.clear(
                     "监控已暂停 · 调试画面已清空"
@@ -429,6 +468,7 @@ class MonitoringService:
             debug_frame_buffer=self._debug_frame_buffer,
             privacy_blur_signal=self._privacy_blur_signal,
             sedentary_reminder_signal=self._sedentary_reminder_signal,
+            sedentary_duration_signal=self._sedentary_duration_signal,
         )
         with self._state_lock:
             if self._thread is threading.current_thread():
@@ -449,6 +489,7 @@ class MonitoringService:
                 worker.join(timeout=30.0)
             self._privacy_blur_signal.clear()
             self._sedentary_reminder_signal.clear()
+            self._sedentary_duration_signal.clear()
             self._debug_frame_buffer.clear(
                 "程序正在退出 · 调试画面已清空"
             )
@@ -537,6 +578,7 @@ class TrayApplication:
         self._tray_locked_image = self._create_icon_image(locked=True)
         self._tray_unlocked_image = self._create_icon_image(locked=False)
         self._tray_visual_state: Optional[bool] = None
+        self._tray_title_text: Optional[str] = None
         self._tray_icon = pystray.Icon(
             "seat_sentinel",
             self._tray_unlocked_image,
@@ -734,18 +776,23 @@ class TrayApplication:
     def _refresh_tray_visual(self) -> None:
         """Match the tray lock symbol to the monitoring state."""
         monitoring_running = self._service.is_running()
-        if monitoring_running == self._tray_visual_state:
-            return
-        self._tray_icon.icon = (
-            self._tray_locked_image
-            if monitoring_running
-            else self._tray_unlocked_image
+        if monitoring_running != self._tray_visual_state:
+            self._tray_icon.icon = (
+                self._tray_locked_image
+                if monitoring_running
+                else self._tray_unlocked_image
+            )
+            self._tray_visual_state = monitoring_running
+
+        duration_snapshot = self._service.sedentary_duration_snapshot()
+        title_text = format_tray_title(
+            monitoring_running,
+            config.SEDENTARY_REMINDER_ENABLED,
+            duration_snapshot.seated_seconds,
         )
-        self._tray_icon.title = (
-            f"{config.APPLICATION_TITLE} · "
-            f"{'监控运行中' if monitoring_running else '监控已暂停'}"
-        )
-        self._tray_visual_state = monitoring_running
+        if title_text != self._tray_title_text:
+            self._tray_icon.title = title_text
+            self._tray_title_text = title_text
 
     def _ensure_lock_warning_window(self) -> tk.Toplevel:
         window = self._lock_warning_window

@@ -34,6 +34,7 @@ from face_identity import (
 )
 from privacy_blur import PrivacyBlurSignal, SecondPersonPrivacyGuard
 from sedentary_reminder import (
+    SedentaryDurationSignal,
     SedentaryReminderSignal,
     SedentaryTracker,
     format_sedentary_duration,
@@ -1461,6 +1462,7 @@ def run(
     debug_frame_buffer: Optional[DebugFrameBuffer] = None,
     privacy_blur_signal: Optional[PrivacyBlurSignal] = None,
     sedentary_reminder_signal: Optional[SedentaryReminderSignal] = None,
+    sedentary_duration_signal: Optional[SedentaryDurationSignal] = None,
 ) -> int:
     """Run persistent lock, unlock, and resume cycles."""
     camera: Optional[Camera] = None
@@ -1468,6 +1470,10 @@ def run(
     identity_recognizer: Optional[FaceIdentityRecognizer] = None
     face_template: Optional[FaceTemplate] = None
     camera_recheck_not_before: Optional[float] = None
+    sedentary_tracker: Optional[SedentaryTracker] = None
+
+    if sedentary_duration_signal is not None:
+        sedentary_duration_signal.clear()
 
     try:
         _clear_debug_frame(
@@ -1525,6 +1531,7 @@ def run(
             SedentaryTracker(
                 config.SEDENTARY_REMINDER_INTERVAL_SECONDS,
                 config.SEDENTARY_LEAVE_CONFIRMATION_SECONDS,
+                duration_signal=sedentary_duration_signal,
             )
             if config.SEDENTARY_REMINDER_ENABLED
             else None
@@ -1686,6 +1693,10 @@ def run(
         return 1
     finally:
         _clear_privacy_blur(privacy_blur_signal)
+        if sedentary_tracker is not None:
+            sedentary_tracker.reset()
+        elif sedentary_duration_signal is not None:
+            sedentary_duration_signal.clear()
         if camera is not None:
             camera.release()
         _clear_debug_frame(

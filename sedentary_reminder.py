@@ -58,6 +58,45 @@ class SedentaryReminderSignal:
             )
 
 
+@dataclass(frozen=True)
+class SedentaryDurationSnapshot:
+    """Current continuous seated duration shared with the tray thread."""
+
+    seated_seconds: Optional[float] = None
+    observed_at: Optional[float] = None
+
+
+class SedentaryDurationSignal:
+    """Publish the current seated duration without consuming reminders."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._snapshot = SedentaryDurationSnapshot()
+
+    def snapshot(self) -> SedentaryDurationSnapshot:
+        with self._lock:
+            return self._snapshot
+
+    def update(
+        self,
+        seated_seconds: float,
+        timestamp: Optional[float] = None,
+    ) -> None:
+        if seated_seconds < 0:
+            raise ValueError("Seated time cannot be negative")
+        with self._lock:
+            self._snapshot = SedentaryDurationSnapshot(
+                seated_seconds=float(seated_seconds),
+                observed_at=(
+                    time.monotonic() if timestamp is None else timestamp
+                ),
+            )
+
+    def clear(self) -> None:
+        with self._lock:
+            self._snapshot = SedentaryDurationSnapshot()
+
+
 class SedentaryTracker:
     """Emit one reminder per interval until a confirmed leave resets time."""
 
@@ -65,6 +104,7 @@ class SedentaryTracker:
         self,
         reminder_interval_seconds: float,
         leave_confirmation_seconds: float,
+        duration_signal: Optional[SedentaryDurationSignal] = None,
     ) -> None:
         if reminder_interval_seconds <= 0:
             raise ValueError("Reminder interval must be positive")
@@ -72,6 +112,7 @@ class SedentaryTracker:
             raise ValueError("Leave confirmation time must be positive")
         self._reminder_interval_seconds = reminder_interval_seconds
         self._leave_confirmation_seconds = leave_confirmation_seconds
+        self._duration_signal = duration_signal
         self._seated_started_at: Optional[float] = None
         self._not_present_started_at: Optional[float] = None
         self._last_observed_at: Optional[float] = None
@@ -82,6 +123,8 @@ class SedentaryTracker:
         self._not_present_started_at = None
         self._last_observed_at = None
         self._next_reminder_seconds = self._reminder_interval_seconds
+        if self._duration_signal is not None:
+            self._duration_signal.clear()
 
     def observe(
         self,
@@ -108,6 +151,8 @@ class SedentaryTracker:
             self._not_present_started_at = None
         else:
             if self._seated_started_at is None:
+                if self._duration_signal is not None:
+                    self._duration_signal.clear()
                 return None
             if self._not_present_started_at is None:
                 self._not_present_started_at = now
@@ -116,10 +161,18 @@ class SedentaryTracker:
                 >= self._leave_confirmation_seconds
             ):
                 self.reset()
+                return None
+            if self._duration_signal is not None:
+                self._duration_signal.update(
+                    max(0.0, now - self._seated_started_at),
+                    now,
+                )
             return None
 
         assert self._seated_started_at is not None
         seated_seconds = max(0.0, now - self._seated_started_at)
+        if self._duration_signal is not None:
+            self._duration_signal.update(seated_seconds, now)
         if seated_seconds < self._next_reminder_seconds:
             return None
 
