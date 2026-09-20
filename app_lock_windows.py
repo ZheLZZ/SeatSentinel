@@ -282,9 +282,6 @@ class AppLockWindow:
                     tk.Label(panel, text="请在主屏输入密码", fg="white", bg="#101827",
                              font=("Microsoft YaHei UI", 13)).pack()
                     window.bind("<Button-1>", lambda event: self.entry.focus_force())
-                tk.Label(panel, text="应用级遮挡保护 · 无法替代 Windows 安全锁屏",
-                         fg="#788ba4", bg="#101827",
-                         font=("Microsoft YaHei UI", 10)).pack(pady=(30, 0))
                 window.update_idletasks()
                 left, top, right, bottom = monitor.monitor
                 window.deiconify()

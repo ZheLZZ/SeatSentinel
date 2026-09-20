@@ -191,7 +191,9 @@ def parent():
     info.wShowWindow = 0
     try:
         if "--packaged" in sys.argv:
-            executable = ROOT / "dist" / "app-lock-preview" / "SeatSentinel" / "SeatSentinel.exe"
+            argument = sys.argv.index("--packaged") + 1
+            executable = (Path(sys.argv[argument]).resolve() if argument < len(sys.argv)
+                          else ROOT / "dist" / "app-lock-preview" / "SeatSentinel" / "SeatSentinel.exe")
             command = [str(executable), "--self-test"]
         else:
             command = [sys.executable, __file__, "--child"] + sys.argv[1:]
