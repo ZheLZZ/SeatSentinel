@@ -389,7 +389,7 @@ OpenCV 的 BGR 画面在显示前转换为 RGB，并按原始比例缩放。Tkin
 ## 本地测试
 
 ```powershell
-python -m compileall .
+python -m compileall -q -x '[\\/](\.venv|build|dist)[\\/]' .
 python -m unittest discover -s tests -v
 python app.py --self-test
 ```
@@ -397,6 +397,9 @@ python app.py --self-test
 `--self-test` 不会打开摄像头。它会验证三组模型、256 维特征链路以及单窗口跨屏
 DWM Acrylic 的窗口属性、双屏工作区和任务栏裁切，并枚举摄像头用于诊断；已保存的
 设备名称在另一台电脑上不存在时只记录警告，不会把跨设备差异误判为程序故障。
+
+GitHub PR 和 `main` 推送会自动运行 Windows / Python 3.13 的语法检查和回归测试。
+模型推理、打包资源和真实锁屏窗口另用本机自检验证；云端回归测试不要求 NPU 或摄像头。
 
 ## 本地构建 EXE
 

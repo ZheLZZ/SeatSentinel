@@ -223,6 +223,7 @@ class AppLockWindow:
         self._timer: str | None = None
         self._result: tuple[bool, str] | None = None
         self._verifying = False
+        self._retry_message_active = False
         self._preview = False
         self._preview_deadline = 0.0
         self._generation = 0
@@ -255,6 +256,7 @@ class AppLockWindow:
         self._result = None
         self.password.set("")
         self.message.set("")
+        self._retry_message_active = False
         self._theme = LandscapeTheme()
         try:
             self._rebuild()
@@ -468,11 +470,13 @@ class AppLockWindow:
         if self._preview or self._saver_active or self._verifying or self.gate is None:
             return
         if self.gate.retry_seconds:
+            self._retry_message_active = True
             self.message.set(f"尝试过于频繁，请 {self.gate.retry_seconds} 秒后重试")
             return
         password = self.password.get()
         self.password.set("")
         self._verifying = True
+        self._retry_message_active = False
         self.button.configure(state="disabled")
         self.message.set("正在验证…")
         gate = self.gate
@@ -508,7 +512,11 @@ class AppLockWindow:
                 self.button.configure(state="normal")
                 self.message.set(error or "密码不正确，请重试")
             if self.gate is not None and self.gate.retry_seconds:
+                self._retry_message_active = True
                 self.message.set(f"尝试过于频繁，请 {self.gate.retry_seconds} 秒后重试")
+            elif self._retry_message_active and not self._verifying:
+                self._retry_message_active = False
+                self.message.set("请重新输入密码")
             self._rebuild()
             self._refresh_clock()
             self._update_saver()

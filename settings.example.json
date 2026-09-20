@@ -1,6 +1,7 @@
 {
   "lock_mode": "SYSTEM",
   "app_lock_password_hash": "",
+  "app_lock_oled_protection": true,
   "camera_name": "FHD Camera",
   "detection_interval_seconds": 0.5,
   "face_confidence_threshold": 0.6,

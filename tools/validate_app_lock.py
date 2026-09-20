@@ -202,6 +202,12 @@ def child():
         lock._submit()
         pump_until(lambda: not lock._verifying)
         assert lock.active and not unlocked and not errors
+        lock.gate.retry_at = time.monotonic() + 3
+        lock._submit()
+        assert lock._retry_message_active and not lock._verifying
+        lock.gate.retry_at = time.monotonic() - 1
+        pump_until(lambda: lock.message.get() == "请重新输入密码")
+        assert lock.active and not unlocked
         # Simulate a display topology refresh with the lock already active.
         lock._signature = ()
         lock._rebuild()
