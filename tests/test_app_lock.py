@@ -118,9 +118,9 @@ class SettingsUiTests(unittest.TestCase):
         application._face_template_store = Mock()
         return application
 
-    def variables(self, settings, mode="APPLICATION", old="", new="Example!482"):
+    def variables(self, settings, mode="APPLICATION", new="Example!482"):
         values = asdict(settings)
-        values.update(lock_mode=LOCK_MODE_LABELS[mode], app_lock_old_password=old,
+        values.update(lock_mode=LOCK_MODE_LABELS[mode],
                       app_lock_new_password=new, app_lock_confirm_password=new,
                       app_lock_empty_password=False)
         return {key: Mock(get=Mock(return_value=value)) for key, value in values.items()}
@@ -136,12 +136,36 @@ class SettingsUiTests(unittest.TestCase):
             application._save_settings(self.variables(saved, new=""), Mock(), saved)
             self.assertEqual(application._settings_store.save.call_args.args[0], saved)
 
-    def test_password_change_or_disable_requires_current_password(self):
+    def test_unlocked_password_change_and_mode_switch_need_no_old_password(self):
         application = self.application()
         settings = AppSettings.from_mapping({"lock_mode": "APPLICATION",
                                             "app_lock_password_hash": hash_password("Example!482")})
-        with patch("app.messagebox.showerror") as error:
+        with patch.object(AppSettings, "apply_to_runtime"), patch("app.messagebox.showerror") as error:
+            application._save_settings(self.variables(settings, new="新"), Mock(), settings)
+            saved = application._settings_store.save.call_args.args[0]
+            self.assertTrue(verify_password("新", saved.app_lock_password_hash))
+            self.assertFalse(verify_password("Example!482", saved.app_lock_password_hash))
             application._save_settings(self.variables(settings, mode="SYSTEM", new=""), Mock(), settings)
+            saved = application._settings_store.save.call_args.args[0]
+            self.assertEqual(saved.lock_mode, "SYSTEM")
+            self.assertEqual(saved.app_lock_password_hash, settings.app_lock_password_hash)
+            error.assert_not_called()
+
+    def test_locked_application_cannot_save_password_changes_from_open_settings(self):
+        application = self.application()
+        settings = AppSettings.defaults()
+        application._service.app_lock_signal.request()
+        application._service.app_lock_signal.complete("locked")
+        application._save_settings(self.variables(settings), Mock(), settings)
+        application._settings_store.save.assert_not_called()
+
+    def test_mismatched_new_passwords_do_not_overwrite_existing_password(self):
+        application = self.application()
+        settings = AppSettings.from_mapping({"app_lock_password_hash": hash_password("原")})
+        values = self.variables(settings, new="新")
+        values["app_lock_confirm_password"].get.return_value = "另一个"
+        with patch("app.messagebox.showerror") as error:
+            application._save_settings(values, Mock(), settings)
             error.assert_called_once()
             application._settings_store.save.assert_not_called()
 
@@ -156,7 +180,7 @@ class SettingsUiTests(unittest.TestCase):
             application._save_settings(values, Mock(), saved)
             saved = application._settings_store.save.call_args.args[0]
             self.assertTrue(verify_password("单", saved.app_lock_password_hash))
-            values = self.variables(saved, old="单", new="")
+            values = self.variables(saved, new="")
             values["app_lock_empty_password"].get.return_value = True
             application._save_settings(values, Mock(), saved)
             self.assertTrue(verify_password("", application._settings_store.save.call_args.args[0].app_lock_password_hash))

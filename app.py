@@ -3270,7 +3270,6 @@ class TrayApplication:
 
         variables = {
             "lock_mode": tk.StringVar(value=LOCK_MODE_LABELS[settings.lock_mode]),
-            "app_lock_old_password": tk.StringVar(),
             "app_lock_new_password": tk.StringVar(),
             "app_lock_confirm_password": tk.StringVar(),
             "app_lock_empty_password": tk.BooleanVar(value=False),
@@ -3326,7 +3325,7 @@ class TrayApplication:
 
         rows = [
             ("离席锁屏方式", "lock_mode"),
-            ("原应用密码（修改时填写）", "app_lock_old_password"),
+            ("当前应用密码", "app_lock_password_status"),
             ("新应用密码（留空保留）", "app_lock_new_password"),
             ("确认新应用密码", "app_lock_confirm_password"),
             ("空密码", "app_lock_empty_password"),
@@ -3359,7 +3358,13 @@ class TrayApplication:
                 pady=6,
                 sticky="w",
             )
-            if key == "app_lock_empty_password":
+            if key == "app_lock_password_status":
+                record = settings.app_lock_password_hash
+                status = ("未设置密码" if not record else
+                          "已设为空密码" if verify_password("", record) else
+                          "●●●●●●  已设置密码")
+                widget = ttk.Label(content, text=status)
+            elif key == "app_lock_empty_password":
                 widget = ttk.Checkbutton(content, variable=variables[key],
                                          text="设为空密码（锁定后直接点解锁）")
             elif key in {
@@ -3554,7 +3559,7 @@ class TrayApplication:
             text=(
                 "应用锁屏密码不限长度和字符，支持中文、空格及空密码。"
                 "已有密码时，新密码留空会保留原密码；如需清空，请勾选“设为空密码”。"
-                "改密码或切换锁屏方式须验证原密码。托盘右键“应用锁屏”可随时手动锁定。"
+                "解锁状态下可直接设置新密码，无需输入旧密码。托盘右键“应用锁屏”可随时手动锁定。"
                 "应用模式在监控及锁定期间保持系统和屏幕唤醒，锁定时覆盖所有显示器；"
                 "不会调用 Windows 锁屏。它无法防止管理员访问或强制结束进程。"
                 "Ctrl+Alt+Del 安全界面及公司策略、屏保、动态锁仍可能触发系统锁屏或绕过遮挡。"
@@ -3671,9 +3676,6 @@ class TrayApplication:
                                    (not password_record and lock_mode == "APPLICATION"))
             if not empty_password and new_password != confirmation:
                 raise SettingsError("两次输入的新密码不一致")
-            if password_record and (change_password or lock_mode != old_settings.lock_mode):
-                if not verify_password(variables["app_lock_old_password"].get(), password_record):
-                    raise SettingsError("原应用锁屏密码不正确")
             if change_password:
                 try:
                     password_record = hash_password("" if empty_password else new_password)

@@ -220,9 +220,25 @@ def child():
             application._app_lock_window._submit()
             pump_app_until(lambda: not application._application_locked())
             pump_app_until(lambda: not application._awake_request.active)
-            application._show_settings()
-            application._root.update()
-            capture_window(application._settings_window, destination / "settings-window.png")
+            def label_texts(widget):
+                texts = []
+                if "text" in widget.keys():
+                    texts.append(str(widget.cget("text")))
+                for child_widget in widget.winfo_children():
+                    texts.extend(label_texts(child_widget))
+                return texts
+
+            for record, status in (("", "未设置密码"), (hash_password(""), "已设为空密码"),
+                                   (hash_password("单"), "●●●●●●  已设置密码")):
+                application._settings_store.save(replace(AppSettings.defaults(),
+                                                         app_lock_password_hash=record))
+                application._show_settings()
+                application._root.update()
+                texts = label_texts(application._settings_window)
+                assert status in texts
+                assert not any("原应用密码" in label for label in texts)
+                capture_window(application._settings_window, destination / "settings-window.png")
+                application._settings_window.destroy()
     finally:
         application._shutdown_started.set()
         application._app_lock_window.close()
