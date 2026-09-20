@@ -2,6 +2,7 @@
 
 import tempfile
 import json
+import queue
 import ctypes
 import time
 import threading
@@ -34,13 +35,17 @@ class CredentialTests(unittest.TestCase):
         self.assertTrue(verify_password("Example!482", self.record))
         self.assertFalse(verify_password("Wrong!482", self.record))
 
-    def test_bad_record_and_password_bounds(self):
+    def test_bad_record_is_rejected(self):
         for value in ("", "pbkdf2_sha256$9999999999$00$00", self.record[:-1]):
             self.assertFalse(validate_password_record(value))
             self.assertFalse(verify_password("Example!482", value))
-        for password in ("short", "x" * 129, "has space", "中文密码12345"):
-            with self.assertRaises(ValueError):
-                hash_password(password)
+
+    def test_passwords_have_no_length_or_character_requirements(self):
+        for password in ("", "1", "x" * 1024, " ", " has space ", "中文🔑密码"):
+            with self.subTest(password=repr(password[:20])):
+                record = hash_password(password)
+                self.assertTrue(verify_password(password, record))
+                self.assertFalse(verify_password(password + "x", record))
 
     def test_cooldown_blocks_even_correct_password_until_expiry(self):
         now = [0.0]
@@ -116,7 +121,8 @@ class SettingsUiTests(unittest.TestCase):
     def variables(self, settings, mode="APPLICATION", old="", new="Example!482"):
         values = asdict(settings)
         values.update(lock_mode=LOCK_MODE_LABELS[mode], app_lock_old_password=old,
-                      app_lock_new_password=new, app_lock_confirm_password=new)
+                      app_lock_new_password=new, app_lock_confirm_password=new,
+                      app_lock_empty_password=False)
         return {key: Mock(get=Mock(return_value=value)) for key, value in values.items()}
 
     def test_enable_and_preserve_existing_password_without_exposing_plaintext(self):
@@ -139,6 +145,22 @@ class SettingsUiTests(unittest.TestCase):
             error.assert_called_once()
             application._settings_store.save.assert_not_called()
 
+    def test_first_enable_accepts_empty_and_checkbox_can_clear_existing_password(self):
+        application = self.application()
+        old = AppSettings.defaults()
+        with patch.object(AppSettings, "apply_to_runtime"):
+            application._save_settings(self.variables(old, new=""), Mock(), old)
+            saved = application._settings_store.save.call_args.args[0]
+            self.assertTrue(verify_password("", saved.app_lock_password_hash))
+            values = self.variables(saved, new="单")
+            application._save_settings(values, Mock(), saved)
+            saved = application._settings_store.save.call_args.args[0]
+            self.assertTrue(verify_password("单", saved.app_lock_password_hash))
+            values = self.variables(saved, old="单", new="")
+            values["app_lock_empty_password"].get.return_value = True
+            application._save_settings(values, Mock(), saved)
+            self.assertTrue(verify_password("", application._settings_store.save.call_args.args[0].app_lock_password_hash))
+
     def test_tray_commands_cannot_pause_or_exit_a_locked_application(self):
         application = self.application()
         application._service.app_lock_signal.request()
@@ -147,6 +169,70 @@ class SettingsUiTests(unittest.TestCase):
         application._show_settings()
         application._show_debug_window()
         application._service.pause_async.assert_not_called()
+
+
+class ManualLockTests(unittest.TestCase):
+    def application(self, running):
+        application = SettingsUiTests().application()
+        application._root = Mock()
+        application._shutdown_started = threading.Event()
+        application._manual_app_lock = False
+        application._manual_lock_preparing = False
+        application._resume_after_manual_lock = False
+        application._manual_lock_results = queue.SimpleQueue()
+        application._awake_request = Mock()
+        application._awake_error = ""
+        application._hide_privacy_blur = Mock()
+        application._app_lock_window = Mock(active=True)
+        application._settings_store.load.return_value = AppSettings.from_mapping({
+            "lock_mode": "SYSTEM", "app_lock_password_hash": hash_password("1")})
+        application._service.is_running.return_value = running
+        application._service.status_snapshot.return_value = ("paused", "paused")
+        return application
+
+    def test_manual_lock_works_in_system_mode_and_restores_prior_monitoring_state(self):
+        for running in (False, True):
+            with self.subTest(running=running):
+                application = self.application(running)
+                def immediate_thread(**kwargs):
+                    return Mock(start=kwargs["target"])
+                with patch("app.threading.Thread", side_effect=immediate_thread), \
+                        patch.object(config, "LOCK_MODE", "SYSTEM"), \
+                        patch("main.lock_workstation") as system_lock:
+                    application._request_manual_app_lock()
+                    application._service.pause_blocking.assert_called_once()
+                    self.assertTrue(application._application_locked())
+                    application._poll_app_lock()
+                    application._app_lock_window.show.assert_called_once()
+                    self.assertEqual(application._service.app_lock_signal.state, "locked")
+                    application._awake_request.update.assert_called_with(True)
+                    application._app_lock_unlocked()
+                    self.assertFalse(application._application_locked())
+                    self.assertEqual(application._service.start_async.call_count, int(running))
+                    application._settings_store.save.assert_not_called()
+                    system_lock.assert_not_called()
+
+    def test_unconfigured_manual_lock_opens_settings_without_locking(self):
+        application = self.application(False)
+        application._settings_store.load.return_value = AppSettings.defaults()
+        application._show_settings = Mock()
+        application._settings_window = Mock()
+        with patch("app.messagebox.showinfo"):
+            application._request_manual_app_lock()
+        application._show_settings.assert_called_once()
+        application._service.pause_blocking.assert_not_called()
+        application._app_lock_window.show.assert_not_called()
+
+    def test_pause_failure_never_reports_a_successful_lock(self):
+        application = self.application(True)
+        application._manual_app_lock = True
+        application._manual_lock_preparing = True
+        application._resume_after_manual_lock = True
+        application._manual_lock_results.put("camera did not stop")
+        application._poll_app_lock()
+        self.assertEqual(application._service.app_lock_signal.state, "failed")
+        application._app_lock_window.show.assert_not_called()
+        self.assertFalse(application._application_locked())
 
 
 class PrivateTestUnlockTests(unittest.TestCase):
@@ -173,6 +259,10 @@ class PrivateTestUnlockTests(unittest.TestCase):
 
 
 class InputAndPowerTests(unittest.TestCase):
+    def test_password_paste_and_input_method_switch_remain_available(self):
+        for key in (0x11, 0xA2, 0xA3, 0x41, 0x56, 0x20, 0x10):
+            self.assertFalse(block_key(key, alt=False, ctrl=True, own_focus=True))
+
     def test_recovery_chord_recognizes_modifiers_even_when_hooks_block_them(self):
         callbacks, candidates = {}, []
         guard = InputGuard(candidates.append)

@@ -583,9 +583,13 @@ class TrayApplication:
         self._service = MonitoringService(self._settings_store)
         self._awake_request = AwakeRequest()
         self._awake_error = ""
+        self._manual_app_lock = False
+        self._manual_lock_preparing = False
+        self._resume_after_manual_lock = False
+        self._manual_lock_results: queue.SimpleQueue[Optional[str]] = queue.SimpleQueue()
         self._app_lock_window = AppLockWindow(
             self._root,
-            lambda: self._service.app_lock_signal.complete("unlocked"),
+            self._app_lock_unlocked,
             self._app_lock_failed,
         )
         self._tray_locked_image = self._create_icon_image(locked=True)
@@ -609,6 +613,11 @@ class TrayApplication:
                     "运行状态 / 调试",
                     self._show_debug_from_tray,
                     default=True,
+                ),
+                pystray.MenuItem(
+                    "应用锁屏",
+                    self._app_lock_from_tray,
+                    enabled=lambda item: not self._application_locked(),
                 ),
                 pystray.MenuItem(
                     "暂停监控",
@@ -783,27 +792,87 @@ class TrayApplication:
 
     def _application_locked(self) -> bool:
         signal = getattr(self._service, "app_lock_signal", None)
-        return bool(signal is not None and signal.busy)
+        return bool(getattr(self, "_manual_app_lock", False) or
+                    (signal is not None and signal.busy))
+
+    def _app_lock_from_tray(self, icon: pystray.Icon, item: pystray.MenuItem) -> None:
+        self._root.after(0, self._request_manual_app_lock)
+
+    def _request_manual_app_lock(self) -> None:
+        if self._application_locked() or self._shutdown_started.is_set():
+            return
+        try:
+            settings = self._settings_store.load()
+            if not settings.app_lock_password_hash:
+                self._show_settings()
+                messagebox.showinfo("应用锁屏", "请先在设置中保存应用锁屏密码。", parent=self._settings_window)
+                return
+        except SettingsError as exc:
+            messagebox.showerror("应用锁屏", str(exc), parent=self._root)
+            return
+        self._resume_after_manual_lock = self._service.is_running()
+        self._manual_app_lock = True
+        self._manual_lock_preparing = True
+
+        def prepare() -> None:
+            try:
+                self._service.pause_blocking()
+                state, detail = self._service.status_snapshot()
+                if state == "error":
+                    raise RuntimeError(detail)
+                self._manual_lock_results.put(None)
+            except Exception as exc:
+                self._manual_lock_results.put(str(exc))
+
+        threading.Thread(target=prepare, name="seat-sentinel-manual-lock", daemon=True).start()
+
+    def _finish_manual_app_lock(self) -> None:
+        if not getattr(self, "_manual_app_lock", False):
+            return
+        resume = self._resume_after_manual_lock
+        self._manual_app_lock = False
+        self._manual_lock_preparing = False
+        self._resume_after_manual_lock = False
+        if resume:
+            self._service.start_async()
+        elif self._service.app_lock_signal.state == "unlocked":
+            self._service._update_status("paused", "应用已解锁 · 监控保持暂停")
+
+    def _app_lock_unlocked(self) -> None:
+        self._service.app_lock_signal.complete("unlocked")
+        self._finish_manual_app_lock()
 
     def _app_lock_failed(self, detail: str) -> None:
         self._service.app_lock_signal.complete("failed", detail)
         self._service._update_status("error", "应用锁屏失败：" + detail)
         LOGGER.error("Application lock unavailable: %s", detail)
+        self._finish_manual_app_lock()
 
     def _poll_app_lock(self) -> None:
         signal = self._service.app_lock_signal
         try:
-            keep_awake = config.LOCK_MODE == "APPLICATION" and (
-                self._service.is_running() or signal.busy
+            if self._manual_lock_preparing:
+                try:
+                    error = self._manual_lock_results.get_nowait()
+                except queue.Empty:
+                    pass
+                else:
+                    self._manual_lock_preparing = False
+                    if error is not None:
+                        self._app_lock_failed(error)
+                        return
+                    signal.request()
+            keep_awake = self._manual_app_lock or signal.busy or (
+                config.LOCK_MODE == "APPLICATION" and self._service.is_running()
             )
             self._awake_request.update(keep_awake)
             self._awake_error = ""
-            if signal.state == "pending":
+            if signal.state == "pending" and not self._manual_lock_preparing:
                 if self._shutdown_started.is_set():
                     signal.complete("cancelled")
                     return
                 settings = self._settings_store.load()
-                if settings.lock_mode != "APPLICATION":
+                if settings.lock_mode != "APPLICATION" and not self._manual_app_lock:
                     raise RuntimeError("应用锁屏设置已变更，请重新启动监控")
                 self._manual_privacy_blur_active = False
                 self._service.clear_privacy_blur()
@@ -3204,6 +3273,7 @@ class TrayApplication:
             "app_lock_old_password": tk.StringVar(),
             "app_lock_new_password": tk.StringVar(),
             "app_lock_confirm_password": tk.StringVar(),
+            "app_lock_empty_password": tk.BooleanVar(value=False),
             "camera_name": tk.StringVar(value=settings.camera_name),
             "camera_monitoring_mode": tk.StringVar(
                 value=CAMERA_MONITORING_MODE_LABELS[
@@ -3259,6 +3329,7 @@ class TrayApplication:
             ("原应用密码（修改时填写）", "app_lock_old_password"),
             ("新应用密码（留空保留）", "app_lock_new_password"),
             ("确认新应用密码", "app_lock_confirm_password"),
+            ("空密码", "app_lock_empty_password"),
             ("摄像头", "camera_name"),
             ("摄像头工作模式", "camera_monitoring_mode"),
             ("空闲开启摄像头（秒）", "camera_activation_idle_seconds"),
@@ -3288,7 +3359,10 @@ class TrayApplication:
                 pady=6,
                 sticky="w",
             )
-            if key in {
+            if key == "app_lock_empty_password":
+                widget = ttk.Checkbutton(content, variable=variables[key],
+                                         text="设为空密码（锁定后直接点解锁）")
+            elif key in {
                 "lock_mode",
                 "camera_name",
                 "camera_monitoring_mode",
@@ -3478,8 +3552,9 @@ class TrayApplication:
         ttk.Label(
             content,
             text=(
-                "应用锁屏：密码须为 8–128 位英文、数字或英文符号，不含空格；"
-                "首次启用请填写并确认新密码，改密码或切换锁屏方式须验证原密码。"
+                "应用锁屏密码不限长度和字符，支持中文、空格及空密码。"
+                "已有密码时，新密码留空会保留原密码；如需清空，请勾选“设为空密码”。"
+                "改密码或切换锁屏方式须验证原密码。托盘右键“应用锁屏”可随时手动锁定。"
                 "应用模式在监控及锁定期间保持系统和屏幕唤醒，锁定时覆盖所有显示器；"
                 "不会调用 Windows 锁屏。它无法防止管理员访问或强制结束进程。"
                 "Ctrl+Alt+Del 安全界面及公司策略、屏保、动态锁仍可能触发系统锁屏或绕过遮挡。"
@@ -3591,14 +3666,17 @@ class TrayApplication:
             new_password = variables["app_lock_new_password"].get()
             confirmation = variables["app_lock_confirm_password"].get()
             password_record = old_settings.app_lock_password_hash
-            if new_password != confirmation:
+            empty_password = variables["app_lock_empty_password"].get()
+            change_password = bool(new_password or confirmation or empty_password or
+                                   (not password_record and lock_mode == "APPLICATION"))
+            if not empty_password and new_password != confirmation:
                 raise SettingsError("两次输入的新密码不一致")
-            if password_record and (new_password or lock_mode != old_settings.lock_mode):
+            if password_record and (change_password or lock_mode != old_settings.lock_mode):
                 if not verify_password(variables["app_lock_old_password"].get(), password_record):
                     raise SettingsError("原应用锁屏密码不正确")
-            if new_password:
+            if change_password:
                 try:
-                    password_record = hash_password(new_password)
+                    password_record = hash_password("" if empty_password else new_password)
                 except ValueError as exc:
                     raise SettingsError(str(exc)) from exc
             settings = AppSettings.from_mapping(

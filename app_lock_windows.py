@@ -62,7 +62,9 @@ class KeyboardData(ctypes.Structure):
 def block_key(vk: int, *, alt: bool, ctrl: bool, own_focus: bool) -> bool:
     """Allow password editing only; no Windows/Alt/function/system shortcuts."""
     return (not own_focus or vk in {0x5B, 0x5C, 0x5D, 0x1B, 0x2C}
-            or 0x70 <= vk <= 0x87 or alt or (ctrl and vk != 0x41))
+            or 0x70 <= vk <= 0x87 or alt
+            or (ctrl and vk not in {0x41, 0x43, 0x56, 0x58, 0x20, 0x08,
+                                   0x10, 0x11, 0xA0, 0xA1, 0xA2, 0xA3}))
 
 
 class InputGuard:

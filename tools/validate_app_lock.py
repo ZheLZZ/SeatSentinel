@@ -63,6 +63,9 @@ def capture_window(window, path):
 
 def child():
     import tkinter as tk
+    import tempfile
+    from dataclasses import replace
+    from user_settings import AppSettings, SettingsStore
     from app_lock import hash_password
     from app_lock_windows import AppLockWindow, AwakeRequest, user32
     from private_test_unlock import PrivateTestUnlock
@@ -126,12 +129,46 @@ def child():
     from app import TrayApplication
     application = TrayApplication()
     try:
-        application._show_settings()
-        application._root.update()
-        capture_window(application._settings_window, destination / "settings-window.png")
+        with tempfile.TemporaryDirectory() as directory:
+            application._settings_store = SettingsStore(path=Path(directory) / "settings.json")
+            application._service._settings_store = application._settings_store
+            application._settings_store.save(replace(AppSettings.defaults(),
+                                                     app_lock_password_hash=hash_password("单")))
+            manual_item = next(item for item in application._tray_icon.menu.items
+                               if item.text == "应用锁屏")
+            manual_item(application._tray_icon)
+            application._poll_app_lock()
+            def pump_app_until(predicate):
+                deadline = time.monotonic() + 10
+                while time.monotonic() < deadline:
+                    application._root.update()
+                    if predicate():
+                        return
+                    time.sleep(0.01)
+                raise AssertionError("Manual lock UI timed out")
+            pump_app_until(lambda: application._service.app_lock_signal.state == "locked")
+            assert application._awake_request.active
+            application._app_lock_window.password.set("单")
+            application._app_lock_window._submit()
+            pump_app_until(lambda: not application._application_locked())
+            assert application._service.status_snapshot()[0] == "paused"
+            pump_app_until(lambda: not application._awake_request.active)
+            application._settings_store.save(replace(AppSettings.defaults(),
+                                                     app_lock_password_hash=hash_password("")))
+            manual_item(application._tray_icon)
+            pump_app_until(lambda: application._service.app_lock_signal.state == "locked")
+            application._app_lock_window._submit()
+            pump_app_until(lambda: not application._application_locked())
+            pump_app_until(lambda: not application._awake_request.active)
+            application._show_settings()
+            application._root.update()
+            capture_window(application._settings_window, destination / "settings-window.png")
     finally:
+        application._shutdown_started.set()
+        application._app_lock_window.close()
+        application._awake_request.update(False)
         application._root.destroy()
-    print("PASS: real hooks, monitor coverage, wrong/correct password, display rebuild, preview, wake cleanup and settings UI")
+    print("PASS: real hooks, monitor coverage, wrong/correct password, display rebuild, tray manual lock, Unicode/empty password, preview, wake cleanup and settings UI")
     if "--full-self-test" in sys.argv:
         from app import _run_self_test
         assert _run_self_test() == 0

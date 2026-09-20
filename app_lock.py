@@ -28,17 +28,13 @@ def validate_password_record(record: str) -> bool:
 
 
 def hash_password(password: str) -> str:
-    if not 8 <= len(password) <= 128 or any(
-        ord(char) < 33 or ord(char) > 126 for char in password
-    ):
-        raise ValueError("密码须为 8–128 位英文字母、数字或英文符号（不含空格）")
     salt = secrets.token_bytes(16)
     digest = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, ITERATIONS)
     return f"pbkdf2_sha256${ITERATIONS}${salt.hex()}${digest.hex()}"
 
 
 def verify_password(password: str, record: str) -> bool:
-    if not validate_password_record(record) or len(password) > 128:
+    if not validate_password_record(record):
         return False
     _, _, salt, expected = record.split("$")
     actual = hashlib.pbkdf2_hmac(
