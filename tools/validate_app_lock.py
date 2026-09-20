@@ -104,11 +104,11 @@ def child():
             assert (rect.left, rect.top, rect.right, rect.bottom) == monitor.monitor
         capture_window(lock.windows[0], destination / "lock-window.png")
         # Deterministic idle time while real hooks continue pumping on the desktop.
-        idle = Mock(return_value=59)
+        idle = Mock(return_value=179)
         lock.guard.idle_seconds = idle
         lock._update_saver()
         assert not lock._saver_active
-        idle.return_value = 61
+        idle.return_value = 181
         lock._oled_enabled = False
         lock._update_saver()
         assert not lock._saver_active
@@ -119,8 +119,8 @@ def child():
         capture_window(lock.windows[0], destination / "oled-clock.png")
         from PIL import Image, ImageStat
         with Image.open(destination / "oled-clock.png") as rendered:
-            assert max(ImageStat.Stat(rendered).mean) < 3, "OLED wallpaper was not hidden"
-            assert rendered.getextrema()[0][1] > 20, "OLED clock did not paint"
+            assert max(ImageStat.Stat(rendered).mean) < 10, "OLED wallpaper was not hidden"
+            assert rendered.getextrema()[0][1] >= 220, "OLED clock did not paint at normal brightness"
         positions = [c.oled_overlay.coords("oled_clock") for c in lock._canvases]
         lock._saver_started -= 20
         lock._update_saver()
@@ -251,7 +251,7 @@ def child():
             manual_item(application._tray_icon)
             pump_app_until(lambda: application._service.app_lock_signal.state == "locked")
             empty_lock = application._app_lock_window
-            empty_lock.guard.last_activity = time.monotonic() - 61
+            empty_lock.guard.last_activity = time.monotonic() - 181
             empty_lock._update_saver()
             empty_lock._submit()
             assert application._application_locked()

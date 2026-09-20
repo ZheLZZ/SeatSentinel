@@ -3369,7 +3369,7 @@ class TrayApplication:
                 widget = ttk.Label(content, text=status)
             elif key == "app_lock_oled_protection":
                 widget = ttk.Checkbutton(content, variable=variables[key],
-                                         text="闲置 1 分钟后显示黑底移动时钟")
+                                         text="闲置 3 分钟后显示黑底移动时钟")
             elif key == "app_lock_empty_password":
                 widget = ttk.Checkbutton(content, variable=variables[key],
                                          text="设为空密码（锁定后直接点解锁）")

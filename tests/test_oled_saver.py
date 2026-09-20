@@ -14,10 +14,11 @@ class OledSaverTests(unittest.TestCase):
             self.assertNotEqual(clock_position(width, height, 240, 100, 0),
                                 clock_position(width, height, 240, 100, 20))
 
-    def test_clock_is_dim_and_changes_brightness(self):
-        colors = {clock_color(seconds) for seconds in range(120)}
+    def test_clock_remains_readable_during_slow_tint_changes(self):
+        colors = {clock_color(seconds) for seconds in range(240)}
         self.assertGreater(len(colors), 10)
-        self.assertTrue(all(36 <= int(color[1:3], 16) <= 60 for color in colors))
+        self.assertTrue(all(220 <= int(color[index:index+2], 16) <= 250
+                            for color in colors for index in (1, 3, 5)))
 
     def test_existing_settings_enable_oled_and_opt_out_round_trips(self):
         self.assertTrue(AppSettings.from_mapping({}).app_lock_oled_protection)

@@ -1,9 +1,9 @@
-"""Low-brightness clock motion, independent of monitor origin and DPI."""
+"""Moving clock presentation, independent of monitor origin and DPI."""
 
 import math
 
 
-IDLE_SECONDS = 60.0
+IDLE_SECONDS = 180.0
 
 
 def clock_position(width, height, text_width, text_height, elapsed, screen_index=0):
@@ -22,5 +22,7 @@ def clock_position(width, height, text_width, text_height, elapsed, screen_index
 
 
 def clock_color(elapsed):
-    level = round(48 + 12 * math.sin(elapsed * math.tau / 120))
-    return f"#{level:02x}{level:02x}{level:02x}"
+    # Readable near-white with a slow, subtle cool-to-warm tint.
+    phase = (1 + math.sin(elapsed * math.tau / 240)) / 2
+    red, green, blue = round(225 + 20 * phase), round(237 + 3 * phase), round(250 - 22 * phase)
+    return f"#{red:02x}{green:02x}{blue:02x}"

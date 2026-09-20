@@ -327,7 +327,9 @@ class AppLockWindow:
                                fill="white", font=font("Microsoft YaHei UI", 24))
             window.bind("<Button-1>", lambda event: self.entry.focus_force())
         canvas.oled_overlay = None
-        canvas.oled_font = font("Segoe UI Light", 82)
+        canvas.oled_font = font("Segoe UI Light", 104)
+        canvas.oled_date_font = font("Microsoft YaHei UI", 19)
+        canvas.oled_scale = scale
         canvas.surface_size = (width, height)
         if self._saver_active:
             self._show_saver_surface(canvas)
@@ -338,8 +340,13 @@ class AppLockWindow:
         if canvas.oled_overlay is None:
             overlay = tk.Canvas(canvas.master, background="black", highlightthickness=0,
                                 borderwidth=0, cursor="none", takefocus=False)
-            overlay.create_text(0, 0, text=clock_text()[0], fill="#303030",
-                                font=canvas.oled_font, tags="oled_clock")
+            overlay.create_text(0, 0, text=clock_text()[0], fill=clock_color(0),
+                                font=canvas.oled_font, tags=("oled_clock", "oled_group"))
+            scale = canvas.oled_scale
+            overlay.create_line(-22 * scale, 66 * scale, 22 * scale, 66 * scale,
+                                fill="#91bbc3", width=max(1, round(scale)), tags="oled_group")
+            overlay.create_text(0, 88 * scale, text=clock_text()[1], fill="#bdcdd4",
+                                font=canvas.oled_date_font, tags=("oled_date", "oled_group"))
             canvas.oled_overlay = overlay
         overlay = canvas.oled_overlay
         overlay.place(x=0, y=0, relwidth=1, relheight=1)
@@ -369,10 +376,12 @@ class AppLockWindow:
             for index, canvas in enumerate(self._canvases):
                 overlay = canvas.oled_overlay
                 overlay.itemconfigure("oled_clock", text=clock_text()[0], fill=clock_color(elapsed))
-                bounds = overlay.bbox("oled_clock")
+                overlay.itemconfigure("oled_date", text=clock_text()[1])
+                bounds = overlay.bbox("oled_group")
                 x, y = clock_position(*canvas.surface_size, bounds[2]-bounds[0],
                                       bounds[3]-bounds[1], elapsed, index)
-                overlay.coords("oled_clock", x, y)
+                overlay.move("oled_group", x - (bounds[0] + bounds[2]) / 2,
+                             y - (bounds[1] + bounds[3]) / 2)
 
     def _refresh_hint(self) -> None:
         if not self.windows or not hasattr(self, "_primary_canvas"):
