@@ -101,6 +101,10 @@ try {
     if (-not (Test-Path -LiteralPath $iconIco)) {
         throw "未找到 Windows 图标：$iconIco"
     }
+    $lockscreenBackground = Join-Path $PSScriptRoot "assets\lockscreen-landscape.png"
+    if (-not (Test-Path -LiteralPath $lockscreenBackground -PathType Leaf)) {
+        throw "未找到应用锁屏背景：$lockscreenBackground"
+    }
 
     Write-Host "==> 检查项目依赖" -ForegroundColor Cyan
     & $virtualPython -m pip check
@@ -150,6 +154,7 @@ try {
         --collect-all "pystray" `
         --collect-all "cv2_enumerate_cameras" `
         --add-data "$iconPng;assets" `
+        --add-data "$lockscreenBackground;assets" `
         --add-data "$PSScriptRoot\models;models" `
         "app.py"
     if ($LASTEXITCODE -ne 0) {
@@ -187,14 +192,9 @@ try {
         -Force
 
     Write-Host ""
-    Write-Host "==> 执行不访问摄像头的打包自检" -ForegroundColor Cyan
-    $selfTest = Start-Process `
-        -FilePath $outputExe `
-        -ArgumentList "--self-test" `
-        -Wait `
-        -PassThru `
-        -WindowStyle Hidden
-    if ($selfTest.ExitCode -ne 0) {
+    Write-Host "==> 在独立测试桌面执行打包自检" -ForegroundColor Cyan
+    & $virtualPython "tools\validate_app_lock.py" --packaged $outputExe
+    if ($LASTEXITCODE -ne 0) {
         $logPath = Join-Path `
             $env:LOCALAPPDATA `
             "SeatSentinel\logs\seat-sentinel.log"

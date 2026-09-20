@@ -23,6 +23,8 @@ from PIL import Image, ImageDraw, ImageEnhance, ImageTk
 
 import main as monitoring
 import config
+from app_lock import AppLockSignal, hash_password, verify_password
+from app_lock_windows import AppLockWindow, AwakeRequest
 from debug_frame import DebugFrameBuffer, DebugFrameSnapshot
 from detector import FaceDetection, FaceDetector
 from dwm_privacy import DwmPrivacyError, DwmPrivacyOverlay
@@ -68,6 +70,8 @@ from user_settings import AppSettings, SettingsError, SettingsStore
 
 
 LOGGER = logging.getLogger("seat_sentinel.tray")
+LOCK_MODE_LABELS = {"SYSTEM": "Windows 系统锁屏", "APPLICATION": "应用锁屏（独立密码）"}
+LOCK_MODE_VALUES = {label: value for value, label in LOCK_MODE_LABELS.items()}
 PRESENCE_MODE_LABELS = {
     "ANY_FACE": "任意人脸",
     "REGISTERED_FACE": "仅本人（需注册）",
@@ -300,6 +304,7 @@ class MonitoringService:
         self._privacy_blur_signal = PrivacyBlurSignal()
         self._sedentary_reminder_signal = SedentaryReminderSignal()
         self._sedentary_duration_signal = SedentaryDurationSignal()
+        self.app_lock_signal = AppLockSignal()
 
     def status_detail(self) -> str:
         with self._state_lock:
@@ -469,6 +474,7 @@ class MonitoringService:
             privacy_blur_signal=self._privacy_blur_signal,
             sedentary_reminder_signal=self._sedentary_reminder_signal,
             sedentary_duration_signal=self._sedentary_duration_signal,
+            app_lock_signal=self.app_lock_signal,
         )
         with self._state_lock:
             if self._thread is threading.current_thread():
@@ -575,6 +581,17 @@ class TrayApplication:
             config.FACE_TEMPLATE_PATH
         )
         self._service = MonitoringService(self._settings_store)
+        self._awake_request = AwakeRequest()
+        self._awake_error = ""
+        self._manual_app_lock = False
+        self._manual_lock_preparing = False
+        self._resume_after_manual_lock = False
+        self._manual_lock_results: queue.SimpleQueue[Optional[str]] = queue.SimpleQueue()
+        self._app_lock_window = AppLockWindow(
+            self._root,
+            self._app_lock_unlocked,
+            self._app_lock_failed,
+        )
         self._tray_locked_image = self._create_icon_image(locked=True)
         self._tray_unlocked_image = self._create_icon_image(locked=False)
         self._tray_visual_state: Optional[bool] = None
@@ -596,6 +613,11 @@ class TrayApplication:
                     "运行状态 / 调试",
                     self._show_debug_from_tray,
                     default=True,
+                ),
+                pystray.MenuItem(
+                    "应用锁屏",
+                    self._app_lock_from_tray,
+                    enabled=lambda item: not self._application_locked(),
                 ),
                 pystray.MenuItem(
                     "暂停监控",
@@ -737,6 +759,7 @@ class TrayApplication:
         self._root.after(80, self._refresh_privacy_blur)
         self._root.after(50, self._poll_privacy_hotkey)
         self._root.after(250, self._poll_debug_signal)
+        self._root.after(100, self._poll_app_lock)
         if hotkey_warning is not None:
             self._root.after(
                 300,
@@ -752,6 +775,11 @@ class TrayApplication:
         except KeyboardInterrupt:
             LOGGER.info("Ctrl+C received; closing tray application")
         finally:
+            self._app_lock_window.close()
+            try:
+                self._awake_request.update(False)
+            except RuntimeError:
+                LOGGER.exception("Unable to release keep-awake request")
             self._stop_privacy_hotkey()
             self._manual_privacy_blur_active = False
             self._hide_privacy_blur()
@@ -761,6 +789,114 @@ class TrayApplication:
                 self._root.destroy()
             except tk.TclError:
                 pass
+
+    def _application_locked(self) -> bool:
+        signal = getattr(self._service, "app_lock_signal", None)
+        return bool(getattr(self, "_manual_app_lock", False) or
+                    (signal is not None and signal.busy))
+
+    def _app_lock_from_tray(self, icon: pystray.Icon, item: pystray.MenuItem) -> None:
+        self._root.after(0, self._request_manual_app_lock)
+
+    def _request_manual_app_lock(self) -> None:
+        if self._application_locked() or self._shutdown_started.is_set():
+            return
+        try:
+            settings = self._settings_store.load()
+            if not settings.app_lock_password_hash:
+                self._show_settings()
+                messagebox.showinfo("应用锁屏", "请先在设置中保存应用锁屏密码。", parent=self._settings_window)
+                return
+        except SettingsError as exc:
+            messagebox.showerror("应用锁屏", str(exc), parent=self._root)
+            return
+        self._resume_after_manual_lock = self._service.is_running()
+        self._manual_app_lock = True
+        self._manual_lock_preparing = True
+
+        def prepare() -> None:
+            try:
+                self._service.pause_blocking()
+                state, detail = self._service.status_snapshot()
+                if state == "error":
+                    raise RuntimeError(detail)
+                self._manual_lock_results.put(None)
+            except Exception as exc:
+                self._manual_lock_results.put(str(exc))
+
+        threading.Thread(target=prepare, name="seat-sentinel-manual-lock", daemon=True).start()
+
+    def _finish_manual_app_lock(self) -> None:
+        if not getattr(self, "_manual_app_lock", False):
+            return
+        resume = self._resume_after_manual_lock
+        self._manual_app_lock = False
+        self._manual_lock_preparing = False
+        self._resume_after_manual_lock = False
+        if resume:
+            self._service.start_async()
+        elif self._service.app_lock_signal.state == "unlocked":
+            self._service._update_status("paused", "应用已解锁 · 监控保持暂停")
+
+    def _app_lock_unlocked(self) -> None:
+        self._service.app_lock_signal.complete("unlocked")
+        self._finish_manual_app_lock()
+
+    def _app_lock_failed(self, detail: str) -> None:
+        self._service.app_lock_signal.complete("failed", detail)
+        self._service._update_status("error", "应用锁屏失败：" + detail)
+        LOGGER.error("Application lock unavailable: %s", detail)
+        self._finish_manual_app_lock()
+
+    def _poll_app_lock(self) -> None:
+        signal = self._service.app_lock_signal
+        try:
+            if self._manual_lock_preparing:
+                try:
+                    error = self._manual_lock_results.get_nowait()
+                except queue.Empty:
+                    pass
+                else:
+                    self._manual_lock_preparing = False
+                    if error is not None:
+                        self._app_lock_failed(error)
+                        return
+                    signal.request()
+            keep_awake = self._manual_app_lock or signal.busy or (
+                config.LOCK_MODE == "APPLICATION" and self._service.is_running()
+            )
+            self._awake_request.update(keep_awake)
+            self._awake_error = ""
+            if signal.state == "pending" and not self._manual_lock_preparing:
+                if self._shutdown_started.is_set():
+                    signal.complete("cancelled")
+                    return
+                settings = self._settings_store.load()
+                if settings.lock_mode != "APPLICATION" and not self._manual_app_lock:
+                    raise RuntimeError("应用锁屏设置已变更，请重新启动监控")
+                self._manual_privacy_blur_active = False
+                self._service.clear_privacy_blur()
+                self._hide_privacy_blur()
+                self._app_lock_window.close()  # close a non-locking preview
+                self._app_lock_window.show(settings.app_lock_password_hash,
+                                           oled_protection=settings.app_lock_oled_protection)
+                if self._app_lock_window.active:
+                    signal.complete("locked")
+                    self._service._update_status("locked", "应用已锁定 · 等待密码解锁 · 后台继续运行")
+        except Exception as exc:
+            if signal.state == "pending":
+                self._app_lock_failed(str(exc))
+            elif self._awake_error != str(exc):
+                self._awake_error = str(exc)
+                LOGGER.error("Keep-awake request failed: %s", exc)
+                self._service._update_status("error", "保持唤醒失败：" + str(exc))
+        finally:
+            if not self._shutdown_started.is_set():
+                self._root.after(100, self._poll_app_lock)
+
+    def _preview_app_lock(self) -> None:
+        if not self._application_locked():
+            self._app_lock_window.show("", preview=True)
 
     def _refresh_tray_menu(self) -> None:
         try:
@@ -1167,9 +1303,13 @@ class TrayApplication:
             pass
 
     def _pause(self, icon: pystray.Icon, item: pystray.MenuItem) -> None:
+        if self._application_locked():
+            return
         self._service.pause_async()
 
     def _resume(self, icon: pystray.Icon, item: pystray.MenuItem) -> None:
+        if self._application_locked():
+            return
         self._service.start_async()
 
     def _toggle_privacy_blur_from_tray(
@@ -1187,6 +1327,8 @@ class TrayApplication:
         self._root.after(0, self._toggle_manual_privacy_blur)
 
     def _toggle_manual_privacy_blur(self) -> None:
+        if self._application_locked():
+            return
         snapshot = self._service.privacy_blur_snapshot()
         overlay_active = bool(
             self._manual_privacy_blur_active or snapshot.active
@@ -1379,6 +1521,8 @@ class TrayApplication:
             hotkey.stop()
 
     def _toggle_privacy_blur_setting(self) -> None:
+        if self._application_locked():
+            return
         was_running = self._service.is_running()
         try:
             current = self._settings_store.load()
@@ -1443,6 +1587,8 @@ class TrayApplication:
         self._root.after(0, self._start_face_registration)
 
     def _show_debug_window(self) -> None:
+        if self._application_locked():
+            return
         if (
             self._debug_window is not None
             and self._debug_window.winfo_exists()
@@ -2627,6 +2773,8 @@ class TrayApplication:
             window.destroy()
 
     def _toggle_monitoring(self) -> None:
+        if self._application_locked():
+            return
         if self._service.is_running():
             self._service.pause_async()
         else:
@@ -2733,6 +2881,8 @@ class TrayApplication:
             )
 
     def _start_face_registration(self) -> None:
+        if self._application_locked():
+            return
         existing_window = self._registration_window
         if existing_window is not None and existing_window.winfo_exists():
             existing_window.deiconify()
@@ -3032,6 +3182,8 @@ class TrayApplication:
             self._service.restart_async()
 
     def _show_settings(self) -> None:
+        if self._application_locked():
+            return
         if (
             self._settings_window is not None
             and self._settings_window.winfo_exists()
@@ -3118,6 +3270,11 @@ class TrayApplication:
         window.bind("<MouseWheel>", scroll_settings)
 
         variables = {
+            "lock_mode": tk.StringVar(value=LOCK_MODE_LABELS[settings.lock_mode]),
+            "app_lock_new_password": tk.StringVar(),
+            "app_lock_confirm_password": tk.StringVar(),
+            "app_lock_empty_password": tk.BooleanVar(value=False),
+            "app_lock_oled_protection": tk.BooleanVar(value=settings.app_lock_oled_protection),
             "camera_name": tk.StringVar(value=settings.camera_name),
             "camera_monitoring_mode": tk.StringVar(
                 value=CAMERA_MONITORING_MODE_LABELS[
@@ -3169,6 +3326,12 @@ class TrayApplication:
         ]
 
         rows = [
+            ("离席锁屏方式", "lock_mode"),
+            ("当前应用密码", "app_lock_password_status"),
+            ("新应用密码（留空保留）", "app_lock_new_password"),
+            ("确认新应用密码", "app_lock_confirm_password"),
+            ("空密码", "app_lock_empty_password"),
+            ("OLED 锁屏保护", "app_lock_oled_protection"),
             ("摄像头", "camera_name"),
             ("摄像头工作模式", "camera_monitoring_mode"),
             ("空闲开启摄像头（秒）", "camera_activation_idle_seconds"),
@@ -3198,13 +3361,28 @@ class TrayApplication:
                 pady=6,
                 sticky="w",
             )
-            if key in {
+            if key == "app_lock_password_status":
+                record = settings.app_lock_password_hash
+                status = ("未设置密码" if not record else
+                          "已设为空密码" if verify_password("", record) else
+                          "●●●●●●  已设置密码")
+                widget = ttk.Label(content, text=status)
+            elif key == "app_lock_oled_protection":
+                widget = ttk.Checkbutton(content, variable=variables[key],
+                                         text="闲置 3 分钟后显示黑底移动时钟")
+            elif key == "app_lock_empty_password":
+                widget = ttk.Checkbutton(content, variable=variables[key],
+                                         text="设为空密码（锁定后直接点解锁）")
+            elif key in {
+                "lock_mode",
                 "camera_name",
                 "camera_monitoring_mode",
                 "inference_device",
                 "presence_mode",
             }:
-                if key == "camera_name":
+                if key == "lock_mode":
+                    values = list(LOCK_MODE_VALUES)
+                elif key == "camera_name":
                     values = camera_names
                 elif key == "camera_monitoring_mode":
                     values = list(CAMERA_MONITORING_MODE_VALUES)
@@ -3224,6 +3402,7 @@ class TrayApplication:
                     content,
                     textvariable=variables[key],
                     width=36,
+                    show="●" if key.startswith("app_lock_") else "",
                 )
             widget.grid(
                 row=row_index,
@@ -3384,6 +3563,13 @@ class TrayApplication:
         ttk.Label(
             content,
             text=(
+                "应用锁屏密码不限长度和字符，支持中文、空格及空密码。"
+                "已有密码时，新密码留空会保留原密码；如需清空，请勾选“设为空密码”。"
+                "解锁状态下可直接设置新密码，无需输入旧密码。托盘右键“应用锁屏”可随时手动锁定。"
+                "应用模式在监控及锁定期间保持系统和屏幕唤醒，锁定时覆盖所有显示器；"
+                "不会调用 Windows 锁屏。它无法防止管理员访问或强制结束进程。"
+                "Ctrl+Alt+Del 安全界面及公司策略、屏保、动态锁仍可能触发系统锁屏或绕过遮挡。"
+                "手动睡眠、合盖及网络自身故障仍可能中断任务。\n\n"
                 "“键鼠空闲后监测”会在达到设定空闲时间后开启摄像头，恢复操作后"
                 "立即释放；该模式只与自动多人脸隐私模糊互斥，手动快捷键不受影响。"
                 "持续监测模式下，"
@@ -3405,6 +3591,8 @@ class TrayApplication:
         buttons = ttk.Frame(window, padding=(16, 10, 24, 16))
         buttons.grid(row=1, column=0, sticky="ew")
         buttons.columnconfigure(0, weight=1)
+        ttk.Button(buttons, text="预览应用锁屏（8 秒）",
+                   command=self._preview_app_lock).grid(row=0, column=0, sticky="w")
         ttk.Button(
             buttons,
             text="取消",
@@ -3482,9 +3670,28 @@ class TrayApplication:
         window: tk.Toplevel,
         old_settings: AppSettings,
     ) -> None:
+        if self._application_locked():
+            return
         try:
+            lock_mode = LOCK_MODE_VALUES[variables["lock_mode"].get()]
+            new_password = variables["app_lock_new_password"].get()
+            confirmation = variables["app_lock_confirm_password"].get()
+            password_record = old_settings.app_lock_password_hash
+            empty_password = variables["app_lock_empty_password"].get()
+            change_password = bool(new_password or confirmation or empty_password or
+                                   (not password_record and lock_mode == "APPLICATION"))
+            if not empty_password and new_password != confirmation:
+                raise SettingsError("两次输入的新密码不一致")
+            if change_password:
+                try:
+                    password_record = hash_password("" if empty_password else new_password)
+                except ValueError as exc:
+                    raise SettingsError(str(exc)) from exc
             settings = AppSettings.from_mapping(
                 {
+                    "lock_mode": lock_mode,
+                    "app_lock_password_hash": password_record,
+                    "app_lock_oled_protection": variables["app_lock_oled_protection"].get(),
                     "camera_name": variables["camera_name"].get(),
                     "camera_monitoring_mode": (
                         CAMERA_MONITORING_MODE_VALUES.get(
@@ -3594,6 +3801,8 @@ class TrayApplication:
         self._request_shutdown()
 
     def _request_shutdown(self) -> None:
+        if self._application_locked():
+            return
         if self._shutdown_started.is_set():
             return
         self._shutdown_started.set()
@@ -3625,6 +3834,8 @@ def _run_self_test() -> int:
         settings.apply_to_runtime()
         if not config.APPLICATION_ICON_PNG_PATH.is_file():
             raise RuntimeError("Application icon resource is missing")
+        with Image.open(config.LOCK_SCREEN_BACKGROUND_PATH) as background:
+            background.verify()
         with Image.open(config.APPLICATION_ICON_PNG_PATH) as icon_source:
             if icon_source.size != (1024, 1024):
                 raise RuntimeError("Application icon master has an invalid size")

@@ -9,6 +9,7 @@ dist/
 *.spec
 settings.json
 settings.json.tmp
+private-test-unlock.json
 *.log
 models/*.xml
 models/*.bin

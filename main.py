@@ -16,6 +16,7 @@ from numpy.typing import NDArray
 
 import config
 from activity_monitor import ActivityMonitor, ActivityMonitorError
+from app_lock import AppLockSignal
 from camera import Camera, CameraError
 from debug_frame import DebugFrameBuffer
 from detector import (
@@ -50,6 +51,7 @@ class MonitorOutcome(Enum):
     """Reasons for pausing active camera monitoring."""
 
     LOCK_REQUESTED = "lock_requested"
+    APP_LOCK_REQUESTED = "app_lock_requested"
     SESSION_LOCKED = "session_locked"
     SESSION_STATE_UNKNOWN = "session_state_unknown"
     INPUT_ACTIVE = "input_active"
@@ -324,6 +326,7 @@ def monitor_until_session_pause(
     privacy_blur_signal: Optional[PrivacyBlurSignal] = None,
     sedentary_tracker: Optional[SedentaryTracker] = None,
     sedentary_reminder_signal: Optional[SedentaryReminderSignal] = None,
+    app_lock_signal: Optional[AppLockSignal] = None,
 ) -> MonitorOutcome:
     """Monitor until Windows locks or the session state becomes uncertain."""
     registered_face_mode = config.PRESENCE_MODE == "REGISTERED_FACE"
@@ -927,6 +930,13 @@ def monitor_until_session_pause(
             )
             continue
 
+        if config.LOCK_MODE == "APPLICATION":
+            if app_lock_signal is None:
+                raise RuntimeError("应用锁屏需要托盘界面，请通过 app.py 启动")
+            _clear_privacy_blur(privacy_blur_signal)
+            _report_status(status_callback, "locking", "达到条件 · 正在启用应用锁屏")
+            return MonitorOutcome.APP_LOCK_REQUESTED
+
         LOGGER.warning(
             "No face for %.1f seconds and no input for %.1f seconds; "
             "locking Windows",
@@ -1463,6 +1473,7 @@ def run(
     privacy_blur_signal: Optional[PrivacyBlurSignal] = None,
     sedentary_reminder_signal: Optional[SedentaryReminderSignal] = None,
     sedentary_duration_signal: Optional[SedentaryDurationSignal] = None,
+    app_lock_signal: Optional[AppLockSignal] = None,
 ) -> int:
     """Run persistent lock, unlock, and resume cycles."""
     camera: Optional[Camera] = None
@@ -1604,6 +1615,7 @@ def run(
                     privacy_blur_signal=privacy_blur_signal,
                     sedentary_tracker=sedentary_tracker,
                     sedentary_reminder_signal=sedentary_reminder_signal,
+                    app_lock_signal=app_lock_signal,
                 )
             finally:
                 camera.release()
@@ -1616,6 +1628,26 @@ def run(
 
             if outcome is MonitorOutcome.STOP_REQUESTED:
                 return 0
+            if outcome is MonitorOutcome.APP_LOCK_REQUESTED:
+                assert app_lock_signal is not None
+                if sedentary_tracker is not None:
+                    sedentary_tracker.reset()
+                if sedentary_reminder_signal is not None:
+                    sedentary_reminder_signal.clear()
+                app_lock_signal.request()
+                result = app_lock_signal.wait(stop_event)
+                if result == "cancelled":
+                    return 0
+                if result == "failed":
+                    _report_status(status_callback, "error",
+                                   "应用锁屏失败：" + app_lock_signal.error)
+                    if _wait_or_stop(stop_event, config.LOCK_RETRY_COOLDOWN_SECONDS):
+                        return 0
+                else:
+                    _report_status(status_callback, "resuming", "密码验证通过 · 正在恢复监控")
+                # A fresh monitoring cycle applies the startup grace period.
+                # Do not wait for a WTS lock transition in application mode.
+                continue
             if outcome is MonitorOutcome.PRESENCE_CONFIRMED_STANDBY:
                 camera_recheck_not_before = (
                     time.monotonic()
