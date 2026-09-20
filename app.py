@@ -3825,6 +3825,8 @@ def _run_self_test() -> int:
         settings.apply_to_runtime()
         if not config.APPLICATION_ICON_PNG_PATH.is_file():
             raise RuntimeError("Application icon resource is missing")
+        with Image.open(config.LOCK_SCREEN_BACKGROUND_PATH) as background:
+            background.verify()
         with Image.open(config.APPLICATION_ICON_PNG_PATH) as icon_source:
             if icon_source.size != (1024, 1024):
                 raise RuntimeError("Application icon master has an invalid size")

@@ -150,6 +150,7 @@ try {
         --collect-all "pystray" `
         --collect-all "cv2_enumerate_cameras" `
         --add-data "$iconPng;assets" `
+        --add-data "$PSScriptRoot\assets\lockscreen-landscape.png;assets" `
         --add-data "$PSScriptRoot\models;models" `
         "app.py"
     if ($LASTEXITCODE -ne 0) {

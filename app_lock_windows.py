@@ -14,9 +14,11 @@ import threading
 import time
 import tkinter as tk
 from typing import Callable
+from PIL import ImageTk
 
 from app_lock import UnlockGate
 from private_test_unlock import load_private_test_unlock
+from lock_screen_theme import LandscapeTheme, LockScreenLayout, clock_text
 from dwm_privacy import enumerate_monitor_work_areas, _physical_pixel_context
 
 
@@ -33,6 +35,8 @@ user32.CallNextHookEx.argtypes = [wintypes.HANDLE, ctypes.c_int, wintypes.WPARAM
 user32.CallNextHookEx.restype = LRESULT
 user32.GetAncestor.argtypes = [wintypes.HWND, wintypes.UINT]
 user32.GetAncestor.restype = wintypes.HWND
+user32.GetDpiForWindow.argtypes = [wintypes.HWND]
+user32.GetDpiForWindow.restype = wintypes.UINT
 user32.GetForegroundWindow.restype = wintypes.HWND
 user32.WindowFromPoint.argtypes = [wintypes.POINT]
 user32.WindowFromPoint.restype = wintypes.HWND
@@ -202,6 +206,14 @@ class AppLockWindow:
         self._generation = 0
         self._test_chords: queue.SimpleQueue[str] = queue.SimpleQueue()
         self._test_unlock = None
+        self.password = tk.StringVar(master=root)
+        self.message = tk.StringVar(master=root)
+        self.password.trace_add("write", lambda *_: self._refresh_hint())
+        self._canvases: list[tk.Canvas] = []
+        self._clock_text: tuple[str, str] | None = None
+        self._theme: LandscapeTheme | None = None
+        self._last_topology_error = float("-inf")
+        self._dpi_signature: tuple[int, ...] = ()
 
     @property
     def active(self) -> bool:
@@ -217,6 +229,9 @@ class AppLockWindow:
         self._test_unlock = None if preview else load_private_test_unlock()
         self._verifying = False
         self._result = None
+        self.password.set("")
+        self.message.set("")
+        self._theme = LandscapeTheme()
         try:
             self._rebuild()
             if not preview:
@@ -233,69 +248,144 @@ class AppLockWindow:
     def _handles(self) -> tuple[int, ...]:
         return tuple(user32.GetAncestor(w.winfo_id(), 2) for w in self.windows)
 
+    def _draw_surface(self, window: tk.Toplevel, width: int, height: int,
+                      primary: bool) -> tk.Canvas:
+        layout = LockScreenLayout.for_size(width, height)
+        canvas = tk.Canvas(window, width=width, height=height,
+                           highlightthickness=0, borderwidth=0, background="#263e4b")
+        canvas.pack(fill="both", expand=True)
+        photo = ImageTk.PhotoImage(self._theme.render(layout, primary), master=self.root)
+        canvas.wallpaper_photo = photo  # retain the Tk image for this display
+        canvas.create_image(0, 0, image=photo, anchor="nw")
+        scale = layout.scale
+        font = lambda family, pixels: (family, -max(10, round(pixels * scale)))
+        canvas.create_text(round(25 * scale), round(30 * scale), text="SeatSentinel",
+                           anchor="w", fill="#f2f5f6", font=font("Segoe UI", 21))
+        canvas.create_text(width / 2, height * 0.19, text="", fill="white",
+                           font=font("Segoe UI Light", 144), tags="clock")
+        canvas.create_text(width / 2, height * 0.30, text="", fill="#f5f6f7",
+                           font=font("Microsoft YaHei UI", 29), tags="date")
+        if primary:
+            canvas.create_text(*layout.point(0.5, 0.21),
+                               text="暂时离开" if not self._preview else "锁屏界面预览",
+                               fill="white", font=font("Microsoft YaHei UI", 34))
+            self.entry = tk.Entry(canvas, textvariable=self.password, show="●",
+                                  font=font("Microsoft YaHei UI", 21), relief="flat",
+                                  background="#718792", foreground="white",
+                                  insertbackground="white", borderwidth=0, highlightthickness=0,
+                                  selectbackground="#4c91a0", selectforeground="white")
+            entry_width = round((layout.panel[2] - layout.panel[0]) * 0.74)
+            canvas.create_window(*layout.point(0.5, 0.485), window=self.entry,
+                                 width=entry_width, height=round(38 * scale))
+            self.entry.bind("<Return>", lambda event: self._submit())
+            self._hint = tk.Label(canvas, text="输入密码", background="#718792", foreground="#e2e9ec",
+                                  font=font("Microsoft YaHei UI", 21), anchor="w", padx=0, pady=0)
+            self._hint_item = canvas.create_window(*layout.point(0.5, 0.485), window=self._hint,
+                                                   width=entry_width, height=round(38 * scale))
+            self._hint.bind("<Button-1>", lambda event: self.entry.focus_force())
+            self.entry.bind("<FocusIn>", lambda event: self._refresh_hint())
+            self.entry.bind("<FocusOut>", lambda event: self._refresh_hint())
+            self.button = tk.Button(canvas, text="解锁", command=self._submit,
+                                    font=font("Microsoft YaHei UI", 21), bg="#4c91a0", fg="white",
+                                    activebackground="#559dac", activeforeground="white",
+                                    borderwidth=0, highlightthickness=0, relief="flat", cursor="hand2",
+                                    state="disabled" if self._verifying else "normal")
+            canvas.create_window(*layout.point(0.5, 0.775), window=self.button,
+                                 width=entry_width, height=round(45 * scale))
+            canvas.create_text(*layout.point(0.5, 0.945), text=self.message.get(),
+                               fill="#fff2d2", font=font("Microsoft YaHei UI", 13), tags="message")
+            self._primary_canvas = canvas
+            if self._preview:
+                self.entry.configure(state="disabled")
+                self.message.set("预览将在 8 秒后自动关闭")
+                self.button.configure(text="关闭预览", command=self.close)
+                window.bind("<Escape>", lambda event: self.close())
+        else:
+            canvas.create_text(width / 2, height * 0.73, text="请在主屏输入密码",
+                               fill="white", font=font("Microsoft YaHei UI", 24))
+            window.bind("<Button-1>", lambda event: self.entry.focus_force())
+        return canvas
+
+    def _refresh_hint(self) -> None:
+        if not self.windows or not hasattr(self, "_primary_canvas"):
+            return
+        visible = not self.password.get()
+        self._primary_canvas.itemconfigure(self._hint_item, state="normal" if visible else "hidden")
+
+    def _refresh_clock(self) -> None:
+        value = clock_text()
+        if value != self._clock_text:
+            for canvas in self._canvases:
+                canvas.itemconfigure("clock", text=value[0])
+                canvas.itemconfigure("date", text=value[1])
+            self._clock_text = value
+        if self._canvases:
+            self._primary_canvas.itemconfigure("message", text=self.message.get())
+            self._refresh_hint()
+
     def _rebuild(self) -> None:
-        monitors = enumerate_monitor_work_areas()
-        signature = tuple(m.monitor for m in monitors)
-        if signature == self._signature and self.windows:
+        new_windows: list[tk.Toplevel] = []
+        old_entry = getattr(self, "entry", None)
+        old_button = getattr(self, "button", None)
+        old_canvas = getattr(self, "_primary_canvas", None)
+        old_hint = getattr(self, "_hint", None)
+        old_hint_item = getattr(self, "_hint_item", None)
+        try:
+            monitors = sorted(enumerate_monitor_work_areas(), key=lambda m: (not m.primary, m.monitor))
+            if not monitors:
+                raise RuntimeError("Windows temporarily reported no active display")
+            signature = tuple((m.monitor, m.work, m.primary) for m in monitors)
+            dpi_signature = tuple(user32.GetDpiForWindow(handle) for handle in self._handles())
+            if signature == self._signature and self.windows and dpi_signature == self._dpi_signature:
+                return
+            canvases = []
+            # Keep all existing covers until every replacement is ready. Creating
+            # each HWND in the physical-pixel context avoids mixed-DPI gaps.
+            with _physical_pixel_context():
+                for index, monitor in enumerate(monitors):
+                    left, top, right, bottom = monitor.monitor
+                    window = tk.Toplevel(self.root, background="#263e4b")
+                    new_windows.append(window)
+                    window.withdraw()
+                    window.overrideredirect(True)
+                    window.attributes("-topmost", True)
+                    window.protocol("WM_DELETE_WINDOW", lambda: None)
+                    window.bind("<Alt-F4>", lambda event: "break")
+                    window.update_idletasks()
+                    handle = user32.GetAncestor(window.winfo_id(), 2)
+                    if not user32.SetWindowPos(handle, -1, left, top, right-left, bottom-top, 0x0010):
+                        raise ctypes.WinError(ctypes.get_last_error())
+                    canvas = self._draw_surface(window, right-left, bottom-top, index == 0)
+                    canvases.append(canvas)
+                    window.update_idletasks()
+                    window.deiconify()
+                    if not user32.SetWindowPos(handle, -1, left, top, right-left, bottom-top, 0x0050):
+                        raise ctypes.WinError(ctypes.get_last_error())
+        except Exception:
+            # A transient unplug/reconfiguration must never dismiss an existing lock.
+            for window in new_windows:
+                window.destroy()
+            self.entry, self.button = old_entry, old_button
+            self._primary_canvas, self._hint = old_canvas, old_hint
+            self._hint_item = old_hint_item
+            if not self.windows:
+                raise
+            if time.monotonic() - self._last_topology_error > 5:
+                LOGGER.exception("Display layout update failed; keeping existing lock covers")
+                self._last_topology_error = time.monotonic()
             return
         old_windows = self.windows
-        self.windows = []
-        try:
-            for index, monitor in enumerate(monitors):
-                window = tk.Toplevel(self.root, background="#101827")
-                self.windows.append(window)
-                window.withdraw()
-                window.overrideredirect(True)
-                window.attributes("-topmost", True)
-                window.protocol("WM_DELETE_WINDOW", lambda: None)
-                window.bind("<Alt-F4>", lambda event: "break")
-                panel = tk.Frame(window, background="#101827")
-                panel.place(relx=0.5, rely=0.5, anchor="center")
-                tk.Label(panel, text="SeatSentinel", font=("Segoe UI", 14),
-                         fg="#7da9ed", bg="#101827").pack(pady=(0, 24))
-                tk.Label(panel, text="应用锁屏" if not self._preview else "锁屏界面预览",
-                         font=("Microsoft YaHei UI", 30, "bold"),
-                         fg="white", bg="#101827").pack(pady=(0, 12))
-                tk.Label(panel, text="后台任务继续运行 · 输入独立密码恢复操作",
-                         font=("Microsoft YaHei UI", 12), fg="#afbdcf",
-                         bg="#101827").pack(pady=(0, 28))
-                if index == 0:
-                    self.password = tk.StringVar(master=window)
-                    self.entry = tk.Entry(panel, textvariable=self.password, show="●",
-                                          width=28, font=("Segoe UI", 16),
-                                          justify="center", relief="flat")
-                    self.entry.pack(ipady=10, pady=(0, 16))
-                    self.entry.bind("<Return>", lambda event: self._submit())
-                    self.message = tk.StringVar(master=window, value="请输入应用锁屏密码")
-                    tk.Label(panel, textvariable=self.message, font=("Microsoft YaHei UI", 11),
-                             fg="#f0c483", bg="#101827").pack(pady=(0, 16))
-                    self.button = tk.Button(panel, text="解锁", command=self._submit,
-                                            font=("Microsoft YaHei UI", 12), width=24,
-                                            bg="#3676df", fg="white", relief="flat")
-                    self.button.pack(ipady=6)
-                    if self._preview:
-                        self.entry.configure(state="disabled")
-                        self.message.set("预览将在 8 秒后自动关闭，不拦截系统操作")
-                        self.button.configure(text="关闭预览", command=self.close)
-                        window.bind("<Escape>", lambda event: self.close())
-                else:
-                    tk.Label(panel, text="请在主屏输入密码", fg="white", bg="#101827",
-                             font=("Microsoft YaHei UI", 13)).pack()
-                    window.bind("<Button-1>", lambda event: self.entry.focus_force())
-                window.update_idletasks()
-                left, top, right, bottom = monitor.monitor
-                window.deiconify()
-                with _physical_pixel_context():
-                    if not user32.SetWindowPos(user32.GetAncestor(window.winfo_id(), 2),
-                                              -1, left, top, right-left, bottom-top, 0x0040):
-                        raise ctypes.WinError(ctypes.get_last_error())
-            self._signature = signature
-            if self.guard is not None:
-                self.guard.handles = self._handles()
-            self.entry.focus_force()
-        finally:
-            for window in old_windows:
-                window.destroy()
+        self.windows = new_windows
+        self._canvases = canvases
+        self._signature = signature
+        self._dpi_signature = tuple(user32.GetDpiForWindow(handle) for handle in self._handles())
+        if self.guard is not None:
+            self.guard.handles = self._handles()
+        for window in old_windows:
+            window.destroy()
+        self._clock_text = None
+        self._refresh_clock()
+        self.entry.focus_force()
 
     def _submit(self) -> None:
         if self._preview or self._verifying or self.gate is None:
@@ -350,6 +440,7 @@ class AppLockWindow:
             if self.gate is not None and self.gate.retry_seconds:
                 self.message.set(f"尝试过于频繁，请 {self.gate.retry_seconds} 秒后重试")
             self._rebuild()
+            self._refresh_clock()
             if self.guard is not None:
                 if self.guard._error is not None or not self.guard._thread.is_alive():
                     raise RuntimeError("输入保护已停止")
@@ -388,7 +479,11 @@ class AppLockWindow:
         for window in self.windows:
             window.destroy()
         self.windows.clear()
+        self._canvases.clear()
+        self.password.set("")
+        self._theme = None
         self._signature = ()
+        self._dpi_signature = ()
         self.gate = None
         self._test_unlock = None
         self._test_chords = queue.SimpleQueue()

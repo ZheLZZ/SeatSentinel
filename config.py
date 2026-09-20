@@ -133,3 +133,4 @@ APPLICATION_ICON_ICO_PATH = (
     BUNDLE_RESOURCE_DIRECTORY / "assets" / "seatsentinel-icon.ico"
 )
 FACE_TEMPLATE_PATH = USER_DATA_DIRECTORY / "registered-face.dat"
+LOCK_SCREEN_BACKGROUND_PATH = BUNDLE_RESOURCE_DIRECTORY / "assets" / "lockscreen-landscape.png"

@@ -65,12 +65,13 @@ def child():
     import tkinter as tk
     import tempfile
     from dataclasses import replace
+    from unittest.mock import patch
     from user_settings import AppSettings, SettingsStore
     from app_lock import hash_password
     from app_lock_windows import AppLockWindow, AwakeRequest, user32
     from private_test_unlock import PrivateTestUnlock
     from app_lock import UnlockGate
-    from dwm_privacy import enumerate_monitor_work_areas, _physical_pixel_context
+    from dwm_privacy import enumerate_monitor_work_areas, _physical_pixel_context, MonitorWorkArea
     destination = ROOT / "dist" / "app-lock-validation"
     destination.mkdir(parents=True, exist_ok=True)
     root = tk.Tk()
@@ -99,6 +100,65 @@ def child():
                 assert user32.GetWindowRect(user32.GetAncestor(window.winfo_id(), 2), ctypes.byref(rect))
             assert (rect.left, rect.top, rect.right, rect.bottom) == monitor.monitor
         capture_window(lock.windows[0], destination / "lock-window.png")
+        # Native HWNDs on this isolated desktop, with injected display topology.
+        # This exercises negative origins, portrait surfaces, primary switching,
+        # DPI-change detection and unplug/error recovery without moving user windows.
+        main_display = MonitorWorkArea((0, 0, 1920, 1080), (0, 0, 1920, 1040), True)
+        left_display = MonitorWorkArea((-1080, -240, 0, 1680), (-1080, -240, 0, 1640), False)
+        upper_display = MonitorWorkArea((1920, -720, 3200, 0), (1920, -720, 3200, -40), False)
+        topologies = [(main_display, left_display), (main_display, left_display, upper_display),
+                      (replace(main_display, primary=False), replace(left_display, primary=True), upper_display),
+                      (main_display,)]
+        lock.password.set("unfinished input")
+        for topology in topologies:
+            previous_windows = tuple(lock.windows)
+            with patch("app_lock_windows.enumerate_monitor_work_areas", return_value=topology):
+                lock._rebuild()
+                root.update()
+                expected = sorted(topology, key=lambda m: (not m.primary, m.monitor))
+                assert len(lock.windows) == len(expected)
+                assert lock.password.get() == "unfinished input"
+                assert lock.guard.handles == lock._handles()
+                for window, monitor in zip(lock.windows, expected):
+                    rect = wintypes.RECT()
+                    with _physical_pixel_context():
+                        user32.GetWindowRect(user32.GetAncestor(window.winfo_id(), 2), ctypes.byref(rect))
+                    assert (rect.left, rect.top, rect.right, rect.bottom) == monitor.monitor
+                assert all(not window.winfo_exists() for window in previous_windows)
+                if len(topology) == 3 and topology[1].primary:
+                    capture_window(lock.windows[1], destination / "secondary-monitor.png")
+                if len(topology) == 1:
+                    before = tuple(lock.windows)
+                    with patch("app_lock_windows.user32.GetDpiForWindow", return_value=144):
+                        lock._rebuild()
+                    assert tuple(lock.windows) != before
+        # PrintWindow may return black for a simulated display entirely outside
+        # the real desktop. Check portrait painting within its actual bounds.
+        portrait = MonitorWorkArea((0, 0, 540, 960), (0, 0, 540, 920), True)
+        with patch("app_lock_windows.enumerate_monitor_work_areas", return_value=[portrait]):
+            lock._rebuild()
+            root.update()
+            capture_window(lock.windows[0], destination / "portrait-primary.png")
+            from PIL import Image, ImageStat
+            with Image.open(destination / "portrait-primary.png") as rendered:
+                assert max(ImageStat.Stat(rendered).stddev) > 15, "Portrait surface did not paint"
+            assert lock.entry.winfo_viewable() and lock.button.winfo_viewable()
+        before = tuple(lock.windows)
+        before_handles = lock.guard.handles
+        with patch("app_lock_windows.enumerate_monitor_work_areas", side_effect=RuntimeError("transient display error")):
+            lock._rebuild()
+        assert tuple(lock.windows) == before and lock.guard.handles == before_handles
+        assert all(window.winfo_exists() for window in before)
+        with patch("app_lock_windows.enumerate_monitor_work_areas", return_value=[]):
+            lock._rebuild()
+        assert tuple(lock.windows) == before and lock.password.get() == "unfinished input"
+        with patch.object(lock, "_draw_surface", side_effect=RuntimeError("transient surface failure")):
+            lock._signature = ()
+            lock._rebuild()
+        assert tuple(lock.windows) == before and lock.guard.handles == before_handles
+        assert all(window.winfo_exists() for window in before)
+        lock._rebuild()
+        lock.password.set("")
         lock.password.set("wrong-password")
         lock._submit()
         pump_until(lambda: not lock._verifying)
@@ -168,7 +228,7 @@ def child():
         application._app_lock_window.close()
         application._awake_request.update(False)
         application._root.destroy()
-    print("PASS: real hooks, monitor coverage, wrong/correct password, display rebuild, tray manual lock, Unicode/empty password, preview, wake cleanup and settings UI")
+    print("PASS: real hooks, monitor coverage, 2/3-display simulations, negative origins, portrait/primary/DPI changes, unplug/error recovery, password, manual lock, preview and cleanup")
     if "--full-self-test" in sys.argv:
         from app import _run_self_test
         assert _run_self_test() == 0
