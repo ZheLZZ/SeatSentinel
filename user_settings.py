@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import json
 import os
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
 import config
 from global_hotkey import normalize_hotkey
+from app_lock import validate_password_record
 
 
 class SettingsError(ValueError):
@@ -37,6 +38,8 @@ class AppSettings:
     startup_grace_period_seconds: float
     frame_width: int
     frame_height: int
+    lock_mode: str = "SYSTEM"
+    app_lock_password_hash: str = field(default="", repr=False)
 
     @classmethod
     def defaults(cls) -> "AppSettings":
@@ -131,6 +134,8 @@ class AppSettings:
                 ),
                 frame_width=int(defaults["frame_width"]),
                 frame_height=int(defaults["frame_height"]),
+                lock_mode=str(defaults["lock_mode"]).strip().upper(),
+                app_lock_password_hash=str(defaults["app_lock_password_hash"]),
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise SettingsError(f"设置值格式不正确：{exc}") from exc
@@ -157,6 +162,12 @@ class AppSettings:
         raise SettingsError(f"{field_name}必须为开启或关闭")
 
     def validate(self) -> None:
+        if self.lock_mode not in {"SYSTEM", "APPLICATION"}:
+            raise SettingsError("锁屏方式只能选择系统锁屏或应用锁屏")
+        if self.app_lock_password_hash and not validate_password_record(self.app_lock_password_hash):
+            raise SettingsError("应用锁屏密码记录无效，请重新设置密码")
+        if self.lock_mode == "APPLICATION" and not self.app_lock_password_hash:
+            raise SettingsError("启用应用锁屏前，请设置并确认独立密码")
         if not self.camera_name:
             raise SettingsError("必须选择摄像头")
         if not 0.1 <= self.detection_interval_seconds <= 10.0:
@@ -216,6 +227,7 @@ class AppSettings:
 
     def apply_to_runtime(self) -> None:
         """Apply settings before starting a fresh monitoring worker."""
+        config.LOCK_MODE = self.lock_mode
         config.PREFERRED_CAMERA_NAME = self.camera_name
         config.DETECTION_INTERVAL_SECONDS = (
             self.detection_interval_seconds
