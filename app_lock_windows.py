@@ -9,6 +9,7 @@ from __future__ import annotations
 import ctypes
 from ctypes import wintypes
 import logging
+import queue
 import threading
 import time
 import tkinter as tk
@@ -17,7 +18,7 @@ from PIL import ImageTk
 
 from app_lock import UnlockGate
 from lock_screen_theme import LandscapeTheme, LockScreenLayout, clock_text
-from oled_saver import IDLE_SECONDS, clock_position, clock_color
+from oled_saver import IDLE_SECONDS, ClockMotion, clock_color
 from dwm_privacy import enumerate_monitor_work_areas, _physical_pixel_context
 
 
@@ -41,6 +42,14 @@ user32.WindowFromPoint.argtypes = [wintypes.POINT]
 user32.WindowFromPoint.restype = wintypes.HWND
 user32.GetAsyncKeyState.argtypes = [ctypes.c_int]
 user32.GetAsyncKeyState.restype = ctypes.c_short
+user32.GetKeyState.argtypes = [ctypes.c_int]
+user32.GetKeyState.restype = ctypes.c_short
+user32.GetKeyboardLayout.argtypes = [wintypes.DWORD]
+user32.GetKeyboardLayout.restype = wintypes.HANDLE
+user32.ToUnicodeEx.argtypes = [wintypes.UINT, wintypes.UINT,
+                              ctypes.POINTER(ctypes.c_ubyte), wintypes.LPWSTR,
+                              ctypes.c_int, wintypes.UINT, wintypes.HANDLE]
+user32.ToUnicodeEx.restype = ctypes.c_int
 user32.GetPhysicalCursorPos.argtypes = [ctypes.POINTER(wintypes.POINT)]
 user32.GetPhysicalCursorPos.restype = wintypes.BOOL
 user32.SetWindowPos.argtypes = [wintypes.HWND, wintypes.HWND, ctypes.c_int,
@@ -75,7 +84,7 @@ def block_key(vk: int, *, alt: bool, ctrl: bool, own_focus: bool) -> bool:
 class InputGuard:
     """Short hook callbacks on a dedicated message-pump thread, no key logging."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, direct_input: bool = False) -> None:
         self.handles: tuple[int, ...] = ()
         self._stop = threading.Event()
         self._ready = threading.Event()
@@ -83,6 +92,60 @@ class InputGuard:
         self._error: Exception | None = None
         self.last_activity = time.monotonic()
         self.saver_active = False
+        self.direct_input = direct_input
+        self.events: queue.Queue[tuple[str, str]] = queue.Queue(maxsize=4096)
+        self.accept_input = True
+        self._layout = user32.GetKeyboardLayout(0)
+        self._toggles = {vk: user32.GetKeyState(vk) & 1 for vk in (0x14, 0x90)}
+        self._toggle_down: set[int] = set()
+
+    def _emit(self, action: str, value: str = "") -> None:
+        if self.accept_input:
+            try:
+                self.events.put_nowait((action, value))
+            except queue.Full:
+                self._error = RuntimeError("输入过快，请重新锁屏后重试")
+
+    def _wake_saver(self) -> None:
+        if self.direct_input and self.saver_active:
+            # Queue the surface change ahead of any later password keys. Do not
+            # wait for the UI timer, which would swallow fast follow-up input.
+            self.saver_active = False
+            self._emit("wake")
+
+    def _direct_key(self, key: KeyboardData, down: bool) -> int:
+        """Consume text before focus/shortcut filtering; never send it to apps.
+
+        Shift/Caps/NumLock alone pass through so Windows owns their real state.
+        Ctrl/Alt are deliberately ignored, so a lost remote key-up cannot latch
+        a modifier and suppress all later password input.
+        """
+        vk = int(key.vkCode)
+        if vk in self._toggles:
+            if down and vk not in self._toggle_down:
+                self._toggles[vk] ^= 1
+                self._toggle_down.add(vk)
+            elif not down:
+                self._toggle_down.discard(vk)
+        if vk in {0x10, 0xA0, 0xA1, 0x14, 0x90}:
+            return 0
+        if not down:
+            return 1
+        if vk in {0x0D, 0x08, 0x1B}:
+            self._emit({0x0D: "submit", 0x08: "backspace", 0x1B: "clear"}[vk])
+        elif vk == 0xE7:  # VK_PACKET: remote Unicode input, including UTF-16 pairs
+            self._emit("text", chr(key.scanCode & 0xFFFF))
+        elif vk not in {0x11, 0xA2, 0xA3, 0x12, 0xA4, 0xA5,
+                        0x5B, 0x5C, 0x5D, 0x09, 0x2C} and not 0x70 <= vk <= 0x87:
+            state = (ctypes.c_ubyte * 256)()
+            state[0x10] = 0x80 if user32.GetAsyncKeyState(0x10) & 0x8000 else 0
+            state[0x14] = self._toggles[0x14]
+            state[0x90] = self._toggles[0x90]
+            buffer = ctypes.create_unicode_buffer(16)
+            count = user32.ToUnicodeEx(vk, key.scanCode, state, buffer, 16, 0, self._layout)
+            if count > 0:
+                self._emit("text", buffer[:count])
+        return 1
 
     def start(self) -> None:
         self._thread = threading.Thread(target=self._run, daemon=True,
@@ -103,6 +166,7 @@ class InputGuard:
         modifiers: set[int] = set()
         wake_keys: set[int] = set()
         wake_buttons: set[int] = set()
+        last_source = None
         cursor = wintypes.POINT()
         last_pointer = (cursor.x, cursor.y) if user32.GetPhysicalCursorPos(ctypes.byref(cursor)) else None
         button_ups = {0x0202: 0x0201, 0x0205: 0x0204, 0x0208: 0x0207, 0x020C: 0x020B}
@@ -110,10 +174,16 @@ class InputGuard:
 
         @HOOKPROC
         def keyboard(code, message, data):
+            nonlocal last_source
             if code >= 0:
                 key = ctypes.cast(data, ctypes.POINTER(KeyboardData)).contents
                 vk = int(key.vkCode)
                 down = message in {0x0100, 0x0104}
+                source = bool(key.flags & 0x10)
+                if last_source is not None and source != last_source:
+                    wake_keys.clear()
+                    modifiers.clear()
+                last_source = source
                 self.last_activity = time.monotonic()
                 for group in groups:
                     if vk in group:
@@ -123,11 +193,20 @@ class InputGuard:
                             modifiers.difference_update(group)
                 # Consume the whole waking key gesture, including auto-repeat.
                 if self.saver_active or vk in wake_keys:
+                    self._wake_saver()
                     if down:
                         wake_keys.add(vk)
                     else:
                         wake_keys.discard(vk)
                     return 1
+                if self.direct_input:
+                    try:
+                        if self._direct_key(key, down):
+                            return 1
+                    except Exception:
+                        self._error = RuntimeError("密码输入处理失败")
+                        return 1
+                    return user32.CallNextHookEx(None, code, message, data)
                 if block_key(
                     vk,
                     alt=bool(key.flags & 0x20 or modifiers & groups[1]),
@@ -143,11 +222,16 @@ class InputGuard:
             if code >= 0:
                 point = ctypes.cast(data, ctypes.POINTER(wintypes.POINT)).contents
                 position = (point.x, point.y)
-                if message != 0x0200 or position != last_pointer:
+                activity = message != 0x0200 or position != last_pointer
+                if activity:
                     self.last_activity = time.monotonic()
                 last_pointer = position
                 down_message = button_ups.get(message, message)
+                if not self.saver_active and message in button_ups.values():
+                    wake_buttons.discard(message)  # a new click repairs a lost release
                 if self.saver_active or down_message in wake_buttons:
+                    if activity:
+                        self._wake_saver()
                     if message in button_ups.values():
                         wake_buttons.add(message)
                     elif message in button_ups:
@@ -187,6 +271,8 @@ class InputGuard:
         self._stop.set()
         if self._thread is not None:
             self._thread.join(timeout=3)
+        while not self.events.empty():
+            self.events.get_nowait()
 
 
 class AwakeRequest:
@@ -261,7 +347,7 @@ class AppLockWindow:
         try:
             self._rebuild()
             if not preview:
-                self.guard = InputGuard()
+                self.guard = InputGuard(direct_input=True)
                 self.guard.handles = self._handles()
                 self.guard.start()
             self._tick()
@@ -293,22 +379,17 @@ class AppLockWindow:
             canvas.create_text(*layout.point(0.5, 0.21),
                                text="暂时离开" if not self._preview else "锁屏界面预览",
                                fill="white", font=font("Microsoft YaHei UI", 34))
-            self.entry = tk.Entry(canvas, textvariable=self.password, show="●",
-                                  font=font("Microsoft YaHei UI", 21), relief="flat",
+            self.entry = tk.Label(canvas, text="直接输入密码 · 回车解锁",
+                                  font=font("Microsoft YaHei UI", 19), relief="flat",
                                   background="#718792", foreground="white",
-                                  insertbackground="white", borderwidth=0, highlightthickness=0,
-                                  selectbackground="#4c91a0", selectforeground="white")
+                                  borderwidth=0, takefocus=False)
             entry_width = round((layout.panel[2] - layout.panel[0]) * 0.74)
             canvas.create_window(*layout.point(0.5, 0.485), window=self.entry,
                                  width=entry_width, height=round(38 * scale))
-            self.entry.bind("<Return>", lambda event: self._submit())
-            self._hint = tk.Label(canvas, text="输入密码", background="#718792", foreground="#e2e9ec",
-                                  font=font("Microsoft YaHei UI", 21), anchor="w", padx=0, pady=0)
-            self._hint_item = canvas.create_window(*layout.point(0.5, 0.485), window=self._hint,
-                                                   width=entry_width, height=round(38 * scale))
-            self._hint.bind("<Button-1>", lambda event: self.entry.focus_force())
-            self.entry.bind("<FocusIn>", lambda event: self._refresh_hint())
-            self.entry.bind("<FocusOut>", lambda event: self._refresh_hint())
+            paste = canvas.create_text(*layout.point(0.5, 0.625),
+                                       text="退格修改 · Esc 清空 · 点击粘贴密码",
+                                       fill="#e2e9ec", font=font("Microsoft YaHei UI", 12))
+            canvas.tag_bind(paste, "<Button-1>", lambda event: self._paste_password())
             self.button = tk.Button(canvas, text="解锁", command=self._submit,
                                     font=font("Microsoft YaHei UI", 21), bg="#4c91a0", fg="white",
                                     activebackground="#559dac", activeforeground="white",
@@ -325,7 +406,7 @@ class AppLockWindow:
                 self.button.configure(text="关闭预览", command=self.close)
                 window.bind("<Escape>", lambda event: self.close())
         else:
-            canvas.create_text(width / 2, height * 0.73, text="请在主屏输入密码",
+            canvas.create_text(width / 2, height * 0.73, text="直接输入密码，按回车解锁",
                                fill="white", font=font("Microsoft YaHei UI", 24))
             window.bind("<Button-1>", lambda event: self.entry.focus_force())
         canvas.oled_overlay = None
@@ -346,10 +427,12 @@ class AppLockWindow:
                                 font=canvas.oled_font, tags=("oled_clock", "oled_group"))
             scale = canvas.oled_scale
             overlay.create_line(-22 * scale, 66 * scale, 22 * scale, 66 * scale,
-                                fill="#91bbc3", width=max(1, round(scale)), tags="oled_group")
+                                fill="#91bbc3", width=max(1, round(scale)), tags=("oled_accent", "oled_group"))
             overlay.create_text(0, 88 * scale, text=clock_text()[1], fill="#bdcdd4",
                                 font=canvas.oled_date_font, tags=("oled_date", "oled_group"))
             canvas.oled_overlay = overlay
+            overlay.motion = None
+            overlay.content_text = None
         overlay = canvas.oled_overlay
         overlay.place(x=0, y=0, relwidth=1, relheight=1)
         overlay.tk.call("raise", str(overlay))
@@ -360,36 +443,61 @@ class AppLockWindow:
         now = time.monotonic()
         wanted = (self._oled_enabled and not self._verifying
                   and self.guard.idle_seconds() >= IDLE_SECONDS)
-        if wanted != self._saver_active:
-            self._saver_active = wanted
-            self.guard.saver_active = wanted
-            if wanted:
-                self._saver_started = now
-            for canvas in self._canvases:
-                if wanted:
-                    self._show_saver_surface(canvas)
-                else:
-                    canvas.oled_overlay.destroy()
-                    canvas.oled_overlay = None
-            if not wanted:
-                self.entry.focus_force()
+        self._set_saver(wanted)
         if self._saver_active:
             elapsed = now - self._saver_started
             for index, canvas in enumerate(self._canvases):
-                overlay = canvas.oled_overlay
-                overlay.itemconfigure("oled_clock", text=clock_text()[0], fill=clock_color(elapsed))
-                overlay.itemconfigure("oled_date", text=clock_text()[1])
-                bounds = overlay.bbox("oled_group")
-                x, y = clock_position(*canvas.surface_size, bounds[2]-bounds[0],
-                                      bounds[3]-bounds[1], elapsed, index)
-                overlay.move("oled_group", x - (bounds[0] + bounds[2]) / 2,
-                             y - (bounds[1] + bounds[3]) / 2)
+                self._position_saver_clock(canvas, elapsed, index)
+
+    def _set_saver(self, active: bool) -> None:
+        if active == self._saver_active:
+            return
+        self._saver_active = active
+        if active:
+            self.guard.saver_active = True
+            self._saver_started = time.monotonic()
+        for canvas in self._canvases:
+            if active:
+                self._show_saver_surface(canvas)
+            else:
+                canvas.oled_overlay.destroy()
+                canvas.oled_overlay = None
+        if not active:
+            self.guard.saver_active = False
+            self.entry.focus_force()
+
+    @staticmethod
+    def _position_saver_clock(canvas, elapsed, index) -> None:
+        overlay = canvas.oled_overlay
+        value = clock_text()
+        scale = canvas.oled_scale
+        # Measure only at a fixed local origin, never from rounded moving bounds.
+        if value != overlay.content_text:
+            overlay.itemconfigure("oled_clock", text=value[0])
+            overlay.itemconfigure("oled_date", text=value[1])
+            overlay.coords("oled_clock", 0, 0)
+            overlay.coords("oled_accent", -22 * scale, 66 * scale, 22 * scale, 66 * scale)
+            overlay.coords("oled_date", 0, 88 * scale)
+            overlay.local_bounds = overlay.bbox("oled_group")
+            overlay.content_text = value
+        bounds = overlay.local_bounds
+        if overlay.motion is None:
+            overlay.motion = ClockMotion(index)
+        x, y = overlay.motion.advance(*canvas.surface_size, bounds[2]-bounds[0],
+                                       bounds[3]-bounds[1], elapsed)
+        ox, oy = x - (bounds[0] + bounds[2]) / 2, y - (bounds[1] + bounds[3]) / 2
+        overlay.coords("oled_clock", ox, oy)
+        overlay.coords("oled_accent", ox - 22 * scale, oy + 66 * scale,
+                       ox + 22 * scale, oy + 66 * scale)
+        overlay.coords("oled_date", ox, oy + 88 * scale)
+        overlay.itemconfigure("oled_clock", fill=clock_color(elapsed))
 
     def _refresh_hint(self) -> None:
         if not self.windows or not hasattr(self, "_primary_canvas"):
             return
-        visible = not self.password.get()
-        self._primary_canvas.itemconfigure(self._hint_item, state="normal" if visible else "hidden")
+        length = len(self.password.get())
+        self.entry.configure(text=("●" * min(length, 24) + ("…" if length > 24 else ""))
+                             if length else "直接输入密码 · 回车解锁")
 
     def _refresh_clock(self) -> None:
         value = clock_text()
@@ -407,8 +515,6 @@ class AppLockWindow:
         old_entry = getattr(self, "entry", None)
         old_button = getattr(self, "button", None)
         old_canvas = getattr(self, "_primary_canvas", None)
-        old_hint = getattr(self, "_hint", None)
-        old_hint_item = getattr(self, "_hint_item", None)
         try:
             monitors = sorted(enumerate_monitor_work_areas(), key=lambda m: (not m.primary, m.monitor))
             if not monitors:
@@ -445,8 +551,7 @@ class AppLockWindow:
             for window in new_windows:
                 window.destroy()
             self.entry, self.button = old_entry, old_button
-            self._primary_canvas, self._hint = old_canvas, old_hint
-            self._hint_item = old_hint_item
+            self._primary_canvas = old_canvas
             if not self.windows:
                 raise
             if time.monotonic() - self._last_topology_error > 5:
@@ -466,6 +571,50 @@ class AppLockWindow:
         self._refresh_clock()
         self.entry.focus_force()
 
+    def _paste_password(self) -> None:
+        if self._preview or self._saver_active or self._verifying:
+            return
+        try:
+            value = self.root.clipboard_get()
+        except tk.TclError:
+            self.message.set("剪贴板中没有可粘贴的文字")
+            return
+        self.password.set(value)
+        self.message.set("已粘贴，按回车解锁")
+
+    def _drain_input(self) -> None:
+        if self.guard is None:
+            return
+        while True:
+            try:
+                action, value = self.guard.events.get_nowait()
+            except queue.Empty:
+                break
+            if action == "wake":
+                self._set_saver(False)
+                continue
+            if self._verifying or self._saver_active:
+                continue
+            if action == "submit":
+                self._submit()
+            elif action == "clear":
+                self._pending_surrogate = ""
+                self.password.set("")
+                self.message.set("")
+            elif action == "backspace":
+                self._pending_surrogate = ""
+                self.password.set(self.password.get()[:-1])
+            elif action == "text":
+                # Recombine remote UTF-16 surrogate packets before giving Tk text.
+                pending = getattr(self, "_pending_surrogate", "")
+                combined = pending + value
+                self._pending_surrogate = ""
+                if combined and 0xD800 <= ord(combined[-1]) <= 0xDBFF:
+                    self._pending_surrogate = combined[-1]
+                    combined = combined[:-1]
+                decoded = combined.encode("utf-16-le", "surrogatepass").decode("utf-16-le", "ignore")
+                self.password.set(self.password.get() + decoded)
+
     def _submit(self) -> None:
         if self._preview or self._saver_active or self._verifying or self.gate is None:
             return
@@ -476,6 +625,8 @@ class AppLockWindow:
         password = self.password.get()
         self.password.set("")
         self._verifying = True
+        if self.guard is not None:
+            self.guard.accept_input = False
         self._retry_message_active = False
         self.button.configure(state="disabled")
         self.message.set("正在验证…")
@@ -505,6 +656,8 @@ class AppLockWindow:
                 success, error = self._result
                 self._result = None
                 self._verifying = False
+                if self.guard is not None:
+                    self.guard.accept_input = True
                 if success:
                     self.close()
                     self.on_unlock()
@@ -517,6 +670,7 @@ class AppLockWindow:
             elif self._retry_message_active and not self._verifying:
                 self._retry_message_active = False
                 self.message.set("请重新输入密码")
+            self._drain_input()
             self._rebuild()
             self._refresh_clock()
             self._update_saver()
@@ -527,7 +681,7 @@ class AppLockWindow:
                     window.lift()
                 if user32.GetForegroundWindow() not in self._handles():
                     self.entry.focus_force()
-            self._timer = self.root.after(200, self._tick)
+            self._timer = self.root.after(50, self._tick)
         except Exception as exc:
             LOGGER.exception("Application lock failed")
             self.close()
@@ -547,6 +701,7 @@ class AppLockWindow:
         self._canvases.clear()
         self._saver_active = False
         self.password.set("")
+        self._pending_surrogate = ""
         self._theme = None
         self._signature = ()
         self._dpi_signature = ()
