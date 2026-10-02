@@ -97,3 +97,7 @@ try {
 finally {
     Remove-ReleaseStage -OutputRoot $tempParent -Stage $fixture
 }
+
+# The missing-model child is expected to exit 1. A successful test suite must
+# return its own status when invoked by the Actions PowerShell wrapper.
+exit 0
