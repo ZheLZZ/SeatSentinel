@@ -55,10 +55,11 @@ def register_face_from_camera(
     recognizer: Optional[FaceIdentityRecognizer] = None
     samples: list[NDArray[np.float32]] = []
     required = config.FACE_REGISTRATION_SAMPLE_COUNT
-    deadline = time.monotonic() + config.FACE_REGISTRATION_TIMEOUT_SECONDS
-    next_inference_at = time.monotonic()
-    next_sample_at = time.monotonic()
     last_message = ""
+
+    def check_cancelled() -> None:
+        if cancel_event.is_set():
+            raise FaceRegistrationCancelled("已取消人脸注册")
 
     def publish(
         message: str,
@@ -86,12 +87,14 @@ def register_face_from_camera(
 
     try:
         publish("正在初始化本地人脸模型……", force=True)
+        check_cancelled()
         detector = FaceDetector(
             config.MODEL_XML_PATH,
             config.MODEL_BIN_PATH,
             settings.face_confidence_threshold,
             preferred_device=settings.inference_device,
         )
+        check_cancelled()
         recognizer = FaceIdentityRecognizer(
             config.LANDMARKS_MODEL_XML_PATH,
             config.LANDMARKS_MODEL_BIN_PATH,
@@ -99,10 +102,10 @@ def register_face_from_camera(
             config.FACE_REIDENTIFICATION_MODEL_BIN_PATH,
             preferred_device=settings.inference_device,
         )
-        if cancel_event.is_set():
-            raise FaceRegistrationCancelled("已取消人脸注册")
+        check_cancelled()
 
         publish("正在打开摄像头……", force=True)
+        check_cancelled()
         camera = Camera(
             index=config.CAMERA_INDEX,
             width=settings.frame_width,
@@ -110,20 +113,26 @@ def register_face_from_camera(
             preferred_name=settings.camera_name,
         )
         camera.open()
+        check_cancelled()
+        # Model initialization and device startup do not consume capture time.
+        capture_started_at = time.monotonic()
+        deadline = capture_started_at + config.FACE_REGISTRATION_TIMEOUT_SECONDS
+        next_inference_at = capture_started_at
+        next_sample_at = capture_started_at
         publish(
             "请正对摄像头，并缓慢左右转头；画面不会保存。",
             force=True,
         )
 
         while len(samples) < required:
-            if cancel_event.is_set():
-                raise FaceRegistrationCancelled("已取消人脸注册")
+            check_cancelled()
             now = time.monotonic()
             if now >= deadline:
                 raise FaceRegistrationError(
                     "注册超时。请保证光线充足、仅一人入镜并靠近摄像头。"
                 )
             camera_ok, frame = camera.read()
+            check_cancelled()
             if not camera_ok or frame is None:
                 publish("摄像头画面读取失败，正在重试……")
                 if cancel_event.wait(0.1):
@@ -134,6 +143,7 @@ def register_face_from_camera(
             next_inference_at = now + 0.20
 
             detections = detector.detect_faces(frame)
+            check_cancelled()
             if len(detections) == 0:
                 publish("未检测到人脸，请正对并靠近摄像头。", frame)
                 continue
@@ -155,8 +165,10 @@ def register_face_from_camera(
             try:
                 embedding = recognizer.extract_embedding(frame, detection)
             except FaceIdentityInferenceError:
+                check_cancelled()
                 publish("暂时无法提取稳定特征，请保持面部清晰。", frame)
                 continue
+            check_cancelled()
             if samples:
                 current_centroid = FaceTemplateStore.normalize_embedding(
                     np.mean(samples, axis=0)
@@ -176,7 +188,11 @@ def register_face_from_camera(
                 force=True,
             )
 
+        check_cancelled()
         publish("正在加密保存人脸特征模板……", force=True)
+        # The progress callback may itself request cancellation. Once the
+        # atomic save starts, it is the commit point of this registration.
+        check_cancelled()
         template = template_store.save_embeddings(samples)
         publish(
             f"注册完成：已使用 {template.sample_count} 个样本。",

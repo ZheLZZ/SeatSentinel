@@ -299,20 +299,24 @@ class FaceDetector:
         parsed: list[FaceDetection] = []
         for row in output.reshape(-1, 7):
             # A negative image_id marks the end of valid detections.
-            if float(row[0]) < 0:
+            image_id = float(row[0])
+            if not math.isfinite(image_id):
+                raise DetectorInferenceError("Detector returned a non-finite image id")
+            if image_id < 0:
                 break
 
             confidence = float(row[2])
-            coordinates = [float(value) for value in row[3:7]]
-            if (
-                not math.isfinite(confidence)
-                or any(
-                    not math.isfinite(value)
-                    for value in coordinates
-                )
-                or confidence <= confidence_threshold
-            ):
+            if not math.isfinite(confidence):
+                raise DetectorInferenceError("Detector returned non-finite confidence")
+            # Below-threshold entries can be padding; their coordinates are
+            # not detections and do not need to contain valid boxes.
+            if confidence <= confidence_threshold:
                 continue
+            if not math.isfinite(float(row[1])):
+                raise DetectorInferenceError("Detector returned a non-finite face label")
+            coordinates = [float(value) for value in row[3:7]]
+            if any(not math.isfinite(value) for value in coordinates):
+                raise DetectorInferenceError("Detector returned non-finite face coordinates")
 
             xmin_norm, ymin_norm, xmax_norm, ymax_norm = coordinates
             xmin = min(

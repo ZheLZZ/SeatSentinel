@@ -4,6 +4,10 @@ from __future__ import annotations
 
 import json
 import os
+import tempfile
+import threading
+import time
+import weakref
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any
@@ -15,6 +19,41 @@ from app_lock import validate_password_record
 
 class SettingsError(ValueError):
     """Raised when persisted or entered settings are invalid."""
+
+
+_SETTINGS_LOCK_REGISTRY_GUARD = threading.Lock()
+_SETTINGS_LOCKS: weakref.WeakValueDictionary[str, Any] = weakref.WeakValueDictionary()
+
+
+def _settings_path_lock(path: Path):
+    # Windows paths with different casing or relative components must share one
+    # lock. A weak registry does not retain locks for discarded temporary stores.
+    key = os.path.normcase(str(path.resolve()))
+    with _SETTINGS_LOCK_REGISTRY_GUARD:
+        lock = _SETTINGS_LOCKS.get(key)
+        if lock is None:
+            lock = threading.RLock()
+            _SETTINGS_LOCKS[key] = lock
+        return lock
+
+
+def _replace_settings_file(source: Path, destination: Path) -> None:
+    """Publish atomically, tolerating brief Windows sharing/rename conflicts."""
+    retry_delays = (0.01, 0.02, 0.04, 0.08)
+    for attempt in range(len(retry_delays) + 1):
+        try:
+            os.replace(source, destination)
+            return
+        except OSError as exc:
+            # Concurrent MoveFileEx replacements can report ACCESS_DENIED (5)
+            # as well as SHARING_VIOLATION (32) or LOCK_VIOLATION (33). Retry
+            # only these Win32 errors, for at most 150 ms; a persistent ACL
+            # failure is still reported, and disk/path/encoding errors are not
+            # retried. The complete temporary file and old target remain intact
+            # until a replacement succeeds.
+            if getattr(exc, "winerror", None) not in {5, 32, 33} or attempt == len(retry_delays):
+                raise
+            time.sleep(retry_delays[attempt])
 
 
 @dataclass(frozen=True)
@@ -140,8 +179,11 @@ class AppSettings:
                 app_lock_oled_protection=cls._parse_boolean(
                     defaults["app_lock_oled_protection"], "OLED 锁屏保护开关"),
             )
-        except (KeyError, TypeError, ValueError) as exc:
-            raise SettingsError(f"设置值格式不正确：{exc}") from exc
+        except (KeyError, TypeError, ValueError, OverflowError):
+            # Exception text from int/float conversion can contain the entire
+            # input value. Keep malformed settings (including secrets) out of UI
+            # messages and logs that display this error.
+            raise SettingsError("设置值格式不正确，请检查数值和开关设置") from None
         if (
             settings.camera_monitoring_mode == "IDLE_TRIGGERED"
             and settings.privacy_blur_enabled
@@ -282,6 +324,7 @@ class SettingsStore:
                 "legacy_path 和 legacy_paths 不能同时使用"
             )
         self.path = path or config.USER_SETTINGS_PATH
+        self._io_lock = _settings_path_lock(self.path)
         self.legacy_paths = (
             legacy_paths
             if legacy_paths is not None
@@ -297,6 +340,13 @@ class SettingsStore:
         )
 
     def load(self) -> AppSettings:
+        # Python's Windows file reader can temporarily deny a simultaneous
+        # replacement. Serialize the read with publication, across store
+        # instances. Reentrancy permits first-load migration/default saving.
+        with self._io_lock:
+            return self._load_locked()
+
+    def _load_locked(self) -> AppSettings:
         if not self.path.is_file():
             migrated = self._load_legacy_settings()
             if migrated is not None:
@@ -310,10 +360,10 @@ class SettingsStore:
             values = json.loads(
                 self.path.read_text(encoding="utf-8")
             )
-        except (OSError, json.JSONDecodeError) as exc:
+        except (OSError, UnicodeError, json.JSONDecodeError):
             raise SettingsError(
-                f"无法读取设置文件 {self.path}：{exc}"
-            ) from exc
+                f"无法读取设置文件 {self.path}：请检查文件权限及 UTF-8 JSON 格式"
+            ) from None
         if not isinstance(values, dict):
             raise SettingsError("设置文件的顶层内容必须是对象")
         return AppSettings.from_mapping(values)
@@ -327,10 +377,10 @@ class SettingsStore:
                 values = json.loads(
                     legacy_path.read_text(encoding="utf-8")
                 )
-            except (OSError, json.JSONDecodeError) as exc:
+            except (OSError, UnicodeError, json.JSONDecodeError):
                 raise SettingsError(
-                    f"无法迁移旧版设置文件 {legacy_path}：{exc}"
-                ) from exc
+                    f"无法迁移旧版设置文件 {legacy_path}：请检查文件权限及 UTF-8 JSON 格式"
+                ) from None
             if not isinstance(values, dict):
                 raise SettingsError("旧版设置文件的顶层内容必须是对象")
             return AppSettings.from_mapping(values)
@@ -338,9 +388,7 @@ class SettingsStore:
 
     def save(self, settings: AppSettings) -> None:
         settings.validate()
-        temporary_path = self.path.with_suffix(
-            self.path.suffix + ".tmp"
-        )
+        temporary_path: Path | None = None
         serialized = json.dumps(
             asdict(settings),
             ensure_ascii=False,
@@ -348,12 +396,26 @@ class SettingsStore:
         )
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
-            temporary_path.write_text(
-                serialized + "\n",
-                encoding="utf-8",
-            )
-            os.replace(temporary_path, self.path)
-        except OSError as exc:
+            # A unique file prevents concurrent writers from replacing another
+            # writer's temporary contents. os.replace publishes one whole file.
+            with tempfile.NamedTemporaryFile(
+                mode="w", encoding="utf-8", newline="\n",
+                prefix=f".{self.path.name}.", suffix=".tmp",
+                dir=self.path.parent, delete=False,
+            ) as temporary_file:
+                temporary_path = Path(temporary_file.name)
+                temporary_file.write(serialized + "\n")
+                temporary_file.flush()
+                os.fsync(temporary_file.fileno())
+            with self._io_lock:
+                _replace_settings_file(temporary_path, self.path)
+        except (OSError, UnicodeError):
             raise SettingsError(
-                f"无法保存设置文件 {self.path}：{exc}"
-            ) from exc
+                f"无法保存设置文件 {self.path}：请检查文件权限及文本编码"
+            ) from None
+        finally:
+            if temporary_path is not None:
+                try:
+                    temporary_path.unlink(missing_ok=True)
+                except OSError:
+                    pass

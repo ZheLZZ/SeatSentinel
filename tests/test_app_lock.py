@@ -209,6 +209,7 @@ class ManualLockTests(unittest.TestCase):
         application._settings_store.load.return_value = AppSettings.from_mapping({
             "lock_mode": "SYSTEM", "app_lock_password_hash": hash_password("1")})
         application._service.is_running.return_value = running
+        application._service.should_resume_monitoring.return_value = running
         application._service.status_snapshot.return_value = ("paused", "paused")
         return application
 
@@ -222,7 +223,7 @@ class ManualLockTests(unittest.TestCase):
                         patch.object(config, "LOCK_MODE", "SYSTEM"), \
                         patch("main.lock_workstation") as system_lock:
                     application._request_manual_app_lock()
-                    application._service.pause_blocking.assert_called_once()
+                    application._service.acquire_camera.assert_called_once()
                     self.assertTrue(application._application_locked())
                     application._poll_app_lock()
                     application._app_lock_window.show.assert_called_once()
@@ -230,6 +231,8 @@ class ManualLockTests(unittest.TestCase):
                     application._awake_request.update.assert_called_with(True)
                     application._app_lock_unlocked()
                     self.assertFalse(application._application_locked())
+                    application._service.release_camera.assert_called_once_with(
+                        application._service.acquire_camera.call_args.args[0])
                     self.assertEqual(application._service.start_async.call_count, int(running))
                     application._settings_store.save.assert_not_called()
                     system_lock.assert_not_called()
@@ -242,7 +245,7 @@ class ManualLockTests(unittest.TestCase):
         with patch("app.messagebox.showinfo"):
             application._request_manual_app_lock()
         application._show_settings.assert_called_once()
-        application._service.pause_blocking.assert_not_called()
+        application._service.acquire_camera.assert_not_called()
         application._app_lock_window.show.assert_not_called()
 
     def test_pause_failure_never_reports_a_successful_lock(self):

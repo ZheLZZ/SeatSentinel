@@ -1,0 +1,9 @@
+# Build tools from the same validated Windows x64 / Python 3.13 environment.
+-r requirements-runtime.lock
+-r requirements-build.txt
+altgraph==0.17.5
+pefile==2024.8.26
+pyinstaller==6.21.0
+pyinstaller-hooks-contrib==2026.6
+pywin32-ctypes==0.2.3
+setuptools==83.0.0

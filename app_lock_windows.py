@@ -94,17 +94,63 @@ class InputGuard:
         self.saver_active = False
         self.direct_input = direct_input
         self.events: queue.Queue[tuple[str, str]] = queue.Queue(maxsize=4096)
+        self._input_lock = threading.Lock()
+        self._input_generation = 0
+        self._input_needs_reset = False
         self.accept_input = True
         self._layout = user32.GetKeyboardLayout(0)
         self._toggles = {vk: user32.GetKeyState(vk) & 1 for vk in (0x14, 0x90)}
         self._toggle_down: set[int] = set()
 
     def _emit(self, action: str, value: str = "") -> None:
-        if self.accept_input:
+        with self._input_lock:
+            if not self.accept_input:
+                return
+            if self._input_needs_reset:
+                if action == "clear":
+                    self._input_needs_reset = False
+                elif action != "wake":
+                    return
             try:
                 self.events.put_nowait((action, value))
             except queue.Full:
-                self._error = RuntimeError("输入过快，请重新锁屏后重试")
+                # An incomplete password must never reach verification. Keep
+                # filtering input until an explicit Esc or whole-value paste.
+                dropped = self._take_events_unlocked()
+                if action == "wake" or any(item[0] == "wake" for item in dropped):
+                    self.events.put_nowait(("wake", ""))
+                self.events.put_nowait(("overflow", ""))
+                self._input_needs_reset = True
+                self._input_generation += 1
+
+    def _take_events_unlocked(self) -> list[tuple[str, str]]:
+        events = []
+        while True:
+            try:
+                events.append(self.events.get_nowait())
+            except queue.Empty:
+                return events
+
+    def take_events(self) -> tuple[list[tuple[str, str]], int]:
+        """Take a bounded batch without holding the hook lock during Tk work."""
+        with self._input_lock:
+            return self._take_events_unlocked(), self._input_generation
+
+    def pause_input(self, generation: int) -> bool:
+        """Begin verification only if this batch survived every overflow."""
+        with self._input_lock:
+            if self._input_needs_reset or generation != self._input_generation:
+                return False
+            self.accept_input = False
+            self._take_events_unlocked()
+            return True
+
+    def reset_input(self) -> None:
+        """Discard the old stream before replacing it with a complete paste."""
+        with self._input_lock:
+            self._take_events_unlocked()
+            self._input_needs_reset = False
+            self._input_generation += 1
 
     def _wake_saver(self) -> None:
         if self.direct_input and self.saver_active:
@@ -271,8 +317,9 @@ class InputGuard:
         self._stop.set()
         if self._thread is not None:
             self._thread.join(timeout=3)
-        while not self.events.empty():
-            self.events.get_nowait()
+        with self._input_lock:
+            self.accept_input = False
+            self._take_events_unlocked()
 
 
 class AwakeRequest:
@@ -309,6 +356,7 @@ class AppLockWindow:
         self._timer: str | None = None
         self._result: tuple[bool, str] | None = None
         self._verifying = False
+        self._input_needs_reset = False
         self._retry_message_active = False
         self._preview = False
         self._preview_deadline = 0.0
@@ -339,6 +387,7 @@ class AppLockWindow:
         self._preview_deadline = time.monotonic() + 8
         self.gate = None if preview else UnlockGate(record)
         self._verifying = False
+        self._input_needs_reset = False
         self._result = None
         self.password.set("")
         self.message.set("")
@@ -579,31 +628,63 @@ class AppLockWindow:
         except tk.TclError:
             self.message.set("剪贴板中没有可粘贴的文字")
             return
+        if self.guard is not None:
+            self.guard.reset_input()
+        self._input_needs_reset = False
+        self._pending_surrogate = ""
         self.password.set(value)
         self.message.set("已粘贴，按回车解锁")
 
-    def _drain_input(self) -> None:
+    def _reset_overflow_input(self) -> None:
+        self._input_needs_reset = True
+        self._pending_surrogate = ""
+        self.password.set("")
+        self.message.set("输入过快，请按 Esc 重输或粘贴")
+
+    def _drain_input(self) -> int | None:
         if self.guard is None:
-            return
-        while True:
-            try:
-                action, value = self.guard.events.get_nowait()
-            except queue.Empty:
-                break
+            return None
+        events, generation = self.guard.take_events()
+        if not events:
+            return generation
+        characters = list(self.password.get())
+        changed = False
+
+        def flush() -> None:
+            nonlocal changed
+            if changed:
+                self.password.set("".join(characters))
+                changed = False
+
+        for action, value in events:
             if action == "wake":
                 self._set_saver(False)
                 continue
+            if action == "overflow":
+                characters.clear()
+                changed = False
+                self._reset_overflow_input()
+                continue
             if self._verifying or self._saver_active:
                 continue
-            if action == "submit":
-                self._submit()
-            elif action == "clear":
+            if action == "clear":
+                self._input_needs_reset = False
                 self._pending_surrogate = ""
-                self.password.set("")
+                characters.clear()
+                changed = True
                 self.message.set("")
+            elif self._input_needs_reset:
+                continue
+            elif action == "submit":
+                # Flush only at a submission boundary or once per UI batch.
+                flush()
+                self._submit(input_generation=generation)
+                characters = list(self.password.get())
             elif action == "backspace":
                 self._pending_surrogate = ""
-                self.password.set(self.password.get()[:-1])
+                if characters:
+                    characters.pop()
+                    changed = True
             elif action == "text":
                 # Recombine remote UTF-16 surrogate packets before giving Tk text.
                 pending = getattr(self, "_pending_surrogate", "")
@@ -613,20 +694,33 @@ class AppLockWindow:
                     self._pending_surrogate = combined[-1]
                     combined = combined[:-1]
                 decoded = combined.encode("utf-16-le", "surrogatepass").decode("utf-16-le", "ignore")
-                self.password.set(self.password.get() + decoded)
+                if decoded:
+                    characters.extend(decoded)
+                    changed = True
+        flush()
+        return generation
 
-    def _submit(self) -> None:
+    def _submit(self, *, input_generation: int | None = None) -> None:
         if self._preview or self._saver_active or self._verifying or self.gate is None:
+            return
+        if self.guard is not None and input_generation is None:
+            # A mouse click must also observe pending overflow/clear events.
+            input_generation = self._drain_input()
+            if self._verifying:
+                return
+        if self._input_needs_reset:
             return
         if self.gate.retry_seconds:
             self._retry_message_active = True
             self.message.set(f"尝试过于频繁，请 {self.gate.retry_seconds} 秒后重试")
             return
+        if self.guard is not None and not self.guard.pause_input(input_generation):
+            self._reset_overflow_input()
+            return
         password = self.password.get()
         self.password.set("")
+        self._pending_surrogate = ""
         self._verifying = True
-        if self.guard is not None:
-            self.guard.accept_input = False
         self._retry_message_active = False
         self.button.configure(state="disabled")
         self.message.set("正在验证…")
@@ -700,6 +794,7 @@ class AppLockWindow:
         self.windows.clear()
         self._canvases.clear()
         self._saver_active = False
+        self._input_needs_reset = False
         self.password.set("")
         self._pending_surrogate = ""
         self._theme = None

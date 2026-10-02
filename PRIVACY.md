@@ -1,9 +1,9 @@
 # SeatSentinel 隐私说明
 
-适用版本：`v0.2.8-beta`
+适用版本：`v0.2.12-beta`
 
 SeatSentinel 的设计目标是只在本机判断用户是否仍在电脑前，并在满足安全条件时
-调用 Windows 锁屏。SeatSentinel 不提供云端服务，也不要求用户账户。
+执行所选的 Windows 系统锁屏或应用锁屏。SeatSentinel 不提供云端服务，也不要求用户账户。
 
 ## 摄像头数据
 
@@ -87,6 +87,9 @@ SeatSentinel 的正常监控代码不包含上传、远程推理或网络 API �
 1. 电脑没有兼容的 Python 3.13 时，从 Python.org 下载项目专用 Python；
 2. 从 PyPI 或配置的镜像安装 Python 依赖；
 3. 从 Intel Open Model Zoo 官方存储地址下载人脸检测、关键点和特征模型。
+
+`构建EXE.ps1` 在准备锁定版本的构建依赖时也可能连接 PyPI 或其镜像；
+`一键启动.ps1 -VerifyModelsOnly` 只读取并校验本地模型，不联网或准备环境。
 
 Python 安装包和下载后的模型必须通过各自固定的 SHA-256 校验。项目专用 Python
 安装在 `%LOCALAPPDATA%\SeatSentinel\runtime\Python313`，不写入 PATH、不建立

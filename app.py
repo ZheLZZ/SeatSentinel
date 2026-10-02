@@ -67,6 +67,7 @@ from single_instance import (
     show_already_running_message,
 )
 from user_settings import AppSettings, SettingsError, SettingsStore
+from monitoring_service import MonitoringService, MonitoringTransitionError
 
 
 LOGGER = logging.getLogger("seat_sentinel.tray")
@@ -288,219 +289,6 @@ def format_tray_title(
     )
 
 
-class MonitoringService:
-    """Start, pause, resume, and restart the monitoring worker safely."""
-
-    def __init__(self, settings_store: SettingsStore) -> None:
-        self._settings_store = settings_store
-        self._state_lock = threading.RLock()
-        self._transition_lock = threading.Lock()
-        self._thread: Optional[threading.Thread] = None
-        self._stop_event: Optional[threading.Event] = None
-        self._status_state = "stopped"
-        self._status_detail = "监控尚未启动"
-        self._shutting_down = False
-        self._debug_frame_buffer = DebugFrameBuffer()
-        self._privacy_blur_signal = PrivacyBlurSignal()
-        self._sedentary_reminder_signal = SedentaryReminderSignal()
-        self._sedentary_duration_signal = SedentaryDurationSignal()
-        self.app_lock_signal = AppLockSignal()
-
-    def status_detail(self) -> str:
-        with self._state_lock:
-            return self._status_detail
-
-    def status_snapshot(self) -> tuple[str, str]:
-        with self._state_lock:
-            return self._status_state, self._status_detail
-
-    def is_running(self) -> bool:
-        with self._state_lock:
-            return bool(
-                self._thread is not None
-                and self._thread.is_alive()
-                and self._stop_event is not None
-                and not self._stop_event.is_set()
-            )
-
-    def debug_snapshot(self) -> DebugFrameSnapshot:
-        """Return the latest frame copied safely for the Tkinter thread."""
-        return self._debug_frame_buffer.snapshot()
-
-    def privacy_blur_snapshot(self) -> PrivacyBlurSnapshot:
-        return self._privacy_blur_signal.snapshot()
-
-    def sedentary_reminder_snapshot(self) -> SedentaryReminderSnapshot:
-        return self._sedentary_reminder_signal.snapshot()
-
-    def sedentary_duration_snapshot(self) -> SedentaryDurationSnapshot:
-        return self._sedentary_duration_signal.snapshot()
-
-    def clear_sedentary_reminder(self) -> None:
-        self._sedentary_reminder_signal.clear()
-
-    def dismiss_privacy_blur(
-        self,
-        status_detail: str = "已通过甩动鼠标解除隐私模糊 · 继续监控",
-    ) -> bool:
-        dismissed = self._privacy_blur_signal.dismiss()
-        if dismissed:
-            self._update_status(
-                "monitoring",
-                status_detail,
-            )
-        return dismissed
-
-    def clear_privacy_blur(self) -> None:
-        self._privacy_blur_signal.clear()
-
-    def _update_status(self, state: str, detail: str) -> None:
-        with self._state_lock:
-            if self._shutting_down:
-                return
-            self._status_state = state
-            self._status_detail = detail
-
-    def start_async(self) -> None:
-        threading.Thread(
-            target=self._transition,
-            args=(True, False),
-            name="seat-sentinel-start",
-            daemon=True,
-        ).start()
-
-    def pause_async(self) -> None:
-        self._privacy_blur_signal.clear()
-        self._sedentary_reminder_signal.clear()
-        self._sedentary_duration_signal.clear()
-        self._update_status("pausing", "正在暂停并释放摄像头")
-        self._debug_frame_buffer.clear(
-            "监控正在暂停 · 调试画面已清空"
-        )
-        threading.Thread(
-            target=self._transition,
-            args=(False, False),
-            name="seat-sentinel-pause",
-            daemon=True,
-        ).start()
-
-    def pause_blocking(self) -> None:
-        """Stop monitoring synchronously from a non-UI worker thread."""
-        self._privacy_blur_signal.clear()
-        self._sedentary_reminder_signal.clear()
-        self._sedentary_duration_signal.clear()
-        self._update_status("pausing", "正在暂停并释放摄像头")
-        self._debug_frame_buffer.clear(
-            "监控正在暂停 · 调试画面已清空"
-        )
-        self._transition(False, False)
-
-    def restart_async(self) -> None:
-        self._privacy_blur_signal.clear()
-        self._sedentary_reminder_signal.clear()
-        self._sedentary_duration_signal.clear()
-        self._update_status("starting", "正在应用设置并重启监控")
-        self._debug_frame_buffer.clear(
-            "正在重新启动监控 · 调试画面已清空"
-        )
-        threading.Thread(
-            target=self._transition,
-            args=(True, True),
-            name="seat-sentinel-restart",
-            daemon=True,
-        ).start()
-
-    def _transition(self, should_run: bool, force_restart: bool) -> None:
-        with self._transition_lock:
-            with self._state_lock:
-                current_thread = self._thread
-                current_stop_event = self._stop_event
-
-            if current_thread is not None and current_thread.is_alive():
-                if should_run and not force_restart and self.is_running():
-                    return
-                if current_stop_event is not None:
-                    current_stop_event.set()
-                current_thread.join(timeout=30.0)
-                if current_thread.is_alive():
-                    self._update_status(
-                        "error",
-                        "监控线程未能及时停止，请退出后重试",
-                    )
-                    return
-
-            with self._state_lock:
-                self._thread = None
-                self._stop_event = None
-
-            if not should_run:
-                self._privacy_blur_signal.clear()
-                self._sedentary_reminder_signal.clear()
-                self._sedentary_duration_signal.clear()
-                self._update_status("paused", "监控已暂停 · 摄像头已释放")
-                self._debug_frame_buffer.clear(
-                    "监控已暂停 · 调试画面已清空"
-                )
-                return
-
-            try:
-                settings = self._settings_store.load()
-                settings.apply_to_runtime()
-            except SettingsError as exc:
-                self._update_status("error", f"设置错误：{exc}")
-                return
-
-            stop_event = threading.Event()
-            worker = threading.Thread(
-                target=self._worker,
-                args=(stop_event,),
-                name="seat-sentinel-monitor",
-                daemon=True,
-            )
-            with self._state_lock:
-                if self._shutting_down:
-                    return
-                self._stop_event = stop_event
-                self._thread = worker
-                self._status_state = "starting"
-                self._status_detail = "正在启动监控"
-            worker.start()
-
-    def _worker(self, stop_event: threading.Event) -> None:
-        exit_code = monitoring.run(
-            stop_event=stop_event,
-            status_callback=self._update_status,
-            debug_frame_buffer=self._debug_frame_buffer,
-            privacy_blur_signal=self._privacy_blur_signal,
-            sedentary_reminder_signal=self._sedentary_reminder_signal,
-            sedentary_duration_signal=self._sedentary_duration_signal,
-            app_lock_signal=self.app_lock_signal,
-        )
-        with self._state_lock:
-            if self._thread is threading.current_thread():
-                if not stop_event.is_set() and exit_code != 0:
-                    self._status_state = "error"
-                    if self._status_detail == "监控已停止":
-                        self._status_detail = "监控异常退出"
-
-    def shutdown(self) -> None:
-        with self._transition_lock:
-            with self._state_lock:
-                self._shutting_down = True
-                stop_event = self._stop_event
-                worker = self._thread
-            if stop_event is not None:
-                stop_event.set()
-            if worker is not None and worker.is_alive():
-                worker.join(timeout=30.0)
-            self._privacy_blur_signal.clear()
-            self._sedentary_reminder_signal.clear()
-            self._sedentary_duration_signal.clear()
-            self._debug_frame_buffer.clear(
-                "程序正在退出 · 调试画面已清空"
-            )
-
-
 class TrayApplication:
     """Own the Tk settings window and Windows tray icon."""
 
@@ -522,6 +310,7 @@ class TrayApplication:
         ] = None
         self._registration_window: Optional[tk.Toplevel] = None
         self._registration_cancel_event: Optional[threading.Event] = None
+        self._registration_thread: Optional[threading.Thread] = None
         self._registration_queue: Optional[
             queue.Queue[tuple[str, object]]
         ] = None
@@ -584,6 +373,7 @@ class TrayApplication:
         self._awake_request = AwakeRequest()
         self._awake_error = ""
         self._manual_app_lock = False
+        self._manual_camera_owner: object | None = None
         self._manual_lock_preparing = False
         self._resume_after_manual_lock = False
         self._manual_lock_results: queue.SimpleQueue[Optional[str]] = queue.SimpleQueue()
@@ -617,17 +407,17 @@ class TrayApplication:
                 pystray.MenuItem(
                     "应用锁屏",
                     self._app_lock_from_tray,
-                    enabled=lambda item: not self._application_locked(),
+                    enabled=lambda item: not self._application_locked() and not self._registration_active(),
                 ),
                 pystray.MenuItem(
                     "暂停监控",
                     self._pause,
-                    enabled=lambda item: self._service.is_running(),
+                    enabled=lambda item: self._service.should_resume_monitoring() and not self._registration_active(),
                 ),
                 pystray.MenuItem(
                     "恢复监控",
                     self._resume,
-                    enabled=lambda item: not self._service.is_running(),
+                    enabled=lambda item: not self._service.should_resume_monitoring() and not self._registration_active(),
                 ),
                 pystray.MenuItem(
                     "多人脸隐私模糊",
@@ -795,11 +585,14 @@ class TrayApplication:
         return bool(getattr(self, "_manual_app_lock", False) or
                     (signal is not None and signal.busy))
 
+    def _registration_active(self) -> bool:
+        return getattr(self, "_registration_cancel_event", None) is not None
+
     def _app_lock_from_tray(self, icon: pystray.Icon, item: pystray.MenuItem) -> None:
         self._root.after(0, self._request_manual_app_lock)
 
     def _request_manual_app_lock(self) -> None:
-        if self._application_locked() or self._shutdown_started.is_set():
+        if self._application_locked() or self._registration_active() or self._shutdown_started.is_set():
             return
         try:
             settings = self._settings_store.load()
@@ -810,13 +603,15 @@ class TrayApplication:
         except SettingsError as exc:
             messagebox.showerror("应用锁屏", str(exc), parent=self._root)
             return
-        self._resume_after_manual_lock = self._service.is_running()
+        self._resume_after_manual_lock = self._service.should_resume_monitoring()
         self._manual_app_lock = True
         self._manual_lock_preparing = True
+        owner = object()
+        self._manual_camera_owner = owner
 
         def prepare() -> None:
             try:
-                self._service.pause_blocking()
+                self._service.acquire_camera(owner)
                 state, detail = self._service.status_snapshot()
                 if state == "error":
                     raise RuntimeError(detail)
@@ -833,6 +628,10 @@ class TrayApplication:
         self._manual_app_lock = False
         self._manual_lock_preparing = False
         self._resume_after_manual_lock = False
+        owner = getattr(self, "_manual_camera_owner", None)
+        if owner is not None:
+            self._service.release_camera(owner)
+            self._manual_camera_owner = None
         if resume:
             self._service.start_async()
         elif self._service.app_lock_signal.state == "unlocked":
@@ -1303,12 +1102,12 @@ class TrayApplication:
             pass
 
     def _pause(self, icon: pystray.Icon, item: pystray.MenuItem) -> None:
-        if self._application_locked():
+        if self._application_locked() or self._registration_active():
             return
         self._service.pause_async()
 
     def _resume(self, icon: pystray.Icon, item: pystray.MenuItem) -> None:
-        if self._application_locked():
+        if self._application_locked() or self._registration_active():
             return
         self._service.start_async()
 
@@ -1521,9 +1320,9 @@ class TrayApplication:
             hotkey.stop()
 
     def _toggle_privacy_blur_setting(self) -> None:
-        if self._application_locked():
+        if self._application_locked() or self._registration_active():
             return
-        was_running = self._service.is_running()
+        was_running = self._service.should_resume_monitoring()
         try:
             current = self._settings_store.load()
             if current.camera_monitoring_mode != "CONTINUOUS":
@@ -1537,7 +1336,6 @@ class TrayApplication:
                 privacy_blur_enabled=not current.privacy_blur_enabled,
             )
             self._settings_store.save(updated)
-            updated.apply_to_runtime()
         except SettingsError as exc:
             messagebox.showerror("设置错误", str(exc))
             return
@@ -1553,6 +1351,8 @@ class TrayApplication:
                 self._settings_privacy_blur_variable = None
         if was_running:
             self._service.restart_async()
+        else:
+            self._service.refresh_settings_async()
         try:
             self._tray_icon.update_menu()
         except Exception as exc:
@@ -2512,7 +2312,8 @@ class TrayApplication:
 
         if self._debug_toggle_button is not None:
             self._debug_toggle_button.configure(
-                text="暂停监控" if running else "开始监控"
+                text=("暂停监控" if self._service.should_resume_monitoring()
+                      else "开始监控")
             )
         self._render_debug_preview(snapshot)
         window.after(500, self._refresh_debug_window)
@@ -2773,9 +2574,9 @@ class TrayApplication:
             window.destroy()
 
     def _toggle_monitoring(self) -> None:
-        if self._application_locked():
+        if self._application_locked() or self._registration_active():
             return
-        if self._service.is_running():
+        if self._service.should_resume_monitoring():
             self._service.pause_async()
         else:
             self._service.start_async()
@@ -2784,6 +2585,8 @@ class TrayApplication:
         self._request_shutdown()
 
     def _toggle_inference_device(self) -> None:
+        if self._application_locked() or self._registration_active():
+            return
         try:
             current = self._settings_store.load()
             actual_device = (
@@ -2839,6 +2642,8 @@ class TrayApplication:
         event: Optional[tk.Event] = None,
     ) -> None:
         del event
+        if self._application_locked() or self._registration_active():
+            return
         variable = self._debug_camera_variable
         if variable is None:
             return
@@ -2881,7 +2686,7 @@ class TrayApplication:
             )
 
     def _start_face_registration(self) -> None:
-        if self._application_locked():
+        if self._application_locked() or self._shutdown_started.is_set():
             return
         existing_window = self._registration_window
         if existing_window is not None and existing_window.winfo_exists():
@@ -2972,13 +2777,14 @@ class TrayApplication:
 
         self._registration_cancel_event = threading.Event()
         self._registration_queue = queue.Queue(maxsize=4)
-        self._registration_resume_after = self._service.is_running()
-        threading.Thread(
+        self._registration_resume_after = self._service.should_resume_monitoring()
+        self._registration_thread = threading.Thread(
             target=self._face_registration_worker,
             args=(settings,),
             name="seat-sentinel-face-registration",
             daemon=True,
-        ).start()
+        )
+        self._registration_thread.start()
         window.after(100, self._poll_face_registration)
         window.update_idletasks()
         x = max(0, (window.winfo_screenwidth() - window.winfo_width()) // 2)
@@ -2989,8 +2795,10 @@ class TrayApplication:
         window.focus_force()
 
     def _face_registration_worker(self, settings: AppSettings) -> None:
+        owner = object()
+        terminal: tuple[str, object] = ("error", "人脸注册未完成")
         try:
-            self._service.pause_blocking()
+            self._service.acquire_camera(owner)
             cancel_event = self._registration_cancel_event
             if cancel_event is None or cancel_event.is_set():
                 raise FaceRegistrationCancelled("已取消人脸注册")
@@ -3002,14 +2810,18 @@ class TrayApplication:
                     "update", update
                 ),
             )
-            self._queue_registration_message("success", template)
+            terminal = ("success", template)
         except FaceRegistrationCancelled as exc:
-            self._queue_registration_message("cancelled", str(exc))
-        except (FaceRegistrationError, FaceTemplateError) as exc:
-            self._queue_registration_message("error", str(exc))
+            terminal = ("cancelled", str(exc))
+        except (FaceRegistrationError, FaceTemplateError, MonitoringTransitionError) as exc:
+            terminal = ("error", str(exc))
         except Exception as exc:
             LOGGER.exception("Unexpected face registration failure")
-            self._queue_registration_message("error", str(exc))
+            terminal = ("error", str(exc))
+        finally:
+            self._service.release_camera(owner)
+        # Publish completion only after registration has released the camera.
+        self._queue_registration_message(*terminal)
 
     def _queue_registration_message(
         self,
@@ -3027,7 +2839,9 @@ class TrayApplication:
                 try:
                     message_queue.get_nowait()
                 except queue.Empty:
-                    return
+                    # The UI may have drained the queue since put_nowait.
+                    # Retry the put so a completion message is never lost.
+                    continue
 
     def _poll_face_registration(self) -> None:
         window = self._registration_window
@@ -3080,15 +2894,6 @@ class TrayApplication:
                 self._registration_status_variable.set("已取消人脸注册。")
 
         restart_monitoring = self._registration_resume_after
-        if kind == "success":
-            try:
-                restart_monitoring = (
-                    restart_monitoring
-                    or self._settings_store.load().presence_mode
-                    == "REGISTERED_FACE"
-                )
-            except SettingsError:
-                pass
         self._finish_face_registration(restart_monitoring)
 
     def _render_registration_update(
@@ -3131,6 +2936,7 @@ class TrayApplication:
             window.destroy()
         self._registration_window = None
         self._registration_cancel_event = None
+        self._registration_thread = None
         self._registration_queue = None
         self._registration_status_variable = None
         self._registration_progress = None
@@ -3142,6 +2948,8 @@ class TrayApplication:
             self._service.start_async()
 
     def _delete_registered_face(self) -> None:
+        if self._application_locked() or self._registration_active():
+            return
         if not self._face_template_store.is_registered():
             messagebox.showinfo(
                 "本人数据",
@@ -3182,7 +2990,7 @@ class TrayApplication:
             self._service.restart_async()
 
     def _show_settings(self) -> None:
-        if self._application_locked():
+        if self._application_locked() or self._registration_active():
             return
         if (
             self._settings_window is not None
@@ -3670,7 +3478,7 @@ class TrayApplication:
         window: tk.Toplevel,
         old_settings: AppSettings,
     ) -> None:
-        if self._application_locked():
+        if self._application_locked() or self._registration_active():
             return
         try:
             lock_mode = LOCK_MODE_VALUES[variables["lock_mode"].get()]
@@ -3761,7 +3569,6 @@ class TrayApplication:
             self._replace_privacy_hotkey(settings.privacy_blur_hotkey)
             hotkey_rebound = self._privacy_hotkey is not previous_hotkey
             self._settings_store.save(settings)
-            settings.apply_to_runtime()
         except (GlobalHotkeyError, SettingsError) as exc:
             if locals().get("hotkey_rebound", False):
                 try:
@@ -3791,7 +3598,17 @@ class TrayApplication:
                 exc_info=exc,
             )
         window.destroy()
-        self._service.restart_async()
+        # These preferences are consumed by the UI, not the camera worker.
+        ui_only = replace(
+            old_settings,
+            privacy_blur_hotkey=settings.privacy_blur_hotkey,
+            app_lock_password_hash=settings.app_lock_password_hash,
+            app_lock_oled_protection=settings.app_lock_oled_protection,
+        ) == settings
+        if ui_only:
+            config.PRIVACY_BLUR_HOTKEY = settings.privacy_blur_hotkey
+        else:
+            self._service.restart_async()
 
     def _exit_from_tray(
         self,
@@ -3815,6 +3632,9 @@ class TrayApplication:
     def _shutdown(self) -> None:
         if self._registration_cancel_event is not None:
             self._registration_cancel_event.set()
+        registration = self._registration_thread
+        if registration is not None and registration.is_alive():
+            registration.join(timeout=30.0)
         self._stop_privacy_hotkey()
         self._manual_privacy_blur_active = False
         self._hide_privacy_blur()
