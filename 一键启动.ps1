@@ -37,31 +37,6 @@ function Test-CommandSucceeded {
     }
 }
 
-function Test-FileSha256 {
-    param(
-        [Parameter(Mandatory = $true)][string]$Path,
-        [Parameter(Mandatory = $true)][string]$ExpectedSha256
-    )
-
-    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
-        return $false
-    }
-
-    try {
-        $actualSha256 = (
-            Get-FileHash -LiteralPath $Path -Algorithm SHA256
-        ).Hash
-    }
-    catch {
-        return $false
-    }
-
-    return $actualSha256.Equals(
-        $ExpectedSha256,
-        [System.StringComparison]::OrdinalIgnoreCase
-    )
-}
-
 function Download-VerifiedFile {
     param(
         [Parameter(Mandatory = $true)][string]$Label,
@@ -240,6 +215,13 @@ function Install-ManagedPython {
 }
 
 try {
+    . (Join-Path $PSScriptRoot "tools\release_helpers.ps1")
+    $modelManifest = Get-ModelManifest -SourceRoot $PSScriptRoot
+    if ($VerifyModelsOnly) {
+        Assert-ModelFiles -SourceRoot $PSScriptRoot
+        Write-Host "All six model SHA-256 hashes verified; no environment changes or downloads."
+        exit 0
+    }
     $Host.UI.RawUI.WindowTitle = "SeatSentinel"
     Set-Location -LiteralPath $PSScriptRoot
 
@@ -337,13 +319,14 @@ try {
         Test-CommandSucceeded "创建运行环境失败"
     }
 
-    $requirementsFile = Join-Path $PSScriptRoot "requirements.txt"
+    $requirementsFile = Join-Path $PSScriptRoot "requirements-runtime.lock"
     $dependencyMarker = Join-Path `
         $virtualEnvironment `
         ".seat-sentinel-requirements.sha256"
     $requirementsHash = (
-        Get-FileHash -LiteralPath $requirementsFile -Algorithm SHA256
-    ).Hash
+        (Get-FileHash -LiteralPath $requirementsFile -Algorithm SHA256).Hash + ":" +
+        (Get-FileHash -LiteralPath (Join-Path $PSScriptRoot "requirements.txt") -Algorithm SHA256).Hash
+    )
     $installedHash = ""
     if (Test-Path -LiteralPath $dependencyMarker) {
         $markerContent = (
@@ -394,54 +377,8 @@ try {
             -Path $modelsDirectory)
     }
 
-    $modelRepositoryUrl = (
-        "https://storage.openvinotoolkit.org/repositories/" +
-        "open_model_zoo/2022.1/models_bin/2"
-    )
-    $modelDefinitions = @(
-        [PSCustomObject]@{
-            Name = "face-detection-retail-0004"
-            Label = "人脸检测"
-            XmlSha256 = (
-                "E1103759CF32B74AE3C2E84E9653DB5F" +
-                "A0D69AC246DC1E17AC3B116EFF319459"
-            )
-            BinSha256 = (
-                "89349CE12DD21C5263FB302CD3FFD4B7" +
-                "3C35EA12ED98AFF863D03A2CF3A32464"
-            )
-            XmlMinimumBytes = 10000
-            BinMinimumBytes = 1000000
-        },
-        [PSCustomObject]@{
-            Name = "landmarks-regression-retail-0009"
-            Label = "人脸关键点"
-            XmlSha256 = (
-                "8EDE1C8A94BFF1C0DDDA96F938CB8722" +
-                "49BD0E1E33E77315498C8A8F17470AC1"
-            )
-            BinSha256 = (
-                "71199E8D6DF4583C3BA4AD8EAB013F36" +
-                "995B9FEF2DD6D85D86C2CC2322803955"
-            )
-            XmlMinimumBytes = 50000
-            BinMinimumBytes = 700000
-        },
-        [PSCustomObject]@{
-            Name = "face-reidentification-retail-0095"
-            Label = "本人人脸特征"
-            XmlSha256 = (
-                "9148EB0E6578807B073F2A90649C7015" +
-                "66A277DF1A2086E769C2CB263CC66B86"
-            )
-            BinSha256 = (
-                "C0A0ACB57503ACB0B04A9AA3B1A6DA7" +
-                "165C799D0DC2A462AD6B081A5CD1BC908"
-            )
-            XmlMinimumBytes = 300000
-            BinMinimumBytes = 4000000
-        }
-    )
+    $modelRepositoryUrl = $modelManifest.RepositoryUrl
+    $modelDefinitions = @($modelManifest.Models)
 
     foreach ($modelDefinition in $modelDefinitions) {
         $modelName = $modelDefinition.Name
@@ -481,10 +418,7 @@ try {
     }
     Write-Host "全部模型 SHA-256 校验通过。"
 
-    if ($VerifyModelsOnly) {
-        Write-Host "模型完整性检查完成，未启动 SeatSentinel。"
-        exit 0
-    }
+    Assert-ModelFiles -SourceRoot $PSScriptRoot
 
     Write-Step "启动 SeatSentinel"
     Write-Host "程序运行期间按 Ctrl+C 可以安全退出。"
@@ -496,6 +430,6 @@ try {
 catch {
     Write-Host ""
     Write-Host "错误：$($_.Exception.Message)" -ForegroundColor Red
-    Wait-OnError
+    if (-not $VerifyModelsOnly) { Wait-OnError }
     exit 1
 }

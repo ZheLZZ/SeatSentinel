@@ -329,7 +329,35 @@ def monitor_until_session_pause(
     app_lock_signal: Optional[AppLockSignal] = None,
 ) -> MonitorOutcome:
     """Monitor until Windows locks or the session state becomes uncertain."""
-    registered_face_mode = config.PRESENCE_MODE == "REGISTERED_FACE"
+    # Freeze the settings used by this monitoring cycle. UI changes take
+    # effect after the service stops and starts a new cycle.
+    presence_mode = config.PRESENCE_MODE
+    second_person_confirmation_frames = config.SECOND_PERSON_CONFIRMATION_FRAMES
+    second_person_rearm_clear_seconds = config.SECOND_PERSON_REARM_CLEAR_SECONDS
+    second_person_auto_dismiss_seconds = config.SECOND_PERSON_AUTO_DISMISS_SECONDS
+    camera_monitoring_mode = config.CAMERA_MONITORING_MODE
+    privacy_blur_enabled = config.PRIVACY_BLUR_ENABLED
+    startup_grace_period_seconds = config.STARTUP_GRACE_PERIOD_SECONDS
+    detection_interval_seconds = config.DETECTION_INTERVAL_SECONDS
+    camera_activation_idle_seconds = config.CAMERA_ACTIVATION_IDLE_SECONDS
+    error_log_interval_seconds = config.ERROR_LOG_INTERVAL_SECONDS
+    camera_reconnect_interval_seconds = config.CAMERA_RECONNECT_INTERVAL_SECONDS
+    face_match_similarity_threshold = config.FACE_MATCH_SIMILARITY_THRESHOLD
+    identity_match_confirmation_frames = config.IDENTITY_MATCH_CONFIRMATION_FRAMES
+    camera_presence_auto_standby_seconds = (
+        config.CAMERA_PRESENCE_AUTO_STANDBY_SECONDS
+    )
+    camera_presence_recheck_interval_seconds = (
+        config.CAMERA_PRESENCE_RECHECK_INTERVAL_SECONDS
+    )
+    face_absence_timeout_seconds = config.FACE_ABSENCE_TIMEOUT_SECONDS
+    input_idle_timeout_seconds = config.INPUT_IDLE_TIMEOUT_SECONDS
+    lock_warning_duration_seconds = config.LOCK_WARNING_SECONDS
+    status_log_interval_seconds = config.STATUS_LOG_INTERVAL_SECONDS
+    lock_mode = config.LOCK_MODE
+    lock_retry_cooldown_seconds = config.LOCK_RETRY_COOLDOWN_SECONDS
+
+    registered_face_mode = presence_mode == "REGISTERED_FACE"
     if registered_face_mode and (
         identity_recognizer is None or face_template is None
     ):
@@ -339,6 +367,18 @@ def monitor_until_session_pause(
         identity_device = identity_recognizer.device
         if identity_device and identity_device != detector.device:
             device_text = f"检测 {detector.device} / 识别 {identity_device}"
+
+    def stop_requested() -> bool:
+        if stop_event is None or not stop_event.is_set():
+            return False
+        _clear_privacy_blur(privacy_blur_signal)
+        _clear_debug_frame(
+            debug_frame_buffer,
+            "监控已停止 · 调试画面已清空",
+            device_text,
+        )
+        return True
+
     monitoring_started_at = time.monotonic()
     last_seen_time = monitoring_started_at
     next_detection_at = monitoring_started_at
@@ -357,18 +397,18 @@ def monitor_until_session_pause(
     privacy_guard = (
         SecondPersonPrivacyGuard(
             confirmation_frames=(
-                config.SECOND_PERSON_CONFIRMATION_FRAMES
+                second_person_confirmation_frames
             ),
             rearm_clear_seconds=(
-                config.SECOND_PERSON_REARM_CLEAR_SECONDS
+                second_person_rearm_clear_seconds
             ),
             auto_dismiss_owner_alone_seconds=(
-                config.SECOND_PERSON_AUTO_DISMISS_SECONDS
+                second_person_auto_dismiss_seconds
             ),
         )
         if (
-            config.CAMERA_MONITORING_MODE == "CONTINUOUS"
-            and config.PRIVACY_BLUR_ENABLED
+            camera_monitoring_mode == "CONTINUOUS"
+            and privacy_blur_enabled
             and privacy_blur_signal is not None
         )
         else None
@@ -376,7 +416,7 @@ def monitor_until_session_pause(
 
     LOGGER.info(
         "Monitoring active; grace period is %.0f seconds",
-        config.STARTUP_GRACE_PERIOD_SECONDS,
+        startup_grace_period_seconds,
     )
     _report_status(
         status_callback,
@@ -389,25 +429,19 @@ def monitor_until_session_pause(
     )
 
     while True:
-        if stop_event is not None and stop_event.is_set():
-            _clear_privacy_blur(privacy_blur_signal)
-            _clear_debug_frame(
-                debug_frame_buffer,
-                "监控已停止 · 调试画面已清空",
-                device_text,
-            )
+        if stop_requested():
             return MonitorOutcome.STOP_REQUESTED
 
         now = time.monotonic()
         wait_seconds = next_detection_at - now
         if wait_seconds > 0:
             if _wait_or_stop(stop_event, wait_seconds):
-                _clear_privacy_blur(privacy_blur_signal)
+                stop_requested()
                 return MonitorOutcome.STOP_REQUESTED
 
         cycle_time = time.monotonic()
         next_detection_at = (
-            cycle_time + config.DETECTION_INTERVAL_SECONDS
+            cycle_time + detection_interval_seconds
         )
 
         try:
@@ -454,7 +488,7 @@ def monitor_until_session_pause(
             )
             return MonitorOutcome.SESSION_STATE_UNKNOWN
 
-        if config.CAMERA_MONITORING_MODE == "IDLE_TRIGGERED":
+        if camera_monitoring_mode == "IDLE_TRIGGERED":
             try:
                 activation_idle_seconds = (
                     activity_monitor.seconds_since_last_input()
@@ -479,9 +513,9 @@ def monitor_until_session_pause(
                 return MonitorOutcome.INPUT_MONITOR_UNAVAILABLE
 
             if not camera_should_be_active(
-                config.CAMERA_MONITORING_MODE,
+                camera_monitoring_mode,
                 activation_idle_seconds,
-                config.CAMERA_ACTIVATION_IDLE_SECONDS,
+                camera_activation_idle_seconds,
             ):
                 _observe_sedentary_time(
                     sedentary_tracker,
@@ -506,6 +540,8 @@ def monitor_until_session_pause(
                 return MonitorOutcome.INPUT_ACTIVE
 
         camera_ok, frame = camera.read()
+        if stop_requested():
+            return MonitorOutcome.STOP_REQUESTED
         inference_ok = False
         any_face_detected: Optional[bool] = None
         presence_detected: Optional[bool] = None
@@ -524,7 +560,7 @@ def monitor_until_session_pause(
             identity_match_streak = 0
             if (
                 cycle_time - last_camera_error_log_at
-                >= config.ERROR_LOG_INTERVAL_SECONDS
+                >= error_log_interval_seconds
             ):
                 LOGGER.warning(
                     "Camera frame read failed; locking is disabled"
@@ -541,8 +577,12 @@ def monitor_until_session_pause(
 
             if cycle_time >= next_camera_reconnect_at:
                 camera.release()
+                if stop_requested():
+                    return MonitorOutcome.STOP_REQUESTED
                 try:
                     camera.open()
+                    if stop_requested():
+                        return MonitorOutcome.STOP_REQUESTED
                     LOGGER.info(
                         "Camera reconnected; starting a fresh absence window"
                     )
@@ -558,7 +598,7 @@ def monitor_until_session_pause(
                     )
                 next_camera_reconnect_at = (
                     cycle_time
-                    + config.CAMERA_RECONNECT_INTERVAL_SECONDS
+                    + camera_reconnect_interval_seconds
                 )
         else:
             if not camera_was_healthy:
@@ -568,6 +608,8 @@ def monitor_until_session_pause(
             try:
                 inference_started_at = time.perf_counter()
                 detections = detector.detect_faces(frame)
+                if stop_requested():
+                    return MonitorOutcome.STOP_REQUESTED
                 any_face_detected = bool(detections)
                 if registered_face_mode:
                     assert identity_recognizer is not None
@@ -576,23 +618,25 @@ def monitor_until_session_pause(
                         frame,
                         detections,
                         face_template,
-                        config.FACE_MATCH_SIMILARITY_THRESHOLD,
+                        face_match_similarity_threshold,
                     )
+                    if stop_requested():
+                        return MonitorOutcome.STOP_REQUESTED
                     presence_detected, identity_match_streak = (
                         evaluate_presence(
                             detections,
-                            config.PRESENCE_MODE,
+                            presence_mode,
                             identity_match_streak,
-                            config.IDENTITY_MATCH_CONFIRMATION_FRAMES,
+                            identity_match_confirmation_frames,
                         )
                     )
                 else:
                     presence_detected, identity_match_streak = (
                         evaluate_presence(
                             detections,
-                            config.PRESENCE_MODE,
+                            presence_mode,
                             identity_match_streak,
-                            config.IDENTITY_MATCH_CONFIRMATION_FRAMES,
+                            identity_match_confirmation_frames,
                         )
                     )
                 inference_ms = (
@@ -600,7 +644,7 @@ def monitor_until_session_pause(
                 ) * 1000.0
                 inference_ok = True
                 if (
-                    config.PRIVACY_BLUR_ENABLED
+                    privacy_blur_enabled
                     and privacy_guard is not None
                 ):
                     privacy_decision = privacy_guard.evaluate(
@@ -666,7 +710,7 @@ def monitor_until_session_pause(
                 identity_match_streak = 0
                 if (
                     cycle_time - last_inference_error_log_at
-                    >= config.ERROR_LOG_INTERVAL_SECONDS
+                    >= error_log_interval_seconds
                 ):
                     LOGGER.warning(
                         "Model inference failed; locking is disabled: %s",
@@ -682,6 +726,9 @@ def monitor_until_session_pause(
                 if privacy_guard is not None:
                     privacy_guard.mark_visual_state_unknown()
 
+        if stop_requested():
+            return MonitorOutcome.STOP_REQUESTED
+
         _observe_sedentary_time(
             sedentary_tracker,
             sedentary_reminder_signal,
@@ -696,7 +743,7 @@ def monitor_until_session_pause(
         if presence_detected is True:
             last_seen_time = cycle_time
 
-        if config.CAMERA_MONITORING_MODE == "IDLE_TRIGGERED":
+        if camera_monitoring_mode == "IDLE_TRIGGERED":
             (
                 presence_confirmed_since,
                 should_enter_presence_standby,
@@ -704,22 +751,22 @@ def monitor_until_session_pause(
                 presence_detected,
                 cycle_time,
                 presence_confirmed_since,
-                config.CAMERA_PRESENCE_AUTO_STANDBY_SECONDS,
+                camera_presence_auto_standby_seconds,
             )
             if should_enter_presence_standby:
                 detail = (
                     "已连续确认在场 %.0f 秒 · 摄像头进入待机 · "
                     "%.0f 秒后复查"
                     % (
-                        config.CAMERA_PRESENCE_AUTO_STANDBY_SECONDS,
-                        config.CAMERA_PRESENCE_RECHECK_INTERVAL_SECONDS,
+                        camera_presence_auto_standby_seconds,
+                        camera_presence_recheck_interval_seconds,
                     )
                 )
                 LOGGER.info(
                     "Presence confirmed for %.1f seconds; releasing the "
                     "camera for a %.1f-second recheck interval",
-                    config.CAMERA_PRESENCE_AUTO_STANDBY_SECONDS,
-                    config.CAMERA_PRESENCE_RECHECK_INTERVAL_SECONDS,
+                    camera_presence_auto_standby_seconds,
+                    camera_presence_recheck_interval_seconds,
                 )
                 _clear_debug_frame(
                     debug_frame_buffer,
@@ -743,7 +790,7 @@ def monitor_until_session_pause(
             input_idle_seconds = None
             if (
                 cycle_time - last_activity_error_log_at
-                >= config.ERROR_LOG_INTERVAL_SECONDS
+                >= error_log_interval_seconds
             ):
                 LOGGER.warning(
                     "Unable to read keyboard/mouse activity; "
@@ -759,11 +806,11 @@ def monitor_until_session_pause(
             and inference_ok
             and presence_detected is False
             and face_absent_seconds
-            >= config.FACE_ABSENCE_TIMEOUT_SECONDS
+            >= face_absence_timeout_seconds
             and input_idle_seconds is not None
-            and input_idle_seconds >= config.INPUT_IDLE_TIMEOUT_SECONDS
+            and input_idle_seconds >= input_idle_timeout_seconds
             and startup_elapsed_seconds
-            >= config.STARTUP_GRACE_PERIOD_SECONDS
+            >= startup_grace_period_seconds
             and cycle_time >= lock_retry_not_before
         )
         previous_lock_warning_started_at = lock_warning_started_at
@@ -775,7 +822,7 @@ def monitor_until_session_pause(
             lock_conditions_met,
             cycle_time,
             lock_warning_started_at,
-            config.LOCK_WARNING_SECONDS,
+            lock_warning_duration_seconds,
         )
         warning_started = (
             previous_lock_warning_started_at is None
@@ -788,7 +835,7 @@ def monitor_until_session_pause(
         if warning_started:
             LOGGER.info(
                 "Lock conditions met; starting %.1f-second warning",
-                config.LOCK_WARNING_SECONDS,
+                lock_warning_duration_seconds,
             )
         elif warning_cancelled:
             LOGGER.info(
@@ -836,12 +883,12 @@ def monitor_until_session_pause(
                 should_lock,
                 inference_ms,
                 presence_detected,
-                config.PRESENCE_MODE,
+                presence_mode,
             )
 
         if (
             cycle_time - last_status_log_at
-            >= config.STATUS_LOG_INTERVAL_SECONDS
+            >= status_log_interval_seconds
             or lock_warning_seconds is not None
             or warning_cancelled
             or should_lock
@@ -916,7 +963,7 @@ def monitor_until_session_pause(
 
         if (
             final_input_idle_seconds
-            < config.INPUT_IDLE_TIMEOUT_SECONDS
+            < input_idle_timeout_seconds
         ):
             LOGGER.info(
                 "Recent keyboard/mouse input detected during final check; "
@@ -930,11 +977,16 @@ def monitor_until_session_pause(
             )
             continue
 
-        if config.LOCK_MODE == "APPLICATION":
+        if stop_requested():
+            return MonitorOutcome.STOP_REQUESTED
+
+        if lock_mode == "APPLICATION":
             if app_lock_signal is None:
                 raise RuntimeError("应用锁屏需要托盘界面，请通过 app.py 启动")
             _clear_privacy_blur(privacy_blur_signal)
             _report_status(status_callback, "locking", "达到条件 · 正在启用应用锁屏")
+            if stop_requested():
+                return MonitorOutcome.STOP_REQUESTED
             return MonitorOutcome.APP_LOCK_REQUESTED
 
         LOGGER.warning(
@@ -954,6 +1006,8 @@ def monitor_until_session_pause(
             device_text,
         )
         try:
+            if stop_requested():
+                return MonitorOutcome.STOP_REQUESTED
             lock_workstation()
             LOGGER.info("LockWorkStation completed successfully")
             _report_status(
@@ -968,7 +1022,7 @@ def monitor_until_session_pause(
             last_seen_time = cycle_time
             lock_warning_started_at = None
             lock_retry_not_before = (
-                cycle_time + config.LOCK_RETRY_COOLDOWN_SECONDS
+                cycle_time + lock_retry_cooldown_seconds
             )
             _report_status(
                 status_callback,
@@ -1427,6 +1481,9 @@ def open_camera_when_session_ready(
 
         try:
             camera.open()
+            if stop_event is not None and stop_event.is_set():
+                camera.release()
+                return None
             _report_status(
                 status_callback,
                 "starting",
@@ -1630,10 +1687,14 @@ def run(
                 return 0
             if outcome is MonitorOutcome.APP_LOCK_REQUESTED:
                 assert app_lock_signal is not None
+                if stop_event is not None and stop_event.is_set():
+                    return 0
                 if sedentary_tracker is not None:
                     sedentary_tracker.reset()
                 if sedentary_reminder_signal is not None:
                     sedentary_reminder_signal.clear()
+                if stop_event is not None and stop_event.is_set():
+                    return 0
                 app_lock_signal.request()
                 result = app_lock_signal.wait(stop_event)
                 if result == "cancelled":

@@ -1,247 +1,118 @@
 ﻿[CmdletBinding()]
 param(
-    [switch]$NoPause
+    [switch]$NoPause,
+    [string]$OutputRoot = ""
 )
 
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
-
-function Wait-OnError {
-    Write-Host ""
-    if (-not $NoPause) {
-        [void](Read-Host "构建未完成。按 Enter 键关闭窗口")
-    }
-}
+$stage = $null
 
 try {
-    $Host.UI.RawUI.WindowTitle = "构建 SeatSentinel EXE"
+    . (Join-Path $PSScriptRoot "tools\release_helpers.ps1")
     Set-Location -LiteralPath $PSScriptRoot
-
-    $virtualPython = Join-Path `
-        $PSScriptRoot `
-        ".venv\Scripts\python.exe"
-    if (-not (Test-Path -LiteralPath $virtualPython)) {
+    if (-not $OutputRoot) { $OutputRoot = Join-Path $PSScriptRoot "dist" }
+    $OutputRoot = [IO.Path]::GetFullPath($OutputRoot)
+    $virtualPython = Join-Path $PSScriptRoot ".venv\Scripts\python.exe"
+    if (-not (Test-Path -LiteralPath $virtualPython -PathType Leaf)) {
         throw "未找到项目运行环境。请先运行一键启动.ps1。"
     }
 
-    $runtimeRequirements = Join-Path $PSScriptRoot "requirements.txt"
-    $buildRequirements = Join-Path `
-        $PSScriptRoot `
-        "requirements-build.txt"
-    $buildDependencyMarker = Join-Path `
-        $PSScriptRoot `
-        ".venv\.seat-sentinel-build-requirements.sha256"
-    $buildRequirementsHash = (
-        (Get-FileHash `
-            -LiteralPath $runtimeRequirements `
-            -Algorithm SHA256).Hash + ":" +
-        (Get-FileHash `
-            -LiteralPath $buildRequirements `
-            -Algorithm SHA256).Hash
-    )
-    $installedBuildHash = ""
-    if (Test-Path -LiteralPath $buildDependencyMarker) {
-        $installedBuildHash = (
-            Get-Content `
-                -LiteralPath $buildDependencyMarker `
-                -Raw
-        ).Trim()
-    }
-    if ($installedBuildHash -ne $buildRequirementsHash) {
-        Write-Host "==> 安装或更新构建工具" -ForegroundColor Cyan
-        & $virtualPython -m pip install `
-            --disable-pip-version-check `
-            --no-cache-dir `
-            --retries 2 `
-            --timeout 30 `
-            -r $buildRequirements
-        if ($LASTEXITCODE -ne 0) {
-            Write-Host (
-                "PyPI 官方源连接失败，自动切换到清华镜像重试。"
-            ) -ForegroundColor Yellow
-            & $virtualPython -m pip install `
-                --disable-pip-version-check `
-                --no-cache-dir `
-                --retries 3 `
-                --timeout 60 `
-                --index-url `
-                "https://pypi.tuna.tsinghua.edu.cn/simple" `
-                -r $buildRequirements
-        }
-        if ($LASTEXITCODE -ne 0) {
-            throw "安装构建工具失败（退出码：$LASTEXITCODE）"
-        }
-        Set-Content `
-            -LiteralPath $buildDependencyMarker `
-            -Value $buildRequirementsHash `
-            -Encoding ASCII
-    }
-
-    $requiredModels = @(
-        "face-detection-retail-0004",
-        "landmarks-regression-retail-0009",
-        "face-reidentification-retail-0095"
-    )
-    foreach ($modelName in $requiredModels) {
-        $modelXml = Join-Path $PSScriptRoot "models\$modelName.xml"
-        $modelBin = Join-Path $PSScriptRoot "models\$modelName.bin"
-        if (
-            -not (Test-Path -LiteralPath $modelXml) -or
-            -not (Test-Path -LiteralPath $modelBin)
-        ) {
-            throw "未找到模型 $modelName。请先运行一键启动.ps1。"
-        }
-    }
-
-    $iconPng = Join-Path $PSScriptRoot "assets\seatsentinel-icon.png"
-    $iconIco = Join-Path $PSScriptRoot "assets\seatsentinel-icon.ico"
-    if (-not (Test-Path -LiteralPath $iconPng)) {
-        throw "未找到应用图标：$iconPng"
-    }
-    if (-not (Test-Path -LiteralPath $iconIco)) {
-        throw "未找到 Windows 图标：$iconIco"
-    }
-    $lockscreenBackground = Join-Path $PSScriptRoot "assets\lockscreen-landscape.png"
-    if (-not (Test-Path -LiteralPath $lockscreenBackground -PathType Leaf)) {
-        throw "未找到应用锁屏背景：$lockscreenBackground"
-    }
-
-    Write-Host "==> 检查项目依赖" -ForegroundColor Cyan
-    & $virtualPython -m pip check
-    if ($LASTEXITCODE -ne 0) {
-        throw "项目依赖检查失败（退出码：$LASTEXITCODE）"
-    }
-
-    $outputDirectory = Join-Path `
-        $PSScriptRoot `
-        "dist\SeatSentinel"
+    # Fail before touching any previous artifact or running a dependency install.
+    Assert-ModelFiles -SourceRoot $PSScriptRoot
+    $documents = @(Get-ReleaseFiles -SourceRoot $PSScriptRoot -Section full_documents)
+    $assets = @(Get-ReleaseFiles -SourceRoot $PSScriptRoot -Section full_assets)
+    $modelManifest = Get-ModelManifest -SourceRoot $PSScriptRoot
+    $outputDirectory = Assert-ReleasePath -OutputRoot $OutputRoot -Path (Join-Path $OutputRoot "SeatSentinel")
     $outputExe = Join-Path $outputDirectory "SeatSentinel.exe"
-    $expectedOutputExe = [IO.Path]::GetFullPath($outputExe)
-    $runningOutputProcesses = @(
-        Get-Process `
-            -Name "SeatSentinel" `
-            -ErrorAction SilentlyContinue |
-            Where-Object {
-                try {
-                    [IO.Path]::GetFullPath($_.Path) -eq $expectedOutputExe
-                }
-                catch {
-                    $false
-                }
-            }
-    )
-    if ($runningOutputProcesses.Count -gt 0) {
-        $processIds = (
-            $runningOutputProcesses |
-            ForEach-Object { $_.Id }
-        ) -join ", "
-        throw (
-            "正在运行的 SeatSentinel 占用旧打包目录（PID：$processIds）。" +
-            "请先从托盘退出程序，再重新运行构建脚本。"
-        )
+    $running = @(Get-Process -Name "SeatSentinel" -ErrorAction SilentlyContinue | Where-Object {
+        try { [IO.Path]::GetFullPath($_.Path) -eq $outputExe } catch { $false }
+    })
+    if ($running.Count -gt 0) {
+        throw "输出目录内的 SeatSentinel 正在运行。请退出该实例，或指定其他 -OutputRoot。"
     }
 
-    Write-Host ""
-    Write-Host "==> 构建无控制台托盘 EXE，请稍候" -ForegroundColor Cyan
-    & $virtualPython -m PyInstaller `
-        --noconfirm `
-        --clean `
-        --onedir `
-        --windowed `
-        --name "SeatSentinel" `
-        --icon "$iconIco" `
-        --collect-all "openvino" `
-        --collect-all "pystray" `
-        --collect-all "cv2_enumerate_cameras" `
-        --add-data "$iconPng;assets" `
-        --add-data "$lockscreenBackground;assets" `
-        --add-data "$PSScriptRoot\models;models" `
-        "app.py"
-    if ($LASTEXITCODE -ne 0) {
-        throw "PyInstaller 构建失败（退出码：$LASTEXITCODE）"
-    }
-
-    if (-not (Test-Path -LiteralPath $outputExe)) {
-        throw "构建完成但未找到 SeatSentinel.exe"
-    }
-
-    $distributionDocuments = @(
-        "README.md",
-        "LICENSE",
-        "PRIVACY.md",
-        "SECURITY.md",
-        "THIRD_PARTY_NOTICES.md"
-    )
-    foreach ($documentName in $distributionDocuments) {
-        Copy-Item `
-            -LiteralPath (Join-Path $PSScriptRoot $documentName) `
-            -Destination (Join-Path $outputDirectory $documentName) `
-            -Force
-    }
-    $documentationAssets = Join-Path $PSScriptRoot "docs"
-    if (Test-Path -LiteralPath $documentationAssets) {
-        Copy-Item `
-            -LiteralPath $documentationAssets `
-            -Destination (Join-Path $outputDirectory "docs") `
-            -Recurse `
-            -Force
-    }
-    Copy-Item `
-        -LiteralPath (Join-Path $PSScriptRoot "打开调试界面.cmd") `
-        -Destination (Join-Path $outputDirectory "打开调试界面.cmd") `
-        -Force
-
-    Write-Host ""
-    Write-Host "==> 在独立测试桌面执行打包自检" -ForegroundColor Cyan
-    & $virtualPython "tools\validate_app_lock.py" --packaged $outputExe
-    if ($LASTEXITCODE -ne 0) {
-        $logPath = Join-Path `
-            $env:LOCALAPPDATA `
-            "SeatSentinel\logs\seat-sentinel.log"
-        throw "打包自检失败，请查看日志：$logPath"
-    }
-
-    $archivePath = Join-Path `
-        $PSScriptRoot `
-        "dist\SeatSentinel-Windows-x64.zip"
-    if (Test-Path -LiteralPath $archivePath) {
-        Remove-Item -LiteralPath $archivePath -Force
-    }
-    Compress-Archive `
-        -Path $outputDirectory `
-        -DestinationPath $archivePath `
-        -CompressionLevel Optimal
-
-    # PyInstaller 的 build 目录仅包含构建中间文件，其中的 EXE 不能直接运行。
-    # 成功生成并验证 dist 后将其清理，避免误点。
-    $buildDirectory = Join-Path $PSScriptRoot "build"
-    if (Test-Path -LiteralPath $buildDirectory) {
-        $resolvedBuildDirectory = (Resolve-Path `
-            -LiteralPath $buildDirectory).Path
-        $expectedBuildDirectory = [System.IO.Path]::GetFullPath(
-            $buildDirectory
-        )
-        if ($resolvedBuildDirectory -ne $expectedBuildDirectory) {
-            throw "构建中间目录路径校验失败，未执行清理。"
+    $buildLock = Join-Path $PSScriptRoot "requirements-build.lock"
+    $dependencyFiles = @("requirements.txt", "requirements-build.txt", "requirements-runtime.lock", "requirements-build.lock")
+    $requirementsHash = ($dependencyFiles | ForEach-Object {
+        (Get-FileHash -LiteralPath (Join-Path $PSScriptRoot $_) -Algorithm SHA256).Hash
+    }) -join ':'
+    $marker = Join-Path $PSScriptRoot ".venv\.seat-sentinel-build-requirements.sha256"
+    $installedHash = if (Test-Path -LiteralPath $marker) {
+        ([string](Get-Content -LiteralPath $marker -Raw)).Trim()
+    } else { "" }
+    if ($installedHash -ne $requirementsHash) {
+        Write-Host "==> 准备锁定版本的构建依赖" -ForegroundColor Cyan
+        & $virtualPython -m pip install --disable-pip-version-check --no-cache-dir --retries 2 --timeout 30 -r $buildLock
+        if ($LASTEXITCODE -ne 0) {
+            & $virtualPython -m pip install --disable-pip-version-check --no-cache-dir --retries 3 --timeout 60 `
+                --index-url "https://pypi.tuna.tsinghua.edu.cn/simple" -r $buildLock
         }
-        Remove-Item `
-            -LiteralPath $resolvedBuildDirectory `
-            -Recurse `
-            -Force
+        if ($LASTEXITCODE -ne 0) { throw "安装构建依赖失败（退出码：$LASTEXITCODE）" }
+        Set-Content -LiteralPath $marker -Value $requirementsHash -Encoding ASCII
     }
+    & $virtualPython -m pip check
+    if ($LASTEXITCODE -ne 0) { throw "项目依赖检查失败（退出码：$LASTEXITCODE）" }
+    & $virtualPython "tools\validate_release.py" --environment
+    if ($LASTEXITCODE -ne 0) { throw "构建环境与版本锁文件不一致。" }
 
-    Write-Host ""
-    Write-Host "构建及自检成功。" -ForegroundColor Green
-    Write-Host "EXE：$outputExe"
-    Write-Host "压缩包：$archivePath"
-    Write-Host ""
-    if (-not $NoPause) {
-        [void](Read-Host "按 Enter 键关闭窗口")
+    $stage = New-ReleaseStage -OutputRoot $OutputRoot
+    $inputs = Join-Path $stage "inputs"
+    $modelFiles = @("model-manifest.json")
+    foreach ($model in $modelManifest.Models) {
+        $modelFiles += "models/$($model.Name).xml"
+        $modelFiles += "models/$($model.Name).bin"
     }
+    Copy-ReleaseFiles -SourceRoot $PSScriptRoot -DestinationRoot $inputs -Files ($modelFiles + $assets)
+    Assert-ModelFiles -SourceRoot $inputs
+    $stagedDist = Join-Path $stage "dist"
+    $work = Join-Path $stage "build"
+    $spec = Join-Path $stage "spec"
+    [void](New-Item -ItemType Directory -Path $spec -Force)
+    $arguments = @("-m", "PyInstaller", "--noconfirm", "--clean", "--onedir", "--windowed",
+        "--name", "SeatSentinel", "--icon", (Join-Path $inputs "assets\seatsentinel-icon.ico"),
+        "--distpath", $stagedDist, "--workpath", $work, "--specpath", $spec,
+        "--collect-all", "openvino", "--collect-all", "pystray", "--collect-all", "cv2_enumerate_cameras")
+    foreach ($asset in $assets) {
+        $assetPath = Join-Path $inputs $asset
+        $assetDirectory = Split-Path -Parent $asset
+        $arguments += @("--add-data", "$assetPath;$assetDirectory")
+    }
+    $arguments += @("--add-data", ((Join-Path $inputs "models") + ";models"), "app.py")
+    Write-Host "==> 在独立暂存目录构建 EXE" -ForegroundColor Cyan
+    & $virtualPython @arguments
+    if ($LASTEXITCODE -ne 0) { throw "PyInstaller 构建失败（退出码：$LASTEXITCODE）" }
+    $stagedApplication = Join-Path $stagedDist "SeatSentinel"
+    $stagedExe = Join-Path $stagedApplication "SeatSentinel.exe"
+    if (-not (Test-Path -LiteralPath $stagedExe -PathType Leaf)) { throw "构建未生成 SeatSentinel.exe。" }
+    Copy-ReleaseFiles -SourceRoot $PSScriptRoot -DestinationRoot $stagedApplication -Files $documents
+
+    Write-Host "==> 在独立测试桌面验证暂存 EXE" -ForegroundColor Cyan
+    & $virtualPython "tools\validate_app_lock.py" --packaged $stagedExe
+    if ($LASTEXITCODE -ne 0) { throw "暂存 EXE 自检失败；原发行物保持不变。" }
+
+    $archiveName = "SeatSentinel-Windows-x64.zip"
+    $archive = Join-Path $stage $archiveName
+    Compress-Archive -LiteralPath $stagedApplication -DestinationPath $archive -CompressionLevel Optimal
+    Assert-ReleaseArchive -Archive $archive -PackageName "SeatSentinel"
+    $hash = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+    $checksum = "$archive.sha256"
+    Set-Content -LiteralPath $checksum -Value "$hash  $archiveName" -Encoding ASCII
+    Publish-ReleaseArtifacts -OutputRoot $OutputRoot -Items @(
+        [PSCustomObject]@{Source=$stagedApplication; Name="SeatSentinel"},
+        [PSCustomObject]@{Source=$archive; Name=$archiveName},
+        [PSCustomObject]@{Source=$checksum; Name="$archiveName.sha256"}
+    )
+    Remove-ReleaseStage -OutputRoot $OutputRoot -Stage $stage
+    $stage = $null
+    Write-Host "构建、自检和发布完成；旧版产物已保留备份。" -ForegroundColor Green
+    Write-Host "EXE：$outputExe"
+    Write-Host "压缩包：$(Join-Path $OutputRoot $archiveName)"
+    if (-not $NoPause) { [void](Read-Host "按 Enter 键关闭窗口") }
 }
 catch {
-    Write-Host ""
     Write-Host "错误：$($_.Exception.Message)" -ForegroundColor Red
-    Wait-OnError
+    if ($stage) { Write-Host "诊断暂存目录保留：$stage" }
+    if (-not $NoPause) { [void](Read-Host "构建未完成。按 Enter 键关闭窗口") }
     exit 1
 }

@@ -5,7 +5,7 @@ from __future__ import annotations
 import ctypes
 import logging
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from ctypes import wintypes
 from typing import Callable, Optional
 
@@ -18,7 +18,7 @@ MOD_SHIFT = 0x0004
 MOD_WIN = 0x0008
 MOD_NOREPEAT = 0x4000
 WM_HOTKEY = 0x0312
-WM_QUIT = 0x0012
+WM_STOP_WAKE = 0x8000 + 0x534
 PM_NOREMOVE = 0x0000
 HOTKEY_ID = 0x5345
 ERROR_HOTKEY_ALREADY_REGISTERED = 1409
@@ -248,51 +248,69 @@ def hotkey_from_tk_key_event(
     return normalize_hotkey("+".join((*ordered_modifiers, key_name)))
 
 
+@dataclass
+class _HotkeyRun:
+    """One registration generation; a late worker cannot alter a later run."""
+
+    spec: HotkeySpec
+    stop_event: threading.Event = field(default_factory=threading.Event)
+    ready_event: threading.Event = field(default_factory=threading.Event)
+    startup_error: Optional[GlobalHotkeyError] = None
+    thread_id: int = 0
+    thread: Optional[threading.Thread] = None
+
+
 class WindowsGlobalHotkey:
     """Own one RegisterHotKey binding and its native message thread."""
 
     def __init__(self, callback: Callable[[], None]) -> None:
         self._callback = callback
-        self._spec: Optional[HotkeySpec] = None
-        self._thread: Optional[threading.Thread] = None
-        self._thread_id = 0
-        self._ready_event = threading.Event()
-        self._startup_error: Optional[GlobalHotkeyError] = None
+        self._state_lock = threading.Lock()
+        self._run: Optional[_HotkeyRun] = None
 
     @property
     def hotkey(self) -> Optional[str]:
-        return self._spec.display if self._spec is not None else None
+        with self._state_lock:
+            run = self._run
+            return run.spec.display if run is not None and not run.stop_event.is_set() else None
 
     def start(self, hotkey: str | HotkeySpec, timeout: float = 2.0) -> None:
-        if self._thread is not None and self._thread.is_alive():
-            raise GlobalHotkeyError("全局快捷键已经注册")
         spec = parse_hotkey(hotkey) if isinstance(hotkey, str) else hotkey
-        self._spec = spec
-        self._startup_error = None
-        self._ready_event.clear()
-        self._thread = threading.Thread(
-            target=self._message_loop,
-            args=(spec,),
-            name="seat-sentinel-hotkey",
-            daemon=True,
-        )
-        self._thread.start()
-        if not self._ready_event.wait(timeout=max(0.1, timeout)):
-            self.stop()
+        with self._state_lock:
+            current = self._run
+            if current is not None and current.thread is not None and current.thread.is_alive():
+                raise GlobalHotkeyError("全局快捷键已经注册或仍在停止")
+            run = _HotkeyRun(spec)
+            run.thread = threading.Thread(
+                target=self._message_loop,
+                args=(run,),
+                name="seat-sentinel-hotkey",
+                daemon=True,
+            )
+            self._run = run
+            run.thread.start()
+        if not run.ready_event.wait(timeout=max(0.1, timeout)):
+            self._stop_run(run, timeout)
             raise GlobalHotkeyError("等待 Windows 注册快捷键超时")
-        if self._startup_error is not None:
-            error = self._startup_error
-            if self._thread is not None:
-                self._thread.join(timeout=timeout)
-            self._thread = None
-            self._thread_id = 0
+        if run.startup_error is not None or run.stop_event.is_set():
+            error = run.startup_error or GlobalHotkeyError("全局快捷键启动已取消")
+            self._stop_run(run, timeout)
             raise error
 
     def stop(self, timeout: float = 2.0) -> None:
-        thread = self._thread
-        thread_id = self._thread_id
+        with self._state_lock:
+            run = self._run
+        if run is not None:
+            self._stop_run(run, timeout)
+
+    def _stop_run(self, run: _HotkeyRun, timeout: float) -> None:
+        # Mark cancellation before inspecting the native queue. If startup has
+        # not made a queue yet, the worker will see this before registering.
+        run.stop_event.set()
+        thread = run.thread
         if thread is None:
             return
+        thread_id = run.thread_id
         if thread.is_alive() and thread_id:
             user32 = ctypes.WinDLL("user32", use_last_error=True)
             user32.PostThreadMessageW.argtypes = [
@@ -302,7 +320,10 @@ class WindowsGlobalHotkey:
                 wintypes.LPARAM,
             ]
             user32.PostThreadMessageW.restype = wintypes.BOOL
-            if not user32.PostThreadMessageW(thread_id, WM_QUIT, 0, 0):
+            # A private wake message only unblocks GetMessage; the generation's
+            # stop_event authorizes exit. A stale WM_QUIT could instead stop a
+            # newer worker if Windows has already reused the old thread ID.
+            if not user32.PostThreadMessageW(thread_id, WM_STOP_WAKE, 0, 0):
                 LOGGER.warning(
                     "Unable to stop the global-hotkey message loop: %d",
                     ctypes.get_last_error(),
@@ -310,10 +331,25 @@ class WindowsGlobalHotkey:
         if thread is not threading.current_thread():
             thread.join(timeout=max(0.1, timeout))
         if not thread.is_alive():
-            self._thread = None
-            self._thread_id = 0
+            with self._state_lock:
+                if self._run is run:
+                    self._run = None
 
-    def _message_loop(self, spec: HotkeySpec) -> None:
+    def _message_loop(self, run: _HotkeyRun) -> None:
+        try:
+            self._run_message_loop(run)
+        except Exception as exc:
+            run.startup_error = GlobalHotkeyError("Windows 全局快捷键线程失败")
+            LOGGER.exception("Global-hotkey message thread failed", exc_info=exc)
+        finally:
+            run.thread_id = 0
+            run.stop_event.set()
+            run.ready_event.set()
+
+    def _run_message_loop(self, run: _HotkeyRun) -> None:
+        if run.stop_event.is_set():
+            return
+        spec = run.spec
         user32 = ctypes.WinDLL("user32", use_last_error=True)
         kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
         user32.RegisterHotKey.argtypes = [
@@ -345,11 +381,13 @@ class WindowsGlobalHotkey:
         registered = False
         message = _Message()
         try:
-            self._thread_id = int(kernel32.GetCurrentThreadId())
+            run.thread_id = int(kernel32.GetCurrentThreadId())
             # Ensure PostThreadMessageW has a queue to target during shutdown.
             user32.PeekMessageW(
                 ctypes.byref(message), None, 0, 0, PM_NOREMOVE
             )
+            if run.stop_event.is_set():
+                return
             ctypes.set_last_error(0)
             registered = bool(
                 user32.RegisterHotKey(
@@ -365,13 +403,15 @@ class WindowsGlobalHotkey:
                     detail = "该组合键已被其他程序占用"
                 else:
                     detail = f"Windows 错误 {error_code}"
-                self._startup_error = GlobalHotkeyError(
+                run.startup_error = GlobalHotkeyError(
                     f"无法注册 {spec.display}：{detail}"
                 )
                 return
-            self._ready_event.set()
+            if run.stop_event.is_set():
+                return
+            run.ready_event.set()
 
-            while True:
+            while not run.stop_event.is_set():
                 result = int(
                     user32.GetMessageW(
                         ctypes.byref(message), None, 0, 0
@@ -387,6 +427,7 @@ class WindowsGlobalHotkey:
                 if (
                     message.message == WM_HOTKEY
                     and int(message.wParam) == HOTKEY_ID
+                    and not run.stop_event.is_set()
                 ):
                     try:
                         self._callback()
@@ -395,4 +436,4 @@ class WindowsGlobalHotkey:
         finally:
             if registered:
                 user32.UnregisterHotKey(None, HOTKEY_ID)
-            self._ready_event.set()
+            run.ready_event.set()

@@ -379,23 +379,32 @@ def _rect_tuple(rectangle: wintypes.RECT) -> tuple[int, int, int, int]:
 
 def enumerate_monitor_work_areas() -> tuple[MonitorWorkArea, ...]:
     monitors: list[MonitorWorkArea] = []
+    monitor_error: int | None = None
 
     @MONITORENUMPROC
     def callback(hmonitor, _hdc, _rect, _data):
+        nonlocal monitor_error
         info = MonitorInfo()
         info.cbSize = ctypes.sizeof(info)
-        if user32.GetMonitorInfoW(hmonitor, ctypes.byref(info)):
-            monitors.append(
-                MonitorWorkArea(
-                    monitor=_rect_tuple(info.rcMonitor),
-                    work=_rect_tuple(info.rcWork),
-                    primary=bool(info.dwFlags & MONITORINFOF_PRIMARY),
-                )
+        if not user32.GetMonitorInfoW(hmonitor, ctypes.byref(info)):
+            # Never publish a partial topology: callers would interpret a
+            # missing monitor as an unplug and remove its existing cover.
+            monitor_error = ctypes.get_last_error()
+            return False
+        monitors.append(
+            MonitorWorkArea(
+                monitor=_rect_tuple(info.rcMonitor),
+                work=_rect_tuple(info.rcWork),
+                primary=bool(info.dwFlags & MONITORINFOF_PRIMARY),
             )
+        )
         return True
 
     with _physical_pixel_context():
-        if not user32.EnumDisplayMonitors(None, None, callback, 0):
+        enumerated = user32.EnumDisplayMonitors(None, None, callback, 0)
+        if monitor_error is not None:
+            raise DwmPrivacyError(f"Unable to query a monitor: {monitor_error}")
+        if not enumerated:
             raise DwmPrivacyError(
                 f"Unable to enumerate monitors: {ctypes.get_last_error()}"
             )

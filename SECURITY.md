@@ -4,7 +4,8 @@
 
 | Version | Supported |
 | --- | --- |
-| `0.2.5-beta` | Yes |
+| `0.2.12-beta`（当前开发版本） | Yes |
+| `0.2.11-beta` 及更早版本 | 请更新至包含最新修复的版本 |
 | `0.2.4-beta` | No |
 | `0.2.3-beta` | No |
 | `0.2.1-beta` | No |
@@ -54,5 +55,6 @@
 
 ## Unsigned builds
 
-本仓库只发布源码。维护者自行生成的未签名 EXE 可能触发 Windows SmartScreen
+Git 仓库保存源码；构建脚本可生成完整 EXE 包及轻量联网包，发行物可通过官方 Releases 获取。
+维护者生成的未签名 EXE 可能触发 Windows SmartScreen
 或安全软件提示。请勿从非官方 Issue、网盘或第三方站点下载可执行文件。

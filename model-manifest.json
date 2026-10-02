@@ -1,0 +1,30 @@
+{
+  "SchemaVersion": 1,
+  "RepositoryUrl": "https://storage.openvinotoolkit.org/repositories/open_model_zoo/2022.1/models_bin/2",
+  "Models": [
+    {
+      "Name": "face-detection-retail-0004",
+      "Label": "人脸检测",
+      "XmlSha256": "E1103759CF32B74AE3C2E84E9653DB5FA0D69AC246DC1E17AC3B116EFF319459",
+      "BinSha256": "89349CE12DD21C5263FB302CD3FFD4B73C35EA12ED98AFF863D03A2CF3A32464",
+      "XmlMinimumBytes": 10000,
+      "BinMinimumBytes": 1000000
+    },
+    {
+      "Name": "landmarks-regression-retail-0009",
+      "Label": "人脸关键点",
+      "XmlSha256": "8EDE1C8A94BFF1C0DDDA96F938CB872249BD0E1E33E77315498C8A8F17470AC1",
+      "BinSha256": "71199E8D6DF4583C3BA4AD8EAB013F36995B9FEF2DD6D85D86C2CC2322803955",
+      "XmlMinimumBytes": 50000,
+      "BinMinimumBytes": 700000
+    },
+    {
+      "Name": "face-reidentification-retail-0095",
+      "Label": "本人人脸特征",
+      "XmlSha256": "9148EB0E6578807B073F2A90649C701566A277DF1A2086E769C2CB263CC66B86",
+      "BinSha256": "C0A0ACB57503ACB0B04A9AA3B1A6DA7165C799D0DC2A462AD6B081A5CD1BC908",
+      "XmlMinimumBytes": 300000,
+      "BinMinimumBytes": 4000000
+    }
+  ]
+}

@@ -1,6 +1,6 @@
 # SeatSentinel
 
-![Version](https://img.shields.io/badge/version-v0.2.11--beta-f0a020)
+![Version](https://img.shields.io/badge/version-v0.2.12--beta-f0a020)
 ![Platform](https://img.shields.io/badge/platform-Windows%2011-0078D4)
 ![Python](https://img.shields.io/badge/Python-3.13-3776AB)
 ![OpenVINO](https://img.shields.io/badge/OpenVINO-NPU%20%7C%20CPU-00C7B7)
@@ -51,6 +51,10 @@ OpenVINO 调用 NPU 或 CPU 判断电脑前是否有人，再结合 Windows 最�
 解除；检测到人脸、甩动鼠标和暂停监控都不会解锁。正确密码解锁后重新进入监控宽限期。
 密码使用随机盐和 PBKDF2-HMAC-SHA256（600,000 次）派生后保存在本机设置文件，
 不保存明文、不写入日志；连续输错 5 次后递增等待，最长每次等待 60 秒。
+
+异常快速输入导致积压时，程序保留锁屏并清空本轮密码。按 Esc 完整重输，或点击
+“粘贴密码”替换全部内容后再解锁。显示器信息临时查询失败时保留已有遮挡，待完整
+布局读取成功后更新。
 
 应用模式在监控和应用锁屏期间请求保持系统与屏幕唤醒，暂停或退出后释放请求。
 软件不模拟键盘或鼠标操作；在应用模式中不会调用系统锁屏，也不改写 Windows 电源、
@@ -165,6 +169,9 @@ SeatSentinel 从本轮首次确认在场开始累计连续久坐时间。持续�
 4. 如需恢复原有行为，随时切回“任意人脸”。
 
 更新注册会替换旧模板；“删除本人数据”会删除模板并自动切回任意人脸模式。
+注册期间请先完成或取消注册，再恢复监控、修改设置或手动锁屏，避免争用摄像头。
+采样限时从摄像头准备就绪后开始；在模板保存提交前取消不会替换原模板。
+结束注册后恢复注册前的监控运行或暂停状态。
 本功能不是活体检测或身份认证，照片、屏幕视频等可能造成误识别，因此不能用于
 Windows 解锁或替代 Windows Hello。
 
@@ -387,8 +394,9 @@ OpenCV 的 BGR 画面在显示前转换为 RGB，并按原始比例缩放。Tkin
 - SeatSentinel 不初始化 OpenVINO 转换工具的可选遥测，并在导入 OpenVINO 前
   设置进程级 `DO_NOT_TRACK=1` 与 `SCARF_NO_ANALYTICS=1`。
 
-正常监控代码没有联网功能。只有 `一键启动.ps1` 在安装依赖和下载模型时访问
-网络。数据保存范围、日志内容和第三方组件边界见 [PRIVACY.md](PRIVACY.md)。
+正常监控代码没有联网功能。`一键启动.ps1` 在安装依赖和下载模型时访问网络，
+`构建EXE.ps1` 准备构建依赖时也可能联网。数据保存范围、日志内容和第三方组件边界
+见 [PRIVACY.md](PRIVACY.md)。
 
 ## 本地测试
 
@@ -405,6 +413,16 @@ DWM Acrylic 的窗口属性、双屏工作区和任务栏裁切，并枚举摄�
 GitHub PR 和 `main` 推送会自动运行 Windows / Python 3.13 的语法检查和回归测试。
 模型推理、打包资源和真实锁屏窗口另用本机自检验证；云端回归测试不要求 NPU 或摄像头。
 
+### v0.2.12-beta 可靠性修复
+
+- 显示器局部查询失败时保留已有应用锁覆盖，输入队列过载时支持安全重输；
+- 注册最终提交前响应取消，采样计时排除模型初始化，并统一协调摄像头占用；
+- 非有限模型检测输出按推理异常处理，停止请求在最终锁屏动作前再次检查；
+- 监控切换按请求顺序生效，每轮锁屏判断使用固定配置；
+- 快捷键启动超时会取消延迟注册，设置保存使用独立临时文件和原子替换；
+- 只修改应用密码、OLED 开关或毛玻璃快捷键时，不重启模型；
+- 保留现有过小人脸的身份识别及隐私判断策略。
+
 ## 本地构建 EXE
 
 仓库只发布源码，不提交 `dist` 或 EXE。需要时可在本机运行：
@@ -413,9 +431,16 @@ GitHub PR 和 `main` 推送会自动运行 Windows / Python 3.13 的语法检查
 .\构建EXE.ps1
 ```
 
-构建脚本会执行依赖检查、PyInstaller 打包、打包版 `--self-test` 和 ZIP 压缩，
-并清理 `build` 中间目录。运行依赖位于 `requirements.txt`，仅构建时需要的
-PyInstaller 位于 `requirements-build.txt`；构建脚本会自动准备构建工具。
+构建脚本先校验模型哈希和发行清单，在独立暂存目录完成 PyInstaller 打包，
+再于独立测试桌面运行打包版自检并生成 ZIP。全部通过后才替换输出，旧版产物保留
+在输出目录的 `backups` 子目录；失败时保留诊断暂存目录，发布步骤报错时回滚旧产物。
+
+运行依赖范围位于 `requirements.txt`，构建工具范围位于 `requirements-build.txt`。
+`requirements-runtime.lock` 和 `requirements-build.lock` 固定本次验证的依赖版本，
+启动、构建和 CI 均使用对应锁文件；锁文件不包含安装包哈希。
+
+可用 `-NoPause -OutputRoot dist\review-build` 指定独立输出目录。只验证本地模型、
+不下载或启动程序时，运行 `一键启动.ps1 -VerifyModelsOnly`。
 
 生成 GitHub Releases 使用的轻量联网版：
 
@@ -425,7 +450,8 @@ PyInstaller 位于 `requirements-build.txt`；构建脚本会自动准备构建�
 
 输出为 `dist\SeatSentinel-v<版本>-Light.zip` 及对应 `.sha256` 文件。轻量版不包含
 Python、`.venv`、OpenVINO、OpenCV 或模型，首次启动时按上述流程联网准备。所有
-生成内容均已由 `.gitignore` 排除。
+生成内容均已由 `.gitignore` 排除。轻量版按 `release-manifest.json` 白名单收集文件，
+启动和完整构建共享 `model-manifest.json` 中的模型校验信息。
 
 ## 项目结构
 
@@ -433,6 +459,7 @@ Python、`.venv`、OpenVINO、OpenCV 或模型，首次启动时按上述流程�
 .
 ├─ app.py
 ├─ main.py
+├─ monitoring_service.py
 ├─ detector.py
 ├─ face_identity.py
 ├─ face_registration.py
@@ -460,6 +487,10 @@ Python、`.venv`、OpenVINO、OpenCV 或模型，首次启动时按上述流程�
 ├─ ROADMAP.md
 ├─ requirements.txt
 ├─ requirements-build.txt
+├─ requirements-runtime.lock
+├─ requirements-build.lock
+├─ release-manifest.json
+├─ model-manifest.json
 ├─ 安装并启动.cmd
 ├─ 一键启动.ps1
 ├─ 打开调试界面.cmd
