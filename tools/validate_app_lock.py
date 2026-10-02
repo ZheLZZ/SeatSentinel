@@ -73,7 +73,7 @@ def child():
     from unittest.mock import patch, Mock
     from user_settings import AppSettings, SettingsStore
     from app_lock import hash_password
-    from app_lock_windows import AppLockWindow, AwakeRequest, user32
+    from app_lock_windows import AppLockWindow, AwakeRequest, KeyboardData, user32
     from dwm_privacy import enumerate_monitor_work_areas, _physical_pixel_context, MonitorWorkArea
     destination = ROOT / "dist" / "app-lock-validation"
     destination.mkdir(parents=True, exist_ok=True)
@@ -92,7 +92,18 @@ def child():
         raise AssertionError("UI operation timed out")
     try:
         wake.update(True)
-        lock.show(hash_password("Test-only!482"))
+        hooks = {}
+        install_hook = user32.SetWindowsHookExW
+        def capture_hook(kind, callback, *args):
+            hooks[kind] = callback
+            return install_hook(kind, callback, *args)
+        # Keep the real hooks installed on the test desktop. Invoke their saved
+        # callbacks directly rather than injecting input into the user's desktop.
+        with patch.object(user32, "SetWindowsHookExW", side_effect=capture_hook):
+            lock.show(hash_password("Test-only!482"))
+        def key(vk, *, down=True, scan=0):
+            data = KeyboardData(vkCode=vk, scanCode=scan)
+            return hooks[13](0, 0x0100 if down else 0x0101, ctypes.addressof(data))
         root.update()
         assert lock.active and lock.guard._thread.is_alive()
         assert len(lock.windows) == len(enumerate_monitor_work_areas())
@@ -198,6 +209,56 @@ def child():
         assert all(window.winfo_exists() for window in before)
         lock._rebuild()
         lock.password.set("")
+        # Real Tk UI consumes input without an Entry or a focused lock window.
+        assert lock.entry.winfo_class() == "Label"
+        other = tk.Toplevel(root)
+        other.focus_force()
+        lock.guard._emit("text", "a中")
+        lock.guard._emit("text", "\ud83d")
+        lock.guard._emit("text", "\udd11")
+        lock._drain_input()
+        assert lock.password.get() == "a中🔑"
+        assert lock.entry.cget("text") == "●●●"
+        lock.guard._emit("backspace")
+        lock._drain_input()
+        assert lock.password.get() == "a中"
+        lock.guard._emit("clear")
+        lock._drain_input()
+        assert not lock.password.get()
+        with patch.object(root, "clipboard_get", return_value="中文 🔑 "):
+            lock._paste_password()
+        assert lock.password.get() == "中文 🔑 "
+        other.destroy()
+        # A clock-waking space cannot become a password prefix, including repeats.
+        # Later keys arriving before the UI timer must survive the wake transition.
+        lock.password.set("")
+        lock.guard.last_activity = time.monotonic() - 181
+        lock._update_saver()
+        assert lock._saver_active
+        key(0x20)
+        key(0x20)
+        lock._drain_input()
+        assert not lock._saver_active and not lock.password.get()
+        key(0x20)  # held after the password surface has appeared
+        key(0x20, down=False)
+        key(0xE7, scan=ord(" "))  # a separate password space remains valid
+        key(0xE7, down=False)
+        key(0xE7, scan=ord("中"))
+        key(0xE7, down=False)
+        lock._drain_input()
+        assert lock.password.get() == " 中"
+        lock.password.set("")
+        lock.guard.last_activity = time.monotonic() - 181
+        lock._update_saver()
+        key(0x0D)
+        key(0x0D)
+        key(0x0D, down=False)
+        key(0xE7, scan=ord("中"))
+        key(0xE7, down=False)
+        assert lock._saver_active  # no UI update between waking and typing
+        lock._drain_input()
+        assert not lock._saver_active and not lock._verifying
+        assert lock.password.get() == "中" and not unlocked
         lock.password.set("wrong-password")
         lock._submit()
         pump_until(lambda: not lock._verifying)
@@ -212,8 +273,9 @@ def child():
         lock._signature = ()
         lock._rebuild()
         assert lock.guard.handles == lock._handles()
-        lock.password.set("Test-only!482")
-        lock._submit()
+        for character in "Test-only!482":
+            lock.guard._emit("text", character)
+        lock.guard._emit("submit")
         pump_until(lambda: bool(unlocked))
         assert not lock.active and lock.guard is None and not errors
         lock.show("", preview=True)
@@ -290,7 +352,7 @@ def child():
         application._app_lock_window.close()
         application._awake_request.update(False)
         application._root.destroy()
-    print("PASS: real hooks, OLED idle/motion/wake, monitor coverage, 2/3-display simulations, negative origins, portrait/primary/DPI changes, unplug/error recovery, password, manual lock, preview and cleanup")
+    print("PASS: direct input queue, foreign focus, editing, Unicode, paste, Enter unlock, real hooks, wake-only first key, held wake repeats, fast post-wake input, OLED wake, multi-monitor/DPI rebuild, manual lock, preview and cleanup")
     if "--full-self-test" in sys.argv:
         from app import _run_self_test
         assert _run_self_test() == 0
