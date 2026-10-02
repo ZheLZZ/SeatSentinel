@@ -29,8 +29,8 @@ jobs:
         shell: powershell
         run: ./tools/test_release_helpers.ps1
       - name: Verify lightweight package contents
-        shell: powershell
-        run: ./构建轻量版.ps1 -NoPause -OutputRoot dist/ci-light
+        shell: pwsh
+        run: powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File ./构建轻量版.ps1 -NoPause -OutputRoot dist/ci-light
       - name: Compile tracked Python files
         shell: pwsh
         run: |
